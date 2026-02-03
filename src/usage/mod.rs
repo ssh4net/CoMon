@@ -5,7 +5,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_ACTIVITY_GAP_MS: i64 = 2 * 60 * 1000;
 const MAX_SESSION_FILE_BYTES: u64 = 64 * 1024 * 1024;
@@ -350,10 +349,6 @@ pub fn compute_snapshot(
     workspace_path: Option<&Path>,
 ) -> Result<LocalUsageSnapshot> {
     let days = days.clamp(1, 90);
-    let updated_at_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
 
     let sessions_root = codex_home.join("sessions");
     let day_keys = make_day_keys(days);
@@ -364,7 +359,7 @@ pub fn compute_snapshot(
     let mut model_totals: HashMap<String, i64> = HashMap::new();
 
     if !sessions_root.exists() {
-        return Ok(build_snapshot(updated_at_ms, day_keys, daily, model_totals));
+        return Ok(build_snapshot(day_keys, daily, model_totals));
     }
 
     let mut total_bytes_scanned: u64 = 0;
@@ -417,11 +412,10 @@ pub fn compute_snapshot(
         }
     }
 
-    Ok(build_snapshot(updated_at_ms, day_keys, daily, model_totals))
+    Ok(build_snapshot(day_keys, daily, model_totals))
 }
 
 fn build_snapshot(
-    _updated_at_ms: i64,
     day_keys: Vec<String>,
     daily: HashMap<String, DailyTotals>,
     model_totals: HashMap<String, i64>,
@@ -856,6 +850,8 @@ fn make_day_keys(days: u32) -> Vec<String> {
 }
 
 fn day_dir_for_key(root: &Path, day_key: &str) -> PathBuf {
+    // Defensive fallbacks: `day_key` is expected to be `YYYY-MM-DD` (as produced by `make_day_keys`),
+    // but session directories are treated as untrusted input.
     let mut parts = day_key.split('-');
     let year = parts.next().unwrap_or("1970");
     let month = parts.next().unwrap_or("01");

@@ -212,15 +212,23 @@ impl CodexRpc {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
 
-        self.write_message(json!({ "id": id, "method": method, "params": params }))
-            .await?;
+        if let Err(err) = self
+            .write_message(json!({ "id": id, "method": method, "params": params }))
+            .await
+        {
+            let _ = self.pending.lock().await.remove(&id);
+            return Err(err);
+        }
 
         match timeout(REQUEST_TIMEOUT, rx).await {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(_)) => Err(anyhow!("request canceled")),
             Err(_) => {
                 let _ = self.pending.lock().await.remove(&id);
-                Err(anyhow!("RPC request timeout after {:?}", REQUEST_TIMEOUT))
+                Err(anyhow!(
+                    "RPC request `{method}` timeout after {:?}",
+                    REQUEST_TIMEOUT
+                ))
             }
         }
     }
@@ -331,4 +339,41 @@ fn as_i64_maybe_float(value: &Value) -> Option<i64> {
         .as_i64()
         .or_else(|| value.as_f64().map(|v| v as i64))
         .or_else(|| value.as_str().and_then(|s| s.parse::<i64>().ok()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_rate_limits_accepts_expected_shapes() {
+        let v = json!({
+            "primary": { "usedPercent": 0, "windowDurationMins": 300, "resetsAt": 1770118764 },
+            "secondary": { "used_percent": 1.0, "window_duration_mins": "10080", "resets_at": "1770684472" },
+            "credits": { "hasCredits": true, "unlimited": false, "balance": 900.735 },
+        });
+
+        let limits = parse_rate_limits(&v).expect("parse_rate_limits");
+        let p = limits.primary.expect("primary");
+        assert_eq!(p.used_percent, Some(0.0));
+        assert_eq!(p.window_duration_mins, Some(300.0));
+        assert_eq!(p.resets_at, Some(1770118764));
+
+        let s = limits.secondary.expect("secondary");
+        assert_eq!(s.used_percent, Some(1.0));
+        assert_eq!(s.window_duration_mins, Some(10080.0));
+        assert_eq!(s.resets_at, Some(1770684472));
+
+        let c = limits.credits.expect("credits");
+        assert!(c.has_credits);
+        assert!(!c.unlimited);
+        assert_eq!(c.balance.as_deref(), Some("900.735"));
+    }
+
+    #[test]
+    fn parse_rate_limits_rejects_non_object() {
+        let err = parse_rate_limits(&Value::Null).unwrap_err().to_string();
+        assert!(err.contains("rate limits missing"));
+    }
 }

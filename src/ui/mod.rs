@@ -1399,10 +1399,15 @@ fn format_credits_compact_line(l: &crate::codex_rpc::AccountRateLimits) -> Optio
     if raw.is_empty() {
         return None;
     }
-    let n = raw.parse::<f64>().ok().filter(|v| v.is_finite());
+    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    let n = cleaned.parse::<f64>().ok().filter(|v| v.is_finite());
     let amount = n
         .map(|v| format!("{} credits", v.round() as i64))
-        .unwrap_or_else(|| format!("{raw} credits"));
+        .unwrap_or_else(|| format!("{cleaned} credits"));
     Some(format!("{:<LABEL_W$}{amount}", "Credits:"))
 }
 
@@ -1506,3 +1511,24 @@ fn inset_with_border_and_padding(area: Rect, padding: Padding) -> Rect {
 }
 
 // counts-line helper removed (values are rendered inside bars now)
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_middle_is_unicode_safe_and_strips_control_chars() {
+        let input = "ab\x1b[31mcd\x1b[0m-zu\u{0308}rich";
+        let out = truncate_middle(input, 10);
+        assert!(!out.chars().any(|c| c.is_control()));
+        assert!(out.chars().count() <= 10);
+    }
+
+    #[test]
+    fn truncate_middle_handles_small_limits() {
+        assert_eq!(truncate_middle("hello", 0), "...");
+        assert_eq!(truncate_middle("hello", 1), "...");
+        assert_eq!(truncate_middle("hello", 2), "...");
+        assert_eq!(truncate_middle("hello", 3), "...");
+    }
+}

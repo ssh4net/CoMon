@@ -1,12 +1,12 @@
 use crate::codex_rpc::{AccountRateLimits, CodexRpc};
 use crate::usage::{ChartRange, LocalUsageSnapshot, UsageMetric};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::Stdout;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -69,10 +69,11 @@ async fn run_inner(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     config: Config,
 ) -> Result<()> {
-    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
-    let (evt_tx, mut evt_rx) = mpsc::unbounded_channel::<AppEvent>();
-    let (usage_refresh_tx, usage_refresh_rx) = mpsc::unbounded_channel::<()>();
-    let (limits_refresh_tx, limits_refresh_rx) = mpsc::unbounded_channel::<()>();
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<UiCommand>(64);
+    let (evt_tx, mut evt_rx) = mpsc::channel::<AppEvent>(64);
+    let (usage_refresh_tx, usage_refresh_rx) = mpsc::channel::<()>(1);
+    let (limits_refresh_tx, limits_refresh_rx) = mpsc::channel::<()>(1);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     // Spawn usage worker.
     {
@@ -81,22 +82,38 @@ async fn run_inner(
         let usage_days = config.usage_days;
         let refresh = Duration::from_secs(config.refresh_usage_secs);
         let mut usage_refresh_rx = usage_refresh_rx;
+        let mut shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(refresh);
             // Immediate first run
-            let first = crate::usage::compute_snapshot(usage_days, &codex_home, None);
-            let _ = evt_tx.send(AppEvent::UsageUpdated(first));
+            let first = tokio::task::spawn_blocking({
+                let codex_home = codex_home.clone();
+                move || crate::usage::compute_snapshot(usage_days, &codex_home, None)
+            })
+            .await
+            .unwrap_or_else(|err| Err(anyhow!("usage snapshot task failed: {err}")));
+            if evt_tx.send(AppEvent::UsageUpdated(first)).await.is_err() {
+                return;
+            }
             // Consume the immediate first tick so the next one waits `refresh`.
             interval.tick().await;
             loop {
                 tokio::select! {
+                    _ = shutdown_rx.changed() => break,
                     _ = interval.tick() => {}
                     recv = usage_refresh_rx.recv() => {
                         if recv.is_none() { break; }
                     }
                 }
-                let snapshot = crate::usage::compute_snapshot(usage_days, &codex_home, None);
-                let _ = evt_tx.send(AppEvent::UsageUpdated(snapshot));
+                let snapshot = tokio::task::spawn_blocking({
+                    let codex_home = codex_home.clone();
+                    move || crate::usage::compute_snapshot(usage_days, &codex_home, None)
+                })
+                .await
+                .unwrap_or_else(|err| Err(anyhow!("usage snapshot task failed: {err}")));
+                if evt_tx.send(AppEvent::UsageUpdated(snapshot)).await.is_err() {
+                    break;
+                }
             }
         });
     }
@@ -108,11 +125,14 @@ async fn run_inner(
         let cwd = config.cwd.clone();
         let refresh = Duration::from_secs(config.refresh_limits_secs);
         let mut limits_refresh_rx = limits_refresh_rx;
+        let mut shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             let rpc = match CodexRpc::spawn(codex_bin, cwd).await {
                 Ok(rpc) => rpc,
                 Err(err) => {
-                    let _ = evt_tx.send(AppEvent::LimitsUnavailable(err.to_string()));
+                    let _ = evt_tx
+                        .send(AppEvent::LimitsUnavailable(err.to_string()))
+                        .await;
                     return;
                 }
             };
@@ -120,10 +140,17 @@ async fn run_inner(
             let mut interval = tokio::time::interval(refresh);
             // Immediate first poll
             let first = rpc.read_account_rate_limits().await;
-            let _ = evt_tx.send(AppEvent::LimitsUpdated(first));
+            if evt_tx.send(AppEvent::LimitsUpdated(first)).await.is_err() {
+                rpc.kill().await;
+                return;
+            }
             interval.tick().await;
             loop {
                 tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        rpc.kill().await;
+                        break;
+                    }
                     _ = interval.tick() => {}
                     recv = limits_refresh_rx.recv() => {
                         if recv.is_none() {
@@ -133,7 +160,10 @@ async fn run_inner(
                     }
                 }
                 let res = rpc.read_account_rate_limits().await;
-                let _ = evt_tx.send(AppEvent::LimitsUpdated(res));
+                if evt_tx.send(AppEvent::LimitsUpdated(res)).await.is_err() {
+                    rpc.kill().await;
+                    break;
+                }
             }
         });
     }
@@ -141,8 +171,13 @@ async fn run_inner(
     // Spawn input reader.
     {
         let cmd_tx = cmd_tx.clone();
+        let shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
+            let shutdown_rx = shutdown_rx;
             loop {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
                 let event = tokio::task::spawn_blocking(|| {
                     let timeout = Duration::from_millis(100);
                     if crossterm::event::poll(timeout).ok()? {
@@ -158,7 +193,9 @@ async fn run_inner(
                 let Some(event) = event else { continue };
 
                 if let Some(cmd) = map_event_to_cmd(event) {
-                    let _ = cmd_tx.send(cmd);
+                    if cmd_tx.send(cmd).await.is_err() {
+                        break;
+                    }
                     if matches!(cmd, UiCommand::Quit) {
                         break;
                     }
@@ -195,6 +232,7 @@ async fn run_inner(
                 if let Some(cmd) = cmd {
                     dirty |= handle_cmd(&mut state, cmd, &usage_refresh_tx, &limits_refresh_tx).await?;
                     if matches!(cmd, UiCommand::Quit) {
+                        let _ = shutdown_tx.send(true);
                         break;
                     }
                 }
@@ -245,8 +283,8 @@ fn map_event_to_cmd(event: Event) -> Option<UiCommand> {
 async fn handle_cmd(
     state: &mut AppState,
     cmd: UiCommand,
-    usage_refresh_tx: &mpsc::UnboundedSender<()>,
-    limits_refresh_tx: &mpsc::UnboundedSender<()>,
+    usage_refresh_tx: &mpsc::Sender<()>,
+    limits_refresh_tx: &mpsc::Sender<()>,
 ) -> Result<bool> {
     match cmd {
         UiCommand::Quit => Ok(true),
@@ -277,8 +315,8 @@ async fn handle_cmd(
             Ok(true)
         }
         UiCommand::RefreshAll => {
-            let _ = usage_refresh_tx.send(());
-            let _ = limits_refresh_tx.send(());
+            let _ = usage_refresh_tx.try_send(());
+            let _ = limits_refresh_tx.try_send(());
             Ok(true)
         }
     }

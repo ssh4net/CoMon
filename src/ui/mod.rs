@@ -132,7 +132,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     };
 
     let usage_hint =
-        "Usage: Statistic [tab] (tokens/time/runs), Timeframe [w] (week/month), Layout [f] (horisontal/vertical), Refresh [r/F5], Help [?], Quit [q]";
+        "Usage: Statistic [tab] (tokens/time/runs), Timeframe [w] (week/month), Layout [f] (horizontal/vertical), Refresh [r/F5], Help [?], Quit [q]";
     let line = Line::from(vec![
         Span::styled(usage_hint, Style::default().fg(Color::Gray)),
         Span::raw("  "),

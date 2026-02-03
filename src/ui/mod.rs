@@ -1,5 +1,4 @@
-use crate::app::ChartOrientation;
-use crate::app::{AppState, Tab};
+use crate::app::{AppState, ChartOrientation};
 use crate::usage::{
     format_compact_kmb, format_count, format_duration_compact, format_tokens_compact, ChartRange,
     UsageMetric,
@@ -84,10 +83,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         .split(inner);
 
     render_header(frame, chunks[0], state);
-    match state.tab {
-        Tab::Usage => render_usage(frame, chunks[1], state),
-        Tab::Limits => render_limits(frame, chunks[1], state),
-    }
+    render_usage(frame, chunks[1], state);
     render_footer(frame, chunks[2], state);
 
     if state.show_help {
@@ -101,10 +97,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         .constraints([Constraint::Min(20), Constraint::Length(28)])
         .split(area);
 
-    let title = match state.tab {
-        Tab::Usage => "USAGE_SNAPSHOT",
-        Tab::Limits => "LIMITS",
-    };
+    let title = "USAGE_SNAPSHOT";
     let left = Paragraph::new(Line::from(Span::styled(
         title,
         Style::default().add_modifier(Modifier::BOLD),
@@ -112,11 +105,10 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     .alignment(Alignment::Left);
     frame.render_widget(left, row[0]);
 
-    let updated = match state.tab {
-        Tab::Usage => state.usage_updated_label(),
-        Tab::Limits => state.limits_updated_label(),
-    }
-    .unwrap_or_else(|| "Updated --".to_string());
+    let updated = state
+        .usage_updated_label()
+        .or_else(|| state.limits_updated_label())
+        .unwrap_or_else(|| "Updated --".to_string());
 
     let right = Paragraph::new(Line::from(vec![
         Span::raw(updated),
@@ -140,7 +132,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     };
 
     let usage_hint =
-        "Usage: Statistic [d] (tokens/time/runs), Timeframe [t] (week/month), Layout [l] (horisontal/vertical), Refresh [r/F5], Help [?], Quit [q]";
+        "Usage: Statistic [tab] (tokens/time/runs), Timeframe [w] (week/month), Layout [f] (horisontal/vertical), Refresh [r/F5], Help [?], Quit [q]";
     let line = Line::from(vec![
         Span::styled(usage_hint, Style::default().fg(Color::Gray)),
         Span::raw("  "),
@@ -1223,74 +1215,6 @@ fn render_top_models(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_limits(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .padding(Padding {
-            left: 2,
-            right: 1,
-            top: 1,
-            bottom: 0,
-        })
-        .title(Span::styled(
-            " Limits ",
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
-
-    if !state.limits_enabled {
-        let msg = state
-            .limits_error
-            .as_deref()
-            .unwrap_or("Limits unavailable.");
-        let p = Paragraph::new(Text::from(vec![
-            Line::from(Span::styled(
-                "Limits are unavailable.",
-                Style::default().fg(Color::Yellow),
-            )),
-            Line::from(Span::raw("")),
-            Line::from(Span::raw(truncate_middle(msg, 140))),
-        ]))
-        .block(block)
-        .wrap(Wrap { trim: true });
-        frame.render_widget(p, area);
-        return;
-    }
-
-    let limits = state.limits.as_ref();
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    if let Some(l) = limits {
-        let (l1, l2) = format_limits_compact_lines(l);
-        lines.push(Line::from(Span::styled(
-            l1,
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(Span::styled(
-            l2,
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-        if let Some(l3) = format_credits_compact_line(l) {
-            lines.push(Line::from(Span::styled(
-                l3,
-                Style::default().add_modifier(Modifier::BOLD),
-            )));
-        }
-        if let Some(plan) = l.plan_type.as_deref().filter(|s| !s.trim().is_empty()) {
-            lines.push(Line::from(vec![
-                Span::styled("Plan: ", Style::default().fg(Color::Gray)),
-                Span::raw(plan.to_string()),
-            ]));
-        }
-    } else {
-        lines.push(Line::from(Span::raw("Loading...")));
-    }
-
-    let p = Paragraph::new(Text::from(lines))
-        .block(block)
-        .wrap(Wrap { trim: true });
-    frame.render_widget(p, area);
-}
-
 fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
     let w = area.width.min(60);
     let h = area.height.min(12);
@@ -1313,10 +1237,9 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
 
     let text = Text::from(vec![
         Line::from("Keys:"),
-        Line::from("  Tab  - switch view (Usage/Limits)"),
-        Line::from("  d    - toggle statistic (Tokens/Time/Runs)"),
-        Line::from("  t    - toggle timeframe (Week/Month)"),
-        Line::from("  l    - toggle layout (Horz/Vert)"),
+        Line::from("  Tab  - toggle statistic (Tokens/Time/Runs)"),
+        Line::from("  w    - toggle timeframe (Week/Month)"),
+        Line::from("  f    - toggle layout (Horz/Vert)"),
         Line::from("  r/F5 - refresh usage + limits"),
         Line::from("  ?    - toggle help"),
         Line::from("  q    - quit"),

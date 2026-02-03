@@ -50,10 +50,9 @@ Example:
 
 ## Key bindings
 
-- `Tab` switch between Usage / Limits
-- `d` Toggle data (Tokens/Time/Runs)
-- `t` Toggle timeframe (Week/Month)
-- `l` Toggle layout (Horz/Vert)
+- `Tab` Toggle data (Tokens/Time/Runs)
+- `w` Toggle timeframe (Week/Month)
+- `f` Toggle layout (Horz/Vert)
 - `r` / `F5` Refresh now (usage + limits)
 - `?` Help overlay
 - `q` Quit

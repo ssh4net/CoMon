@@ -29,7 +29,6 @@ pub struct AccountRateLimits {
     pub primary: Option<RateLimitWindow>,
     pub secondary: Option<RateLimitWindow>,
     pub credits: Option<CreditsSnapshot>,
-    pub plan_type: Option<String>,
 }
 
 pub fn normalize_epoch_millis(value: i64) -> i64 {
@@ -234,17 +233,10 @@ fn parse_rate_limits(value: &Value) -> Result<AccountRateLimits> {
         }
     });
 
-    let plan_type = obj
-        .get("planType")
-        .or_else(|| obj.get("plan_type"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
     Ok(AccountRateLimits {
         primary,
         secondary,
         credits,
-        plan_type,
     })
 }
 

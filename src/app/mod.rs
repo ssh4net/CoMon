@@ -19,12 +19,6 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Tab {
-    Usage,
-    Limits,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChartOrientation {
     Vertical,
     Horizontal,
@@ -36,7 +30,6 @@ enum UiCommand {
     ToggleMetric,
     ToggleRange,
     ToggleOrientation,
-    NextTab,
     ToggleHelp,
     Quit,
 }
@@ -50,7 +43,6 @@ enum AppEvent {
 
 #[derive(Debug)]
 pub(crate) struct AppState {
-    pub(crate) tab: Tab,
     pub(crate) metric: UsageMetric,
     pub(crate) range: ChartRange,
     pub(crate) orientation: ChartOrientation,
@@ -176,7 +168,6 @@ async fn run_inner(
     }
 
     let mut state = AppState {
-        tab: Tab::Usage,
         metric: UsageMetric::Tokens,
         range: ChartRange::Week,
         orientation: ChartOrientation::Horizontal,
@@ -240,10 +231,9 @@ fn map_event_to_cmd(event: Event) -> Option<UiCommand> {
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(UiCommand::Quit),
                 (KeyCode::Char('r'), _) => Some(UiCommand::RefreshAll),
                 (KeyCode::F(5), _) => Some(UiCommand::RefreshAll),
-                (KeyCode::Char('d'), _) => Some(UiCommand::ToggleMetric),
-                (KeyCode::Char('t'), _) => Some(UiCommand::ToggleRange),
-                (KeyCode::Char('l'), _) => Some(UiCommand::ToggleOrientation),
-                (KeyCode::Tab, _) => Some(UiCommand::NextTab),
+                (KeyCode::Tab, _) => Some(UiCommand::ToggleMetric),
+                (KeyCode::Char('w'), _) => Some(UiCommand::ToggleRange),
+                (KeyCode::Char('f'), _) => Some(UiCommand::ToggleOrientation),
                 (KeyCode::Char('?'), _) => Some(UiCommand::ToggleHelp),
                 _ => None,
             }
@@ -262,13 +252,6 @@ async fn handle_cmd(
         UiCommand::Quit => Ok(true),
         UiCommand::ToggleHelp => {
             state.show_help = !state.show_help;
-            Ok(true)
-        }
-        UiCommand::NextTab => {
-            state.tab = match state.tab {
-                Tab::Usage => Tab::Limits,
-                Tab::Limits => Tab::Usage,
-            };
             Ok(true)
         }
         UiCommand::ToggleMetric => {

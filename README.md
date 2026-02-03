@@ -8,7 +8,7 @@ Single-binary, cross-platform TUI for:
 ## Requirements
 
 - Rust toolchain (stable) installed.
-- Codex CLI installed and available as `codex` on your `PATH` (required for the **Limits** tab).
+- Codex CLI installed and available as `codex` on your `PATH` (required for live limits/credits).
   - Usage stats still work without Codex CLI (they only need the session logs on disk).
 
 ## Build
@@ -16,14 +16,13 @@ Single-binary, cross-platform TUI for:
 From the repository root:
 
 ```bash
-cd CodexMon-cli
 cargo build --release
 ```
 
 The binary will be at:
 
-- Windows: `CodexMon-cli\\target\\release\\comon.exe`
-- Linux/macOS: `CodexMon-cli/target/release/comon`
+- Windows: `target\\release\\comon.exe`
+- Linux/macOS: `target/release/comon`
 
 ## Run
 

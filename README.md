@@ -1,9 +1,12 @@
+<img width="1649" height="862" alt="SOuJoN2ooX" src="https://github.com/user-attachments/assets/a6c27de1-d345-4dc7-a7b6-68c296a3e9f4" />
 # comon
 
 Single-binary, cross-platform TUI for:
 
 - Local Codex usage stats (last 7/30 days, chart, top models) by scanning `CODEX_HOME/sessions`.
 - Live account limits/credits by spawning `codex app-server` and calling `account/rateLimits/read`.
+- 
+<img width="1647" height="861" alt="Dkh7CxLgx7" src="https://github.com/user-attachments/assets/edec765d-0924-493b-8c10-cb32bca867a9" />
 
 ## Requirements
 

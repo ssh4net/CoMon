@@ -1407,15 +1407,30 @@ fn format_credits_compact_line(l: &crate::codex_rpc::AccountRateLimits) -> Optio
 }
 
 fn truncate_middle(value: &str, max: usize) -> String {
-    if value.len() <= max {
-        return value.to_string();
+    let cleaned: String = value.chars().filter(|c| !c.is_control()).collect();
+    if cleaned.chars().count() <= max {
+        return cleaned;
     }
     if max <= 3 {
         return "...".to_string();
     }
     let keep = (max - 3) / 2;
-    let start = &value[..keep];
-    let end = &value[value.len() - keep..];
+    let mut start = String::with_capacity(keep);
+    let mut end = String::with_capacity(keep);
+
+    for ch in cleaned.chars().take(keep) {
+        start.push(ch);
+    }
+    for ch in cleaned
+        .chars()
+        .rev()
+        .take(keep)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        end.push(ch);
+    }
     format!("{start}...{end}")
 }
 

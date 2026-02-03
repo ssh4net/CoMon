@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_ACTIVITY_GAP_MS: i64 = 2 * 60 * 1000;
+const MAX_SESSION_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_SESSION_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_SESSION_FILES_SCANNED: usize = 10_000;
+const MAX_DISTINCT_MODELS: usize = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageMetric {
@@ -363,6 +367,9 @@ pub fn compute_snapshot(
         return Ok(build_snapshot(updated_at_ms, day_keys, daily, model_totals));
     }
 
+    let mut total_bytes_scanned: u64 = 0;
+    let mut files_scanned: usize = 0;
+
     for day_key in &day_keys {
         let day_dir = day_dir_for_key(&sessions_root, day_key);
         if !day_dir.exists() {
@@ -373,11 +380,40 @@ pub fn compute_snapshot(
             Err(_) => continue,
         };
         for entry in entries.flatten() {
+            if files_scanned >= MAX_SESSION_FILES_SCANNED
+                || total_bytes_scanned >= MAX_SESSION_TOTAL_BYTES
+            {
+                break;
+            }
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                 continue;
             }
+
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            // Never follow symlinks or read special files (FIFOs/devices) from an untrusted sessions tree.
+            if ft.is_symlink() || !ft.is_file() {
+                continue;
+            }
+
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let len = meta.len();
+            if len == 0 || len > MAX_SESSION_FILE_BYTES {
+                continue;
+            }
+            if total_bytes_scanned.saturating_add(len) > MAX_SESSION_TOTAL_BYTES {
+                continue;
+            }
+
             scan_file(&path, &mut daily, &mut model_totals, workspace_path)?;
+            files_scanned += 1;
+            total_bytes_scanned = total_bytes_scanned.saturating_add(len);
         }
     }
 
@@ -467,6 +503,19 @@ fn scan_file(
     model_totals: &mut HashMap<String, i64>,
     workspace_path: Option<&Path>,
 ) -> Result<()> {
+    // Defensive: do not follow symlinks / special files even if called directly.
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(_) => return Ok(()),
+    };
+    let ft = meta.file_type();
+    if ft.is_symlink() || !ft.is_file() {
+        return Ok(());
+    }
+    if meta.len() == 0 || meta.len() > MAX_SESSION_FILE_BYTES {
+        return Ok(());
+    }
+
     let file = match File::open(path) {
         Ok(file) => file,
         Err(_) => return Ok(()),
@@ -650,7 +699,14 @@ fn scan_file(
                         .clone()
                         .or_else(|| extract_model_from_token_count(&value))
                         .unwrap_or_else(|| "unknown".to_string());
-                    *model_totals.entry(model).or_insert(0) += delta.input + delta.output;
+                    if model_totals.len() <= MAX_DISTINCT_MODELS
+                        || model_totals.contains_key(&model)
+                    {
+                        *model_totals.entry(model).or_insert(0) += delta.input + delta.output;
+                    } else {
+                        *model_totals.entry("other".to_string()).or_insert(0) +=
+                            delta.input + delta.output;
+                    }
                 }
             }
 

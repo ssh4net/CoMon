@@ -5,10 +5,14 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{oneshot, Mutex};
 use tokio::time::timeout;
+
+const MAX_RPC_LINE_BYTES: usize = 1024 * 1024;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_PENDING_REQUESTS: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct RateLimitWindow {
@@ -80,27 +84,63 @@ impl CodexRpc {
             next_id: Mutex::new(1),
         });
 
-        // stdout reader
+        // stdout reader (line-length limited)
         {
             let rpc = Arc::clone(&rpc);
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    let value: Value = match serde_json::from_str(&line) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    if let Some(id) = value.get("id").and_then(|v| v.as_u64()) {
-                        let has_result_or_error =
-                            value.get("result").is_some() || value.get("error").is_some();
-                        if has_result_or_error {
-                            if let Some(tx) = rpc.pending.lock().await.remove(&id) {
-                                let _ = tx.send(value);
+                let mut reader = BufReader::new(stdout);
+                let mut buf = Vec::<u8>::with_capacity(8 * 1024);
+                let mut tmp = [0u8; 8 * 1024];
+
+                loop {
+                    match reader.read(&mut tmp).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+
+                            // Process complete lines.
+                            while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+                                let mut line = buf.drain(..=pos).collect::<Vec<u8>>();
+                                if let Some(b'\n') = line.last() {
+                                    line.pop();
+                                }
+                                if let Some(b'\r') = line.last() {
+                                    line.pop();
+                                }
+
+                                if line.is_empty() {
+                                    continue;
+                                }
+                                if line.len() > MAX_RPC_LINE_BYTES {
+                                    // Protocol violation / malicious server: stop processing.
+                                    let mut child = rpc.child.lock().await;
+                                    let _ = child.kill().await;
+                                    return;
+                                }
+
+                                let value: Value = match serde_json::from_slice(&line) {
+                                    Ok(v) => v,
+                                    Err(_) => continue,
+                                };
+                                if let Some(id) = value.get("id").and_then(|v| v.as_u64()) {
+                                    let has_result_or_error = value.get("result").is_some()
+                                        || value.get("error").is_some();
+                                    if has_result_or_error {
+                                        if let Some(tx) = rpc.pending.lock().await.remove(&id) {
+                                            let _ = tx.send(value);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Protect against unbounded growth if a malicious server omits newlines.
+                            if buf.len() > MAX_RPC_LINE_BYTES * 2 {
+                                let mut child = rpc.child.lock().await;
+                                let _ = child.kill().await;
+                                return;
                             }
                         }
+                        Err(_) => break,
                     }
                 }
             });
@@ -108,9 +148,12 @@ impl CodexRpc {
 
         // stderr reader (best-effort; no UI surface yet)
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(_line)) = lines.next_line().await {
-                // ignore; could be forwarded to UI later
+            let mut reader = BufReader::new(stderr);
+            let mut tmp = [0u8; 8 * 1024];
+            loop {
+                if reader.read(&mut tmp).await.unwrap_or(0) == 0 {
+                    break;
+                }
             }
         });
 
@@ -159,13 +202,27 @@ impl CodexRpc {
             id
         };
 
+        {
+            let pending_len = self.pending.lock().await.len();
+            if pending_len >= MAX_PENDING_REQUESTS {
+                return Err(anyhow!("too many pending RPC requests"));
+            }
+        }
+
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
 
         self.write_message(json!({ "id": id, "method": method, "params": params }))
             .await?;
 
-        rx.await.map_err(|_| anyhow!("request canceled"))
+        match timeout(REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(_)) => Err(anyhow!("request canceled")),
+            Err(_) => {
+                let _ = self.pending.lock().await.remove(&id);
+                Err(anyhow!("RPC request timeout after {:?}", REQUEST_TIMEOUT))
+            }
+        }
     }
 
     pub async fn send_notification(&self, method: &str, params: Option<Value>) -> Result<()> {

@@ -44,6 +44,9 @@ Common flags:
 - `--usage-days <n>`: days to scan for usage (default: 30; clamped 1..=90)
 - `--refresh-usage-secs <n>`: usage refresh interval (default: 300)
 - `--refresh-limits-secs <n>`: limits refresh interval (default: 60)
+- `--max-session-file-mib <n>`: max size (MiB) of a single session file to scan (default: 256)
+- `--max-session-total-mib <n>`: max total size (MiB) to scan across session files (default: 256)
+- `--max-session-files <n>`: max number of session files to scan per refresh (default: 10,000)
 
 Example:
 
@@ -64,4 +67,3 @@ Example:
 
 - Usage stats are derived from Codex session JSONL logs. If you have no session data yet, values will be empty.
 - Limits/credits require `codex app-server` to start successfully (auth, environment, and a usable working directory).
-

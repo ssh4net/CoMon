@@ -5,12 +5,30 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::{Duration as StdDuration, SystemTime};
 
 const MAX_ACTIVITY_GAP_MS: i64 = 2 * 60 * 1000;
-const MAX_SESSION_FILE_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_SESSION_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_SESSION_FILES_SCANNED: usize = 10_000;
+const DEFAULT_MAX_SESSION_FILE_BYTES: u64 = 256 * 1024 * 1024;
+const DEFAULT_MAX_SESSION_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+const DEFAULT_MAX_SESSION_FILES_SCANNED: usize = 10_000;
 const MAX_DISTINCT_MODELS: usize = 5_000;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ScanLimits {
+    pub max_session_file_bytes: u64,
+    pub max_session_total_bytes: u64,
+    pub max_session_files_scanned: usize,
+}
+
+impl Default for ScanLimits {
+    fn default() -> Self {
+        Self {
+            max_session_file_bytes: DEFAULT_MAX_SESSION_FILE_BYTES,
+            max_session_total_bytes: DEFAULT_MAX_SESSION_TOTAL_BYTES,
+            max_session_files_scanned: DEFAULT_MAX_SESSION_FILES_SCANNED,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageMetric {
@@ -347,6 +365,7 @@ pub fn compute_snapshot(
     days: u32,
     codex_home: &Path,
     workspace_path: Option<&Path>,
+    limits: ScanLimits,
 ) -> Result<LocalUsageSnapshot> {
     let days = days.clamp(1, 90);
 
@@ -362,57 +381,112 @@ pub fn compute_snapshot(
         return Ok(build_snapshot(day_keys, daily, model_totals));
     }
 
+    // Prefer scanning by file mtime instead of directory date: long-running sessions can live in an
+    // older day folder but still accrue usage today.
+    let cutoff = SystemTime::now().checked_sub(StdDuration::from_secs(
+        (days as u64).saturating_mul(24 * 60 * 60),
+    ));
+    let mut candidates =
+        collect_session_file_candidates(&sessions_root, cutoff, limits.max_session_file_bytes);
+    // Newest activity first.
+    candidates.sort_by(|a, b| {
+        b.modified_epoch_secs
+            .cmp(&a.modified_epoch_secs)
+            .then_with(|| a.len.cmp(&b.len))
+    });
+
     let mut total_bytes_scanned: u64 = 0;
     let mut files_scanned: usize = 0;
 
-    for day_key in &day_keys {
-        let day_dir = day_dir_for_key(&sessions_root, day_key);
-        if !day_dir.exists() {
+    for candidate in candidates {
+        if files_scanned >= limits.max_session_files_scanned
+            || total_bytes_scanned >= limits.max_session_total_bytes
+        {
+            break;
+        }
+        if total_bytes_scanned.saturating_add(candidate.len) > limits.max_session_total_bytes {
             continue;
         }
-        let entries = match std::fs::read_dir(&day_dir) {
+        scan_file(
+            &candidate.path,
+            &mut daily,
+            &mut model_totals,
+            workspace_path,
+            limits.max_session_file_bytes,
+        )?;
+        files_scanned += 1;
+        total_bytes_scanned = total_bytes_scanned.saturating_add(candidate.len);
+    }
+
+    Ok(build_snapshot(day_keys, daily, model_totals))
+}
+
+#[derive(Debug, Clone)]
+struct SessionFileCandidate {
+    path: PathBuf,
+    len: u64,
+    modified_epoch_secs: Option<u64>,
+}
+
+fn collect_session_file_candidates(
+    sessions_root: &Path,
+    cutoff: Option<SystemTime>,
+    max_session_file_bytes: u64,
+) -> Vec<SessionFileCandidate> {
+    let mut out: Vec<SessionFileCandidate> = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![sessions_root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(_) => continue,
         };
         for entry in entries.flatten() {
-            if files_scanned >= MAX_SESSION_FILES_SCANNED
-                || total_bytes_scanned >= MAX_SESSION_TOTAL_BYTES
-            {
-                break;
-            }
             let path = entry.path();
+            // Never follow symlinks or read special files (FIFOs/devices) from an untrusted sessions tree.
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(_) => continue,
+            };
+            let ft = meta.file_type();
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
             if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                 continue;
             }
 
-            let ft = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            // Never follow symlinks or read special files (FIFOs/devices) from an untrusted sessions tree.
-            if ft.is_symlink() || !ft.is_file() {
-                continue;
-            }
-
-            let meta = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
             let len = meta.len();
-            if len == 0 || len > MAX_SESSION_FILE_BYTES {
-                continue;
-            }
-            if total_bytes_scanned.saturating_add(len) > MAX_SESSION_TOTAL_BYTES {
+            if len == 0 || len > max_session_file_bytes {
                 continue;
             }
 
-            scan_file(&path, &mut daily, &mut model_totals, workspace_path)?;
-            files_scanned += 1;
-            total_bytes_scanned = total_bytes_scanned.saturating_add(len);
+            let modified = meta.modified().ok();
+            if let (Some(cutoff), Some(modified)) = (cutoff, modified) {
+                if modified < cutoff {
+                    continue;
+                }
+            }
+
+            let modified_epoch_secs = modified
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
+            out.push(SessionFileCandidate {
+                path,
+                len,
+                modified_epoch_secs,
+            });
         }
     }
 
-    Ok(build_snapshot(day_keys, daily, model_totals))
+    out
 }
 
 fn build_snapshot(
@@ -496,6 +570,7 @@ fn scan_file(
     daily: &mut HashMap<String, DailyTotals>,
     model_totals: &mut HashMap<String, i64>,
     workspace_path: Option<&Path>,
+    max_session_file_bytes: u64,
 ) -> Result<()> {
     // Defensive: do not follow symlinks / special files even if called directly.
     let meta = match std::fs::symlink_metadata(path) {
@@ -506,7 +581,7 @@ fn scan_file(
     if ft.is_symlink() || !ft.is_file() {
         return Ok(());
     }
-    if meta.len() == 0 || meta.len() > MAX_SESSION_FILE_BYTES {
+    if meta.len() == 0 || meta.len() > max_session_file_bytes {
         return Ok(());
     }
 
@@ -847,16 +922,6 @@ fn make_day_keys(days: u32) -> Vec<String> {
             day.format("%Y-%m-%d").to_string()
         })
         .collect()
-}
-
-fn day_dir_for_key(root: &Path, day_key: &str) -> PathBuf {
-    // Defensive fallbacks: `day_key` is expected to be `YYYY-MM-DD` (as produced by `make_day_keys`),
-    // but session directories are treated as untrusted input.
-    let mut parts = day_key.split('-');
-    let year = parts.next().unwrap_or("1970");
-    let month = parts.next().unwrap_or("01");
-    let day = parts.next().unwrap_or("01");
-    root.join(year).join(month).join(day)
 }
 
 pub fn format_count(value: i64) -> String {

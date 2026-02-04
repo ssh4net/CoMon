@@ -16,6 +16,7 @@ pub struct Config {
     pub usage_days: u32,
     pub refresh_usage_secs: u64,
     pub refresh_limits_secs: u64,
+    pub usage_scan_limits: crate::usage::ScanLimits,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +81,7 @@ async fn run_inner(
         let evt_tx = evt_tx.clone();
         let codex_home = config.codex_home.clone();
         let usage_days = config.usage_days;
+        let usage_scan_limits = config.usage_scan_limits;
         let refresh = Duration::from_secs(config.refresh_usage_secs);
         let mut usage_refresh_rx = usage_refresh_rx;
         let mut shutdown_rx = shutdown_rx.clone();
@@ -88,7 +90,7 @@ async fn run_inner(
             // Immediate first run
             let first = tokio::task::spawn_blocking({
                 let codex_home = codex_home.clone();
-                move || crate::usage::compute_snapshot(usage_days, &codex_home, None)
+                move || crate::usage::compute_snapshot(usage_days, &codex_home, None, usage_scan_limits)
             })
             .await
             .unwrap_or_else(|err| Err(anyhow!("usage snapshot task failed: {err}")));
@@ -107,7 +109,7 @@ async fn run_inner(
                 }
                 let snapshot = tokio::task::spawn_blocking({
                     let codex_home = codex_home.clone();
-                    move || crate::usage::compute_snapshot(usage_days, &codex_home, None)
+                    move || crate::usage::compute_snapshot(usage_days, &codex_home, None, usage_scan_limits)
                 })
                 .await
                 .unwrap_or_else(|err| Err(anyhow!("usage snapshot task failed: {err}")));

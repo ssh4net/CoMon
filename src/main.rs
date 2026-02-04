@@ -33,6 +33,18 @@ struct Args {
     /// Periodic refresh interval for limits/credits (seconds).
     #[arg(long, default_value_t = 60)]
     refresh_limits_secs: u64,
+
+    /// Max size (MiB) of a single session `.jsonl` file to scan.
+    #[arg(long, default_value_t = 256)]
+    max_session_file_mib: u64,
+
+    /// Max total size (MiB) to scan across session files.
+    #[arg(long, default_value_t = 256)]
+    max_session_total_mib: u64,
+
+    /// Max number of session files to scan per refresh.
+    #[arg(long, default_value_t = 10_000)]
+    max_session_files: usize,
 }
 
 #[tokio::main]
@@ -46,6 +58,21 @@ async fn main() -> Result<()> {
     let codex_home = usage::resolve_codex_home(args.codex_home.clone())
         .context("Unable to resolve CODEX_HOME")?;
 
+    let max_session_total_bytes = args
+        .max_session_total_mib
+        .max(1)
+        .saturating_mul(1024 * 1024);
+    let max_session_file_bytes = args
+        .max_session_file_mib
+        .max(1)
+        .saturating_mul(1024 * 1024)
+        .min(max_session_total_bytes);
+    let usage_scan_limits = usage::ScanLimits {
+        max_session_file_bytes,
+        max_session_total_bytes,
+        max_session_files_scanned: args.max_session_files.max(1),
+    };
+
     let config = app::Config {
         codex_bin: args.codex_bin.clone(),
         codex_home,
@@ -53,6 +80,7 @@ async fn main() -> Result<()> {
         usage_days: args.usage_days.clamp(1, 90),
         refresh_usage_secs: args.refresh_usage_secs.max(30),
         refresh_limits_secs: args.refresh_limits_secs.max(10),
+        usage_scan_limits,
     };
 
     app::run(config).await

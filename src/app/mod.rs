@@ -13,6 +13,7 @@ pub struct Config {
     pub codex_bin: Option<String>,
     pub codex_home: std::path::PathBuf,
     pub cwd: std::path::PathBuf,
+    pub workspace_path: Option<std::path::PathBuf>,
     pub usage_days: u32,
     pub refresh_usage_secs: u64,
     pub refresh_limits_secs: u64,
@@ -32,6 +33,7 @@ enum UiCommand {
     ToggleRange,
     ToggleOrientation,
     ToggleHelp,
+    ConfirmContinue,
     Quit,
 }
 
@@ -48,6 +50,9 @@ pub(crate) struct AppState {
     pub(crate) range: ChartRange,
     pub(crate) orientation: ChartOrientation,
     pub(crate) show_help: bool,
+    pub(crate) workspace_path: Option<std::path::PathBuf>,
+    pub(crate) no_sessions_confirm_open: bool,
+    pub(crate) no_sessions_confirm_dismissed: bool,
 
     pub(crate) usage: Option<LocalUsageSnapshot>,
     pub(crate) usage_updated_at: Option<Instant>,
@@ -80,6 +85,7 @@ async fn run_inner(
     {
         let evt_tx = evt_tx.clone();
         let codex_home = config.codex_home.clone();
+        let workspace_path = config.workspace_path.clone();
         let usage_days = config.usage_days;
         let usage_scan_limits = config.usage_scan_limits;
         let refresh = Duration::from_secs(config.refresh_usage_secs);
@@ -90,7 +96,15 @@ async fn run_inner(
             // Immediate first run
             let first = tokio::task::spawn_blocking({
                 let codex_home = codex_home.clone();
-                move || crate::usage::compute_snapshot(usage_days, &codex_home, None, usage_scan_limits)
+                let workspace_path = workspace_path.clone();
+                move || {
+                    crate::usage::compute_snapshot(
+                        usage_days,
+                        &codex_home,
+                        workspace_path.as_deref(),
+                        usage_scan_limits,
+                    )
+                }
             })
             .await
             .unwrap_or_else(|err| Err(anyhow!("usage snapshot task failed: {err}")));
@@ -109,7 +123,15 @@ async fn run_inner(
                 }
                 let snapshot = tokio::task::spawn_blocking({
                     let codex_home = codex_home.clone();
-                    move || crate::usage::compute_snapshot(usage_days, &codex_home, None, usage_scan_limits)
+                    let workspace_path = workspace_path.clone();
+                    move || {
+                        crate::usage::compute_snapshot(
+                            usage_days,
+                            &codex_home,
+                            workspace_path.as_deref(),
+                            usage_scan_limits,
+                        )
+                    }
                 })
                 .await
                 .unwrap_or_else(|err| Err(anyhow!("usage snapshot task failed: {err}")));
@@ -211,6 +233,9 @@ async fn run_inner(
         range: ChartRange::Week,
         orientation: ChartOrientation::Horizontal,
         show_help: false,
+        workspace_path: config.workspace_path.clone(),
+        no_sessions_confirm_open: false,
+        no_sessions_confirm_dismissed: false,
         usage: None,
         usage_updated_at: None,
         usage_error: None,
@@ -269,12 +294,16 @@ fn map_event_to_cmd(event: Event) -> Option<UiCommand> {
             match (key.code, key.modifiers) {
                 (KeyCode::Char('q'), _) => Some(UiCommand::Quit),
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(UiCommand::Quit),
+                (KeyCode::Esc, _) => Some(UiCommand::Quit),
                 (KeyCode::Char('r'), _) => Some(UiCommand::RefreshAll),
                 (KeyCode::F(5), _) => Some(UiCommand::RefreshAll),
                 (KeyCode::Tab, _) => Some(UiCommand::ToggleMetric),
                 (KeyCode::Char('w'), _) => Some(UiCommand::ToggleRange),
                 (KeyCode::Char('f'), _) => Some(UiCommand::ToggleOrientation),
                 (KeyCode::Char('?'), _) => Some(UiCommand::ToggleHelp),
+                (KeyCode::Enter, _) => Some(UiCommand::ConfirmContinue),
+                (KeyCode::Char('y'), _) => Some(UiCommand::ConfirmContinue),
+                (KeyCode::Char('Y'), _) => Some(UiCommand::ConfirmContinue),
                 _ => None,
             }
         }
@@ -288,12 +317,24 @@ async fn handle_cmd(
     usage_refresh_tx: &mpsc::Sender<()>,
     limits_refresh_tx: &mpsc::Sender<()>,
 ) -> Result<bool> {
+    if state.no_sessions_confirm_open {
+        match cmd {
+            UiCommand::ConfirmContinue => {
+                state.no_sessions_confirm_open = false;
+                state.no_sessions_confirm_dismissed = true;
+                return Ok(true);
+            }
+            UiCommand::Quit => return Ok(true),
+            _ => return Ok(false),
+        }
+    }
     match cmd {
         UiCommand::Quit => Ok(true),
         UiCommand::ToggleHelp => {
             state.show_help = !state.show_help;
             Ok(true)
         }
+        UiCommand::ConfirmContinue => Ok(false),
         UiCommand::ToggleMetric => {
             state.metric = match state.metric {
                 UsageMetric::Tokens => UsageMetric::Time,
@@ -329,6 +370,12 @@ fn handle_event(state: &mut AppState, evt: AppEvent) -> bool {
         AppEvent::UsageUpdated(res) => {
             match res {
                 Ok(snapshot) => {
+                    if state.workspace_path.is_some()
+                        && !state.no_sessions_confirm_dismissed
+                        && snapshot.matched_session_files == 0
+                    {
+                        state.no_sessions_confirm_open = true;
+                    }
                     state.usage = Some(snapshot);
                     state.usage_error = None;
                     state.usage_updated_at = Some(Instant::now());

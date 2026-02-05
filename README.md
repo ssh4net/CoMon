@@ -30,7 +30,15 @@ The binary will be at:
 
 ## Run
 
-Run from a Git repository directory (Codex app-server may require a git repo):
+When started inside a git repository, `comon` auto-detects the repo root and:
+
+- Filters usage stats to that project
+- Uses it as the default working directory for `codex app-server`
+
+If started outside a git repo, usage is shown as **All workspaces**.
+
+If you start outside a git repo but pass `--cwd` (or `--project`) pointing inside a git repo,
+`comon` will auto-detect the git root from that path.
 
 ```bash
 ./target/release/comon
@@ -41,6 +49,7 @@ Common flags:
 - `--codex-home <path>`: override CODEX_HOME (default: `$CODEX_HOME` or `~/.codex`)
 - `--codex-bin <path>`: override Codex CLI binary (default: `codex`)
 - `--cwd <path>`: directory to launch `codex app-server` in (default: current directory)
+- `--project <path>` / `--workspace <path>`: filter usage stats to a specific project/workspace (also becomes default `--cwd` if `--cwd` not set)
 - `--usage-days <n>`: days to scan for usage (default: 30; clamped 1..=90)
 - `--refresh-usage-secs <n>`: usage refresh interval (default: 300)
 - `--refresh-limits-secs <n>`: limits refresh interval (default: 60)
@@ -61,7 +70,8 @@ Example:
 - `f` Toggle layout (Horz/Vert)
 - `r` / `F5` Refresh now (usage + limits)
 - `?` Help overlay
-- `q` Quit
+- `Esc` / `q` Quit
+- `Enter` / `y` Continue past "no sessions found" warning (when shown)
 
 ## Notes
 

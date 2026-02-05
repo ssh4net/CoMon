@@ -176,6 +176,9 @@ pub struct LocalUsageSnapshot {
     pub days: Vec<UsageDay>,
     pub totals: UsageTotalsTokens,
     pub top_models: Vec<LocalUsageModel>,
+    // Number of session files that were identified as belonging to the selected workspace filter.
+    // When no workspace filter is used, this is 0.
+    pub matched_session_files: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -378,7 +381,7 @@ pub fn compute_snapshot(
     let mut model_totals: HashMap<String, i64> = HashMap::new();
 
     if !sessions_root.exists() {
-        return Ok(build_snapshot(day_keys, daily, model_totals));
+        return Ok(build_snapshot(day_keys, daily, model_totals, 0));
     }
 
     // Prefer scanning by file mtime instead of directory date: long-running sessions can live in an
@@ -397,6 +400,7 @@ pub fn compute_snapshot(
 
     let mut total_bytes_scanned: u64 = 0;
     let mut files_scanned: usize = 0;
+    let mut matched_session_files: u32 = 0;
 
     for candidate in candidates {
         if files_scanned >= limits.max_session_files_scanned
@@ -413,12 +417,18 @@ pub fn compute_snapshot(
             &mut model_totals,
             workspace_path,
             limits.max_session_file_bytes,
+            &mut matched_session_files,
         )?;
         files_scanned += 1;
         total_bytes_scanned = total_bytes_scanned.saturating_add(candidate.len);
     }
 
-    Ok(build_snapshot(day_keys, daily, model_totals))
+    Ok(build_snapshot(
+        day_keys,
+        daily,
+        model_totals,
+        matched_session_files,
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -493,6 +503,7 @@ fn build_snapshot(
     day_keys: Vec<String>,
     daily: HashMap<String, DailyTotals>,
     model_totals: HashMap<String, i64>,
+    matched_session_files: u32,
 ) -> LocalUsageSnapshot {
     let mut days: Vec<UsageDay> = Vec::with_capacity(day_keys.len());
     let mut total_tokens = 0i64;
@@ -562,6 +573,7 @@ fn build_snapshot(
             peak_day_tokens,
         },
         top_models,
+        matched_session_files,
     }
 }
 
@@ -571,6 +583,7 @@ fn scan_file(
     model_totals: &mut HashMap<String, i64>,
     workspace_path: Option<&Path>,
     max_session_file_bytes: u64,
+    matched_session_files: &mut u32,
 ) -> Result<()> {
     // Defensive: do not follow symlinks / special files even if called directly.
     let meta = match std::fs::symlink_metadata(path) {
@@ -596,6 +609,7 @@ fn scan_file(
     let mut seen_runs: HashSet<i64> = HashSet::new();
     let mut match_known = workspace_path.is_none();
     let mut matches_workspace = workspace_path.is_none();
+    let mut counted_match = false;
 
     for line in reader.lines() {
         let line = match line {
@@ -620,6 +634,10 @@ fn scan_file(
                 if let Some(filter) = workspace_path {
                     matches_workspace = path_matches_workspace(&cwd, filter);
                     match_known = true;
+                    if matches_workspace && !counted_match {
+                        *matched_session_files = matched_session_files.saturating_add(1);
+                        counted_match = true;
+                    }
                     if !matches_workspace {
                         break;
                     }
@@ -909,7 +927,15 @@ fn extract_cwd(value: &Value) -> Option<String> {
 }
 
 fn path_matches_workspace(cwd: &str, workspace_path: &Path) -> bool {
+    // `cwd` comes from session logs and is untrusted: reject obviously malicious inputs.
+    if cwd.is_empty() || cwd.len() > 4096 || cwd.chars().any(|c| c.is_control()) {
+        return false;
+    }
     let cwd_path = Path::new(cwd);
+    // If we're filtering by an absolute workspace path, require absolute `cwd` too.
+    if workspace_path.is_absolute() && !cwd_path.is_absolute() {
+        return false;
+    }
     cwd_path == workspace_path || cwd_path.starts_with(workspace_path)
 }
 

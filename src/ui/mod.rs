@@ -89,6 +89,9 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     if state.show_help {
         render_help_overlay(frame, area);
     }
+    if state.no_sessions_confirm_open {
+        render_no_sessions_overlay(frame, area, state);
+    }
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -166,11 +169,16 @@ fn render_usage_controls(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         .constraints([Constraint::Min(20), Constraint::Min(0)])
         .split(area);
 
+    let workspace_label = state
+        .workspace_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "All workspaces".to_string());
     let left = Paragraph::new(Line::from(vec![
         Span::styled("WORKSPACE", Style::default().fg(Color::Gray)),
         Span::raw("  "),
         Span::styled(
-            "All workspaces",
+            truncate_middle(&workspace_label, 48),
             Style::default().add_modifier(Modifier::BOLD),
         ),
     ]));
@@ -1242,8 +1250,61 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  f    - toggle layout (Horz/Vert)"),
         Line::from("  r/F5 - refresh usage + limits"),
         Line::from("  ?    - toggle help"),
-        Line::from("  q    - quit"),
+        Line::from("  q/Esc - quit"),
     ]);
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(block)
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: true }),
+        popup,
+    );
+}
+
+fn render_no_sessions_overlay(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let w = area.width.min(74);
+    let h = area.height.min(11);
+    let popup = centered_rect(w, h, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .padding(Padding {
+            left: 2,
+            right: 1,
+            top: 1,
+            bottom: 0,
+        })
+        .title(Span::styled(
+            " Warning! ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+    let project = state
+        .workspace_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "--".to_string());
+
+    let text = Text::from(vec![
+        Line::from("No Codex session files were found for this project."),
+        Line::from(Span::styled(
+            truncate_middle(&project, 64),
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(""),
+        Line::from("Usage will stay empty until you run Codex in this repo."),
+        Line::from("Continue anyway?"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Press Enter/Y to continue. ESC/Q to quit",
+            Style::default().fg(Color::Gray),
+        )),
+    ]);
+
     frame.render_widget(
         Paragraph::new(text)
             .block(block)

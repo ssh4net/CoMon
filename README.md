@@ -64,9 +64,45 @@ comon --codex-home "C:\\Users\\You\\.codex" --cwd "C:\\Repos\\some-git-repo"
 - `Esc` / `q` Quit
 - `Enter` / `y` Continue past "no sessions found" warning (when shown)
 
-## Install (user scope)
+## Build from source
 
-To run the app as `comon` from anywhere, install it to your user profile:
+### 1) Setup Cargo (Rust)
+
+If you don't have `cargo` yet, install Rust via the official `rustup` installer:
+
+Linux/macOS:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+```
+
+Windows:
+
+- Download and run the installer from https://rustup.rs
+
+Verify:
+
+```bash
+cargo --version
+```
+
+### 2) Build the app
+
+From the repository root:
+
+```bash
+cargo build --release
+```
+
+The binary will be at:
+
+- Windows: `target\\release\\comon.exe`
+- Linux/macOS: `target/release/comon`
+
+### 3) Install the app (user scope)
+
+To run `comon` from anywhere:
 
 ```bash
 cargo install --path . --locked --force
@@ -84,19 +120,6 @@ Optional: install into `~/.local` instead:
 ```bash
 cargo install --path . --locked --force --root ~/.local
 ```
-
-## Build (from source)
-
-From the repository root:
-
-```bash
-cargo build --release
-```
-
-The binary will be at:
-
-- Windows: `target\\release\\comon.exe`
-- Linux/macOS: `target/release/comon`
 
 ## Notes
 

@@ -15,19 +15,6 @@ Single-binary, cross-platform TUI for:
 - Codex CLI installed and available as `codex` on your `PATH` (required for live limits/credits).
   - Usage stats still work without Codex CLI (they only need the session logs on disk).
 
-## Build
-
-From the repository root:
-
-```bash
-cargo build --release
-```
-
-The binary will be at:
-
-- Windows: `target\\release\\comon.exe`
-- Linux/macOS: `target/release/comon`
-
 ## Run
 
 When started inside a git repository, `comon` auto-detects the repo root and:
@@ -41,7 +28,11 @@ If you start outside a git repo but pass `--cwd` (or `--project`) pointing insid
 `comon` will auto-detect the git root from that path.
 
 ```bash
-./target/release/comon
+# If installed (recommended):
+comon
+
+# Or run from the repo without installing:
+cargo run --release
 ```
 
 Common flags:
@@ -60,7 +51,7 @@ Common flags:
 Example:
 
 ```bash
-./target/release/comon --codex-home "C:\\Users\\You\\.codex" --cwd "C:\\Repos\\some-git-repo"
+comon --codex-home "C:\\Users\\You\\.codex" --cwd "C:\\Repos\\some-git-repo"
 ```
 
 ## Key bindings
@@ -72,6 +63,40 @@ Example:
 - `?` Help overlay
 - `Esc` / `q` Quit
 - `Enter` / `y` Continue past "no sessions found" warning (when shown)
+
+## Install (user scope)
+
+To run the app as `comon` from anywhere, install it to your user profile:
+
+```bash
+cargo install --path . --locked --force
+```
+
+This installs the binary into:
+
+- Linux/macOS: `~/.cargo/bin`
+- Windows: `%USERPROFILE%\\.cargo\\bin`
+
+Make sure that directory is on your `PATH` (the Rust installer typically does this for you).
+
+Optional: install into `~/.local` instead:
+
+```bash
+cargo install --path . --locked --force --root ~/.local
+```
+
+## Build (from source)
+
+From the repository root:
+
+```bash
+cargo build --release
+```
+
+The binary will be at:
+
+- Windows: `target\\release\\comon.exe`
+- Linux/macOS: `target/release/comon`
 
 ## Notes
 

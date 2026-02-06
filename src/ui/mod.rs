@@ -806,6 +806,7 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
     let mut labels: Vec<String> = Vec::with_capacity(days.len());
     let mut values: Vec<u64> = Vec::with_capacity(days.len());
+    let mut token_out_of_cache_values: Vec<u64> = Vec::with_capacity(days.len());
     for day in &days {
         let label = match state.orientation {
             ChartOrientation::Horizontal => format_day_label_weekday_mmdd(&day.day),
@@ -830,6 +831,7 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             UsageMetric::Runs => day.agent_runs.max(0) as u64,
         };
         values.push(value);
+        token_out_of_cache_values.push((day.total_tokens - day.cached_input_tokens).max(0) as u64);
     }
 
     match state.orientation {
@@ -991,6 +993,7 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
             let visible_labels = &labels[start..];
             let visible_values = &values[start..];
+            let visible_out_of_cache = &token_out_of_cache_values[start..];
 
             let max_value = visible_values.iter().copied().max().unwrap_or(0).max(1);
 
@@ -1012,8 +1015,12 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             // Value column width: size to the widest full number, then anchor the column to the right.
             let desired_value_w = {
                 let mut max_len = 0usize;
-                for v in visible_values {
-                    let s = format_horizontal_value(*v, state.metric, u16::MAX);
+                for (idx, v) in visible_values.iter().enumerate() {
+                    let out_of_cache = match state.metric {
+                        UsageMetric::Tokens => Some(visible_out_of_cache[idx]),
+                        _ => None,
+                    };
+                    let s = format_horizontal_value(*v, out_of_cache, state.metric, u16::MAX);
                     max_len = max_len.max(s.len());
                 }
                 (max_len as u16).clamp(6, 32)
@@ -1111,7 +1118,12 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
                 // Value outside the bar, on the middle line, with 1 leading space.
                 let value_max_width = value_area.width;
-                let value_text = format_horizontal_value(*value, state.metric, value_max_width);
+                let out_of_cache = match state.metric {
+                    UsageMetric::Tokens => Some(visible_out_of_cache[idx]),
+                    _ => None,
+                };
+                let value_text =
+                    format_horizontal_value(*value, out_of_cache, state.metric, value_max_width);
                 let value_text = truncate_middle(&value_text, value_max_width as usize);
                 // Right-align numeric values within the dedicated value column.
                 let start_x = value_area
@@ -1151,9 +1163,48 @@ fn format_day_label_weekday_mmdd(day: &str) -> String {
     format!("{weekday} {:02}/{:02}", date.month(), date.day())
 }
 
-fn format_horizontal_value(value: u64, metric: UsageMetric, max_width: u16) -> String {
+fn format_horizontal_value(
+    value: u64,
+    out_of_cache_tokens: Option<u64>,
+    metric: UsageMetric,
+    max_width: u16,
+) -> String {
     if max_width == 0 {
         return String::new();
+    }
+
+    if metric == UsageMetric::Tokens {
+        if let Some(out_of_cache) = out_of_cache_tokens {
+            let full = format!(
+                "{} / {}",
+                format_count(value as i64),
+                format_count(out_of_cache as i64)
+            );
+            if full.len() <= max_width as usize {
+                return full;
+            }
+
+            let compact = format!(
+                "{} / {}",
+                format_tokens_compact(value as i64),
+                format_tokens_compact(out_of_cache as i64)
+            );
+            if compact.len() <= max_width as usize {
+                return compact;
+            }
+
+            let pair_width = max_width.saturating_sub(1);
+            if pair_width >= 2 {
+                let mut left_w = ((pair_width as usize * 2) / 3) as u16;
+                left_w = left_w.clamp(1, pair_width.saturating_sub(1));
+                let right_w = pair_width.saturating_sub(left_w);
+                return format!(
+                    "{} / {}",
+                    format_compact_kmb(value, left_w),
+                    format_compact_kmb(out_of_cache, right_w),
+                );
+            }
+        }
     }
 
     let full = match metric {
@@ -1591,5 +1642,23 @@ mod tests {
         assert_eq!(truncate_middle("hello", 1), "...");
         assert_eq!(truncate_middle("hello", 2), "...");
         assert_eq!(truncate_middle("hello", 3), "...");
+    }
+
+    #[test]
+    fn horizontal_tokens_show_total_and_out_of_cache() {
+        let out = format_horizontal_value(
+            45_456_785,
+            Some(1_756_241),
+            UsageMetric::Tokens,
+            u16::MAX,
+        );
+        assert_eq!(out, "45,456,785 / 1,756,241");
+    }
+
+    #[test]
+    fn horizontal_tokens_pair_compacts_when_tight() {
+        let out = format_horizontal_value(45_456_785, Some(1_756_241), UsageMetric::Tokens, 10);
+        assert!(out.contains(" / "));
+        assert!(!out.is_empty());
     }
 }

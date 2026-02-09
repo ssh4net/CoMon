@@ -53,6 +53,7 @@ Common flags:
 - `--full-scan`: scan all files under `CODEX_HOME/sessions`, including old months (ignores mtime cutoff)
 - `--no-full-scan`: disable full scan for this run (overrides config)
 - `--scan-cache-max-entries <n>`: max entries kept in cache database (`comon.db`) (default from config)
+- `--rebuild-cache-on-start`: delete local scan cache DB files (`comon.db`, `comon.db-wal`, `comon.db-shm`) before first usage scan
 
 Config precedence:
 

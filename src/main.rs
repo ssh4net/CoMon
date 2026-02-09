@@ -188,6 +188,10 @@ struct Args {
     /// Max number of entries to keep in scan cache (default from config).
     #[arg(long)]
     scan_cache_max_entries: Option<usize>,
+
+    /// Rebuild local scan cache on startup (delete `comon.db` before first usage scan).
+    #[arg(long)]
+    rebuild_cache_on_start: bool,
 }
 
 #[tokio::main]
@@ -297,6 +301,7 @@ async fn main() -> Result<()> {
         refresh_usage_secs,
         refresh_limits_secs,
         usage_scan_limits,
+        rebuild_cache_on_start: args.rebuild_cache_on_start,
     };
 
     app::run(config).await

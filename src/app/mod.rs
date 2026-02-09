@@ -22,6 +22,7 @@ pub struct Config {
     pub refresh_usage_secs: u64,
     pub refresh_limits_secs: u64,
     pub usage_scan_limits: crate::usage::ScanLimits,
+    pub rebuild_cache_on_start: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,12 +160,17 @@ async fn run_inner(
                 PersistedUiState::default_for_workspace(config.workspace_path.clone())
             });
 
+    let scan_cache_db_path = config.comon_home.join("comon.db");
+    if config.rebuild_cache_on_start {
+        clear_scan_cache_files(&scan_cache_db_path)?;
+    }
+
     // Spawn usage worker.
     {
         let evt_tx = evt_tx.clone();
         let codex_home = config.codex_home.clone();
         let workspace_path = restored_ui_state.workspace_path.clone();
-        let scan_cache_db_path = config.comon_home.join("comon.db");
+        let scan_cache_db_path = scan_cache_db_path.clone();
         let usage_days = config.usage_days;
         let usage_scan_limits = config.usage_scan_limits;
         let refresh = Duration::from_secs(config.refresh_usage_secs);
@@ -383,6 +389,41 @@ async fn run_inner(
 
     let final_ui_state = PersistedUiState::from_app_state(&state);
     let _ = save_persisted_ui_state(&config.comon_home, &final_ui_state);
+
+    Ok(())
+}
+
+fn clear_scan_cache_files(path: &Path) -> Result<()> {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut candidate_os = path.as_os_str().to_os_string();
+        candidate_os.push(suffix);
+        let candidate = PathBuf::from(candidate_os);
+
+        let meta = match std::fs::symlink_metadata(&candidate) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Unable to inspect scan cache file {}", candidate.display())
+                });
+            }
+        };
+        let ft = meta.file_type();
+        if ft.is_symlink() {
+            anyhow::bail!(
+                "Refusing to rebuild cache: symlink is not allowed ({})",
+                candidate.display()
+            );
+        }
+        if !ft.is_file() {
+            anyhow::bail!(
+                "Refusing to rebuild cache: expected regular file ({})",
+                candidate.display()
+            );
+        }
+        std::fs::remove_file(&candidate)
+            .with_context(|| format!("Unable to remove scan cache file {}", candidate.display()))?;
+    }
 
     Ok(())
 }

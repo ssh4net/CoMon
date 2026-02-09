@@ -1,11 +1,53 @@
 mod app;
 mod codex_rpc;
+mod storage;
 mod ui;
 mod usage;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::path::PathBuf;
+
+const USER_CONFIG_SCHEMA_VERSION: u32 = 1;
+const USER_CONFIG_FILE_NAME: &str = "config.json";
+const DEFAULT_USAGE_DAYS: u32 = 30;
+const DEFAULT_REFRESH_USAGE_SECS: u64 = 300;
+const DEFAULT_REFRESH_LIMITS_SECS: u64 = 60;
+const DEFAULT_MAX_SESSION_FILE_MIB: u64 = 256;
+const DEFAULT_MAX_SESSION_TOTAL_MIB: u64 = 256;
+const DEFAULT_MAX_SESSION_FILES: usize = 10_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct UserConfig {
+    schema_version: u32,
+    usage_days: u32,
+    refresh_usage_secs: u64,
+    refresh_limits_secs: u64,
+    max_session_file_mib: u64,
+    max_session_total_mib: u64,
+    max_session_files: usize,
+    full_scan: bool,
+    scan_cache_max_entries: usize,
+}
+
+impl Default for UserConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: USER_CONFIG_SCHEMA_VERSION,
+            usage_days: DEFAULT_USAGE_DAYS,
+            refresh_usage_secs: DEFAULT_REFRESH_USAGE_SECS,
+            refresh_limits_secs: DEFAULT_REFRESH_LIMITS_SECS,
+            max_session_file_mib: DEFAULT_MAX_SESSION_FILE_MIB,
+            max_session_total_mib: DEFAULT_MAX_SESSION_TOTAL_MIB,
+            max_session_files: DEFAULT_MAX_SESSION_FILES,
+            full_scan: false,
+            scan_cache_max_entries: usage::DEFAULT_SCAN_CACHE_MAX_ENTRIES,
+        }
+    }
+}
 
 fn validate_dir(path: &std::path::Path, label: &str) -> Result<PathBuf> {
     let meta = std::fs::metadata(path).with_context(|| format!("{label} does not exist"))?;
@@ -30,6 +72,57 @@ fn detect_git_root(start: &std::path::Path) -> Option<PathBuf> {
     None
 }
 
+fn resolve_comon_home(override_home: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(path) = override_home {
+        return Some(path);
+    }
+    if let Ok(value) = std::env::var("COMON_HOME") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    if let Ok(value) = std::env::var("HOME") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed).join(".comon"));
+        }
+    }
+    if let Ok(value) = std::env::var("USERPROFILE") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed).join(".comon"));
+        }
+    }
+    None
+}
+
+fn load_or_bootstrap_user_config(comon_home: &Path) -> Result<UserConfig> {
+    let path = comon_home.join(USER_CONFIG_FILE_NAME);
+    if !path.exists() {
+        let defaults = UserConfig::default();
+        let encoded = serde_json::to_vec_pretty(&defaults).with_context(|| {
+            format!("Unable to encode default user config at {}", path.display())
+        })?;
+        crate::storage::write_private_file(&path, &encoded)?;
+        return Ok(defaults);
+    }
+
+    crate::storage::enforce_private_file_if_exists(&path)?;
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("Unable to read user config {}", path.display()))?;
+    let config = serde_json::from_slice::<UserConfig>(&bytes)
+        .with_context(|| format!("Unable to parse user config {}", path.display()))?;
+    if config.schema_version != USER_CONFIG_SCHEMA_VERSION {
+        anyhow::bail!(
+            "Unsupported comon config schema version: {} (expected {})",
+            config.schema_version,
+            USER_CONFIG_SCHEMA_VERSION
+        );
+    }
+    Ok(config)
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "comon", version, about = "Codex usage + limits TUI")]
 struct Args {
@@ -40,6 +133,14 @@ struct Args {
     /// Override CODEX_HOME (default: $CODEX_HOME or ~/.codex).
     #[arg(long)]
     codex_home: Option<PathBuf>,
+
+    /// Override COMON_HOME for comon-owned state/cache files (default: $COMON_HOME or ~/.comon).
+    #[arg(long)]
+    comon_home: Option<PathBuf>,
+
+    /// Print effective comon config path and exit.
+    #[arg(long)]
+    print_config_path: bool,
 
     /// Working directory to launch `codex app-server` in (default: current directory).
     #[arg(long)]
@@ -52,34 +153,53 @@ struct Args {
     #[arg(long, alias = "workspace")]
     project: Option<PathBuf>,
 
-    /// Number of days to scan for local usage (clamped to 1..=90).
-    #[arg(long, default_value_t = 30)]
-    usage_days: u32,
+    /// Number of days to scan for local usage (clamped to 1..=90; default from config).
+    #[arg(long)]
+    usage_days: Option<u32>,
 
-    /// Periodic refresh interval for usage stats (seconds).
-    #[arg(long, default_value_t = 300)]
-    refresh_usage_secs: u64,
+    /// Periodic refresh interval for usage stats in seconds (default from config).
+    #[arg(long)]
+    refresh_usage_secs: Option<u64>,
 
-    /// Periodic refresh interval for limits/credits (seconds).
-    #[arg(long, default_value_t = 60)]
-    refresh_limits_secs: u64,
+    /// Periodic refresh interval for limits/credits in seconds (default from config).
+    #[arg(long)]
+    refresh_limits_secs: Option<u64>,
 
-    /// Max size (MiB) of a single session `.jsonl` file to scan.
-    #[arg(long, default_value_t = 256)]
-    max_session_file_mib: u64,
+    /// Max size in MiB of a single session `.jsonl` file to scan (default from config).
+    #[arg(long)]
+    max_session_file_mib: Option<u64>,
 
-    /// Max total size (MiB) to scan across session files.
-    #[arg(long, default_value_t = 256)]
-    max_session_total_mib: u64,
+    /// Max total size in MiB to scan across session files (default from config).
+    #[arg(long)]
+    max_session_total_mib: Option<u64>,
 
-    /// Max number of session files to scan per refresh.
-    #[arg(long, default_value_t = 10_000)]
-    max_session_files: usize,
+    /// Max number of session files to scan per refresh (default from config).
+    #[arg(long)]
+    max_session_files: Option<usize>,
+
+    /// Scan all session files under CODEX_HOME/sessions (ignore mtime cutoff; overrides config).
+    #[arg(long, conflicts_with = "no_full_scan")]
+    full_scan: bool,
+
+    /// Disable full session scan even if enabled in config.
+    #[arg(long)]
+    no_full_scan: bool,
+
+    /// Max number of entries to keep in scan cache (default from config).
+    #[arg(long)]
+    scan_cache_max_entries: Option<usize>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    if args.print_config_path {
+        let comon_home = resolve_comon_home(args.comon_home.clone())
+            .context("Unable to resolve COMON_HOME (default: ~/.comon)")?;
+        println!("{}", comon_home.join(USER_CONFIG_FILE_NAME).display());
+        return Ok(());
+    }
 
     let launch_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
@@ -111,32 +231,71 @@ async fn main() -> Result<()> {
     let cwd = cwd_override
         .or_else(|| project.clone())
         .unwrap_or_else(|| launch_dir.clone());
+    let comon_home = resolve_comon_home(args.comon_home.clone())
+        .context("Unable to resolve COMON_HOME (default: ~/.comon)")?;
+    crate::storage::ensure_private_dir(&comon_home)?;
+    let user_config = load_or_bootstrap_user_config(&comon_home)?;
     let codex_home = usage::resolve_codex_home(args.codex_home.clone())
         .context("Unable to resolve CODEX_HOME")?;
 
-    let max_session_total_bytes = args
+    let usage_days = args
+        .usage_days
+        .unwrap_or(user_config.usage_days)
+        .clamp(1, 90);
+    let refresh_usage_secs = args
+        .refresh_usage_secs
+        .unwrap_or(user_config.refresh_usage_secs)
+        .max(30);
+    let refresh_limits_secs = args
+        .refresh_limits_secs
+        .unwrap_or(user_config.refresh_limits_secs)
+        .max(10);
+    let full_scan = if args.full_scan {
+        true
+    } else if args.no_full_scan {
+        false
+    } else {
+        user_config.full_scan
+    };
+    let max_session_total_mib = args
         .max_session_total_mib
-        .max(1)
-        .saturating_mul(1024 * 1024);
-    let max_session_file_bytes = args
+        .unwrap_or(user_config.max_session_total_mib)
+        .max(1);
+    let max_session_file_mib = args
         .max_session_file_mib
+        .unwrap_or(user_config.max_session_file_mib)
         .max(1)
+        .min(max_session_total_mib);
+    let max_session_files = args
+        .max_session_files
+        .unwrap_or(user_config.max_session_files)
+        .max(1);
+    let scan_cache_max_entries = args
+        .scan_cache_max_entries
+        .unwrap_or(user_config.scan_cache_max_entries)
+        .max(1);
+
+    let max_session_total_bytes = max_session_total_mib.saturating_mul(1024 * 1024);
+    let max_session_file_bytes = max_session_file_mib
         .saturating_mul(1024 * 1024)
         .min(max_session_total_bytes);
     let usage_scan_limits = usage::ScanLimits {
         max_session_file_bytes,
         max_session_total_bytes,
-        max_session_files_scanned: args.max_session_files.max(1),
+        max_session_files_scanned: max_session_files,
+        full_scan,
+        scan_cache_max_entries,
     };
 
     let config = app::Config {
         codex_bin: args.codex_bin.clone(),
+        comon_home,
         codex_home,
         cwd,
         workspace_path: project,
-        usage_days: args.usage_days.clamp(1, 90),
-        refresh_usage_secs: args.refresh_usage_secs.max(30),
-        refresh_limits_secs: args.refresh_limits_secs.max(10),
+        usage_days,
+        refresh_usage_secs,
+        refresh_limits_secs,
         usage_scan_limits,
     };
 

@@ -1646,12 +1646,8 @@ mod tests {
 
     #[test]
     fn horizontal_tokens_show_total_and_out_of_cache() {
-        let out = format_horizontal_value(
-            45_456_785,
-            Some(1_756_241),
-            UsageMetric::Tokens,
-            u16::MAX,
-        );
+        let out =
+            format_horizontal_value(45_456_785, Some(1_756_241), UsageMetric::Tokens, u16::MAX);
         assert_eq!(out, "45,456,785 / 1,756,241");
     }
 

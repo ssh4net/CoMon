@@ -1,16 +1,20 @@
 use crate::codex_rpc::{AccountRateLimits, CodexRpc};
 use crate::usage::{ChartRange, LocalUsageSnapshot, UsageMetric};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io::Stdout;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub codex_bin: Option<String>,
+    pub comon_home: std::path::PathBuf,
     pub codex_home: std::path::PathBuf,
     pub cwd: std::path::PathBuf,
     pub workspace_path: Option<std::path::PathBuf>,
@@ -64,6 +68,75 @@ pub(crate) struct AppState {
     pub(crate) limits_enabled: bool,
 }
 
+const STATE_STORE_SCHEMA_VERSION: u32 = 1;
+const STATE_STORE_FILE_NAME: &str = "state.json";
+const STATE_SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistedUiState {
+    metric: UsageMetric,
+    range: ChartRange,
+    orientation: ChartOrientation,
+    workspace_path: Option<PathBuf>,
+    no_sessions_confirm_dismissed: bool,
+}
+
+impl PersistedUiState {
+    fn default_for_workspace(workspace_path: Option<PathBuf>) -> Self {
+        Self {
+            metric: UsageMetric::Tokens,
+            range: ChartRange::Week,
+            orientation: ChartOrientation::Horizontal,
+            workspace_path,
+            no_sessions_confirm_dismissed: false,
+        }
+    }
+
+    fn from_app_state(state: &AppState) -> Self {
+        Self {
+            metric: state.metric,
+            range: state.range,
+            orientation: state.orientation,
+            workspace_path: state.workspace_path.clone(),
+            no_sessions_confirm_dismissed: state.no_sessions_confirm_dismissed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StateStore {
+    schema_version: u32,
+    #[serde(default)]
+    global: StoredGlobalState,
+    #[serde(default)]
+    workspaces: BTreeMap<String, StoredWorkspaceState>,
+}
+
+impl Default for StateStore {
+    fn default() -> Self {
+        Self {
+            schema_version: STATE_STORE_SCHEMA_VERSION,
+            global: StoredGlobalState::default(),
+            workspaces: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct StoredGlobalState {
+    metric: Option<String>,
+    range: Option<String>,
+    orientation: Option<String>,
+    last_workspace_path: Option<String>,
+    updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct StoredWorkspaceState {
+    no_sessions_confirm_dismissed: bool,
+    updated_at: i64,
+}
+
 pub async fn run(config: Config) -> Result<()> {
     let mut terminal = crate::ui::init_terminal()?;
     let result = run_inner(&mut terminal, config).await;
@@ -80,12 +153,18 @@ async fn run_inner(
     let (usage_refresh_tx, usage_refresh_rx) = mpsc::channel::<()>(1);
     let (limits_refresh_tx, limits_refresh_rx) = mpsc::channel::<()>(1);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let restored_ui_state =
+        load_persisted_ui_state(&config.comon_home, config.workspace_path.as_deref())
+            .unwrap_or_else(|_| {
+                PersistedUiState::default_for_workspace(config.workspace_path.clone())
+            });
 
     // Spawn usage worker.
     {
         let evt_tx = evt_tx.clone();
         let codex_home = config.codex_home.clone();
-        let workspace_path = config.workspace_path.clone();
+        let workspace_path = restored_ui_state.workspace_path.clone();
+        let scan_cache_db_path = config.comon_home.join("comon.db");
         let usage_days = config.usage_days;
         let usage_scan_limits = config.usage_scan_limits;
         let refresh = Duration::from_secs(config.refresh_usage_secs);
@@ -97,12 +176,14 @@ async fn run_inner(
             let first = tokio::task::spawn_blocking({
                 let codex_home = codex_home.clone();
                 let workspace_path = workspace_path.clone();
+                let scan_cache_db_path = scan_cache_db_path.clone();
                 move || {
                     crate::usage::compute_snapshot(
                         usage_days,
                         &codex_home,
                         workspace_path.as_deref(),
                         usage_scan_limits,
+                        Some(scan_cache_db_path.as_path()),
                     )
                 }
             })
@@ -124,12 +205,14 @@ async fn run_inner(
                 let snapshot = tokio::task::spawn_blocking({
                     let codex_home = codex_home.clone();
                     let workspace_path = workspace_path.clone();
+                    let scan_cache_db_path = scan_cache_db_path.clone();
                     move || {
                         crate::usage::compute_snapshot(
                             usage_days,
                             &codex_home,
                             workspace_path.as_deref(),
                             usage_scan_limits,
+                            Some(scan_cache_db_path.as_path()),
                         )
                     }
                 })
@@ -229,13 +312,13 @@ async fn run_inner(
     }
 
     let mut state = AppState {
-        metric: UsageMetric::Tokens,
-        range: ChartRange::Week,
-        orientation: ChartOrientation::Horizontal,
+        metric: restored_ui_state.metric,
+        range: restored_ui_state.range,
+        orientation: restored_ui_state.orientation,
         show_help: false,
-        workspace_path: config.workspace_path.clone(),
+        workspace_path: restored_ui_state.workspace_path.clone(),
         no_sessions_confirm_open: false,
-        no_sessions_confirm_dismissed: false,
+        no_sessions_confirm_dismissed: restored_ui_state.no_sessions_confirm_dismissed,
         usage: None,
         usage_updated_at: None,
         usage_error: None,
@@ -250,6 +333,9 @@ async fn run_inner(
 
     let mut last_redraw = Instant::now();
     let min_redraw = Duration::from_millis(50);
+    let mut last_observed_ui_state = PersistedUiState::from_app_state(&state);
+    let mut last_saved_ui_state = last_observed_ui_state.clone();
+    let mut state_changed_at: Option<Instant> = None;
 
     loop {
         let mut dirty = false;
@@ -279,7 +365,24 @@ async fn run_inner(
             terminal.draw(|f| crate::ui::render(f, &state))?;
             last_redraw = Instant::now();
         }
+
+        let current_ui_state = PersistedUiState::from_app_state(&state);
+        if current_ui_state != last_observed_ui_state {
+            last_observed_ui_state = current_ui_state.clone();
+            state_changed_at = Some(Instant::now());
+        }
+        if current_ui_state != last_saved_ui_state
+            && state_changed_at
+                .map(|changed_at| changed_at.elapsed() >= STATE_SAVE_DEBOUNCE)
+                .unwrap_or(true)
+        {
+            let _ = save_persisted_ui_state(&config.comon_home, &current_ui_state);
+            last_saved_ui_state = current_ui_state;
+        }
     }
+
+    let final_ui_state = PersistedUiState::from_app_state(&state);
+    let _ = save_persisted_ui_state(&config.comon_home, &final_ui_state);
 
     Ok(())
 }
@@ -405,6 +508,152 @@ fn handle_event(state: &mut AppState, evt: AppEvent) -> bool {
             true
         }
     }
+}
+
+fn load_persisted_ui_state(
+    comon_home: &Path,
+    workspace_hint: Option<&Path>,
+) -> Result<PersistedUiState> {
+    let store = load_or_bootstrap_state_store(comon_home)?;
+    let mut state =
+        PersistedUiState::default_for_workspace(workspace_hint.map(|path| path.to_path_buf()));
+
+    if let Some(metric_text) = store.global.metric.as_deref() {
+        if let Some(metric) = usage_metric_from_store(metric_text) {
+            state.metric = metric;
+        }
+    }
+    if let Some(range_text) = store.global.range.as_deref() {
+        if let Some(range) = chart_range_from_store(range_text) {
+            state.range = range;
+        }
+    }
+    if let Some(orientation_text) = store.global.orientation.as_deref() {
+        if let Some(orientation) = chart_orientation_from_store(orientation_text) {
+            state.orientation = orientation;
+        }
+    }
+    if state.workspace_path.is_none() {
+        state.workspace_path = store.global.last_workspace_path.map(PathBuf::from);
+    }
+
+    if let Some(workspace_path) = state.workspace_path.as_ref() {
+        let workspace_key = workspace_path.to_string_lossy();
+        if let Some(workspace_state) = store.workspaces.get(workspace_key.as_ref()) {
+            state.no_sessions_confirm_dismissed = workspace_state.no_sessions_confirm_dismissed;
+        }
+    }
+
+    Ok(state)
+}
+
+fn save_persisted_ui_state(comon_home: &Path, state: &PersistedUiState) -> Result<()> {
+    let mut store = load_or_bootstrap_state_store(comon_home)?;
+    let now = unix_time_seconds();
+    let workspace_path_text = state
+        .workspace_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+
+    store.global.metric = Some(usage_metric_to_store(state.metric).to_string());
+    store.global.range = Some(chart_range_to_store(state.range).to_string());
+    store.global.orientation = Some(chart_orientation_to_store(state.orientation).to_string());
+    store.global.last_workspace_path = workspace_path_text.clone();
+    store.global.updated_at = now;
+
+    if let Some(workspace_path_text) = workspace_path_text {
+        store.workspaces.insert(
+            workspace_path_text,
+            StoredWorkspaceState {
+                no_sessions_confirm_dismissed: state.no_sessions_confirm_dismissed,
+                updated_at: now,
+            },
+        );
+    }
+
+    write_state_store(comon_home, &store)
+}
+
+fn load_or_bootstrap_state_store(comon_home: &Path) -> Result<StateStore> {
+    let store_path = comon_home.join(STATE_STORE_FILE_NAME);
+    if !store_path.exists() {
+        return Ok(StateStore::default());
+    }
+    crate::storage::enforce_private_file_if_exists(&store_path)?;
+    let bytes = std::fs::read(&store_path)
+        .with_context(|| format!("Unable to read state store {}", store_path.display()))?;
+    let store = serde_json::from_slice::<StateStore>(&bytes)
+        .with_context(|| format!("Unable to parse state store {}", store_path.display()))?;
+    if store.schema_version != STATE_STORE_SCHEMA_VERSION {
+        anyhow::bail!(
+            "Unsupported comon state schema version: {} (expected {})",
+            store.schema_version,
+            STATE_STORE_SCHEMA_VERSION
+        );
+    }
+    Ok(store)
+}
+
+fn write_state_store(comon_home: &Path, store: &StateStore) -> Result<()> {
+    let store_path = comon_home.join(STATE_STORE_FILE_NAME);
+    let encoded = serde_json::to_vec_pretty(store)
+        .with_context(|| format!("Unable to encode state store {}", store_path.display()))?;
+    crate::storage::write_private_file(&store_path, &encoded)?;
+    Ok(())
+}
+
+fn usage_metric_to_store(metric: UsageMetric) -> &'static str {
+    match metric {
+        UsageMetric::Tokens => "tokens",
+        UsageMetric::Time => "time",
+        UsageMetric::Runs => "runs",
+    }
+}
+
+fn usage_metric_from_store(value: &str) -> Option<UsageMetric> {
+    match value {
+        "tokens" => Some(UsageMetric::Tokens),
+        "time" => Some(UsageMetric::Time),
+        "runs" => Some(UsageMetric::Runs),
+        _ => None,
+    }
+}
+
+fn chart_range_to_store(range: ChartRange) -> &'static str {
+    match range {
+        ChartRange::Week => "week",
+        ChartRange::Month => "month",
+    }
+}
+
+fn chart_range_from_store(value: &str) -> Option<ChartRange> {
+    match value {
+        "week" => Some(ChartRange::Week),
+        "month" => Some(ChartRange::Month),
+        _ => None,
+    }
+}
+
+fn chart_orientation_to_store(orientation: ChartOrientation) -> &'static str {
+    match orientation {
+        ChartOrientation::Vertical => "vertical",
+        ChartOrientation::Horizontal => "horizontal",
+    }
+}
+
+fn chart_orientation_from_store(value: &str) -> Option<ChartOrientation> {
+    match value {
+        "vertical" => Some(ChartOrientation::Vertical),
+        "horizontal" => Some(ChartOrientation::Horizontal),
+        _ => None,
+    }
+}
+
+fn unix_time_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 impl AppState {

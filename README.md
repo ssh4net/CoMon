@@ -15,6 +15,7 @@ Single-binary, cross-platform TUI for:
 - C/C++ compiler toolchain available (needed to build bundled SQLite through `rusqlite`).
 - Codex CLI installed and available as `codex` on your `PATH` (required for live limits/credits).
   - Usage stats still work without Codex CLI (they only need the session logs on disk).
+- For portable Linux builds (`--musl`), `rustup` and musl target toolchain support are required.
 
 ## Run
 
@@ -155,7 +156,14 @@ cargo install --path . --locked --force --root ~/.local
 Linux/macOS:
 
 ```bash
+# Native install (default):
 bash scripts/install-user.sh
+
+# Portable Linux build/install (musl target, auto-detected arch):
+bash scripts/install-user.sh --musl
+
+# Explicit target example:
+bash scripts/install-user.sh --musl --target x86_64-unknown-linux-musl
 ```
 
 Windows PowerShell:
@@ -172,8 +180,72 @@ Optional custom install root:
 Install script behavior:
 
 - Installs `comon` into the chosen user root.
+- Supports optional `--target <triple>` and `--musl` build/install mode on Linux.
+- Adds missing Rust target via `rustup target add` when a target is requested.
 - Prepares `COMON_HOME` (default `~/.comon`, or `$COMON_HOME` if set).
 - Refuses to use symlink/reparse-point `COMON_HOME` paths.
+
+### 5) Build a prebuilt zip package (for GitHub releases)
+
+Portable Linux release order (Debian/Ubuntu example):
+
+```bash
+# 1) Build prerequisites
+sudo apt update
+sudo apt install -y build-essential musl-tools zip
+
+# 2) Rust target for portable Linux builds
+rustup toolchain install stable
+rustup target add x86_64-unknown-linux-musl
+
+# 3) Build + package from repo root
+bash scripts/package-prebuilt.sh --musl
+
+# 4) Upload generated zip to GitHub Release
+ls dist/comon-v*-unknown-linux-musl.zip
+```
+
+Additional maintainer options:
+
+```bash
+# Linux: defaults to portable musl package
+# Other OSes: defaults to host target package
+bash scripts/package-prebuilt.sh
+
+# Build portable Linux package (musl)
+bash scripts/package-prebuilt.sh --musl
+
+# Force host-target package (glibc on Linux)
+bash scripts/package-prebuilt.sh --gnu
+```
+
+Package output:
+
+- `dist/comon-v<version>-<target>.zip`
+
+On Linux, prefer `*-unknown-linux-musl.zip` for maximum compatibility across distros.
+
+Each zip includes:
+
+- `comon` binary
+- `install.sh` (user-scope install, no Cargo needed)
+- `LICENSE`, `README.txt`
+
+### 6) Install from prebuilt zip (no compile)
+
+User flow:
+
+```bash
+unzip comon-v<version>-<target>.zip
+cd comon-v<version>-<target>
+bash install.sh
+```
+
+Optional custom install root:
+
+```bash
+bash install.sh ~/.local
+```
 
 ## Notes
 

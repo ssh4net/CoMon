@@ -18,6 +18,8 @@ const DEFAULT_REFRESH_LIMITS_SECS: u64 = 60;
 const DEFAULT_MAX_SESSION_FILE_MIB: u64 = 256;
 const DEFAULT_MAX_SESSION_TOTAL_MIB: u64 = 256;
 const DEFAULT_MAX_SESSION_FILES: usize = 10_000;
+const DEFAULT_MAX_JSONL_LINE_KIB: u64 = 512;
+const DEFAULT_SCAN_TIME_BUDGET_MS: u64 = 1500;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -29,6 +31,8 @@ struct UserConfig {
     max_session_file_mib: u64,
     max_session_total_mib: u64,
     max_session_files: usize,
+    max_jsonl_line_kib: u64,
+    scan_time_budget_ms: u64,
     full_scan: bool,
     scan_cache_max_entries: usize,
 }
@@ -43,6 +47,8 @@ impl Default for UserConfig {
             max_session_file_mib: DEFAULT_MAX_SESSION_FILE_MIB,
             max_session_total_mib: DEFAULT_MAX_SESSION_TOTAL_MIB,
             max_session_files: DEFAULT_MAX_SESSION_FILES,
+            max_jsonl_line_kib: DEFAULT_MAX_JSONL_LINE_KIB,
+            scan_time_budget_ms: DEFAULT_SCAN_TIME_BUDGET_MS,
             full_scan: false,
             scan_cache_max_entries: usage::DEFAULT_SCAN_CACHE_MAX_ENTRIES,
         }
@@ -165,7 +171,9 @@ struct Args {
     #[arg(long)]
     refresh_limits_secs: Option<u64>,
 
-    /// Max size in MiB of a single session `.jsonl` file to scan (default from config).
+    /// Per-file scan budget weight in MiB used by planner (default from config).
+    ///
+    /// Large files are still supported via incremental parsing and cache offsets.
     #[arg(long)]
     max_session_file_mib: Option<u64>,
 
@@ -176,6 +184,14 @@ struct Args {
     /// Max number of session files to scan per refresh (default from config).
     #[arg(long)]
     max_session_files: Option<usize>,
+
+    /// Max size in KiB of one JSONL line parsed from session files (default from config).
+    #[arg(long)]
+    max_jsonl_line_kib: Option<u64>,
+
+    /// Max parse budget in milliseconds per refresh (0 = unlimited; default from config).
+    #[arg(long)]
+    scan_time_budget_ms: Option<u64>,
 
     /// Scan all session files under CODEX_HOME/sessions (ignore mtime cutoff; overrides config).
     #[arg(long, conflicts_with = "no_full_scan")]
@@ -274,6 +290,13 @@ async fn main() -> Result<()> {
         .max_session_files
         .unwrap_or(user_config.max_session_files)
         .max(1);
+    let max_jsonl_line_kib = args
+        .max_jsonl_line_kib
+        .unwrap_or(user_config.max_jsonl_line_kib)
+        .max(1);
+    let scan_time_budget_ms = args
+        .scan_time_budget_ms
+        .unwrap_or(user_config.scan_time_budget_ms);
     let scan_cache_max_entries = args
         .scan_cache_max_entries
         .unwrap_or(user_config.scan_cache_max_entries)
@@ -283,10 +306,14 @@ async fn main() -> Result<()> {
     let max_session_file_bytes = max_session_file_mib
         .saturating_mul(1024 * 1024)
         .min(max_session_total_bytes);
+    let max_jsonl_line_bytes =
+        usize::try_from(max_jsonl_line_kib.saturating_mul(1024)).unwrap_or(usize::MAX);
     let usage_scan_limits = usage::ScanLimits {
         max_session_file_bytes,
         max_session_total_bytes,
         max_session_files_scanned: max_session_files,
+        max_jsonl_line_bytes,
+        scan_time_budget_ms,
         full_scan,
         scan_cache_max_entries,
     };

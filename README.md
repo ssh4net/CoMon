@@ -7,7 +7,18 @@ Single-binary, cross-platform TUI for:
 - Local Codex usage stats (last 7/30 days, chart, top models) by scanning `CODEX_HOME/sessions`.
 - Live account limits/credits by spawning `codex app-server` and calling `account/rateLimits/read`.
 
+See `CHANGELOG.md` for release history.
+
 <img width="1647" height="861" alt="Dkh7CxLgx7" src="https://github.com/user-attachments/assets/edec765d-0924-493b-8c10-cb32bca867a9" />
+
+## Release 0.3.0
+
+- Added incremental session parsing with persisted offsets and parser state in `comon.db`.
+- Reduced restart regressions: unchanged files outside current scan plan now stay visible via cache.
+- Added `--scan-time-budget-ms` for bounded per-refresh parse time (`0` disables budget).
+- Added `--max-jsonl-line-kib` to cap parsed line size without hard-dropping large files.
+- Added cache DB schema migration (`v1 -> v2`) for offset/parser-state fields.
+- For historical backfill after copying older sessions, run once: `comon --full-scan --scan-time-budget-ms 0`
 
 ## Requirements
 
@@ -48,9 +59,11 @@ Common flags:
 - `--usage-days <n>`: days to scan for usage (clamped 1..=90; default from config)
 - `--refresh-usage-secs <n>`: usage refresh interval in seconds (default from config)
 - `--refresh-limits-secs <n>`: limits refresh interval in seconds (default from config)
-- `--max-session-file-mib <n>`: max size (MiB) of a single session file to scan (default from config)
+- `--max-session-file-mib <n>`: per-file planning weight (MiB) for scan budget (default from config)
 - `--max-session-total-mib <n>`: max total size (MiB) to scan across session files (default from config)
 - `--max-session-files <n>`: max number of session files to scan per refresh (default from config)
+- `--max-jsonl-line-kib <n>`: max parsed JSONL line size in KiB (default from config)
+- `--scan-time-budget-ms <n>`: max parse time budget per refresh in ms (`0` disables budget)
 - `--full-scan`: scan all files under `CODEX_HOME/sessions`, including old months (ignores mtime cutoff)
 - `--no-full-scan`: disable full scan for this run (overrides config)
 - `--scan-cache-max-entries <n>`: max entries kept in cache database (`comon.db`) (default from config)
@@ -73,6 +86,8 @@ Config precedence:
   "max_session_file_mib": 256,
   "max_session_total_mib": 256,
   "max_session_files": 10000,
+  "max_jsonl_line_kib": 512,
+  "scan_time_budget_ms": 1500,
   "full_scan": false,
   "scan_cache_max_entries": 50000
 }
@@ -82,6 +97,16 @@ Example:
 
 ```bash
 comon --codex-home "C:\\Users\\You\\.codex" --cwd "C:\\Repos\\some-git-repo"
+```
+
+Large-log recovery/tuning example:
+
+```bash
+# One-time backfill for copied/old sessions:
+comon --full-scan --scan-time-budget-ms 0
+
+# Normal usage with bounded incremental refresh:
+comon --scan-time-budget-ms 1500 --max-jsonl-line-kib 512
 ```
 
 ## Key bindings
@@ -247,12 +272,28 @@ Optional custom install root:
 bash install.sh ~/.local
 ```
 
+## Development checks
+
+ASCII-only guardrails for docs/code/scripts:
+
+```bash
+# Run full repository check (tracked files)
+bash scripts/check-ascii.sh
+
+# Install local pre-commit hook (checks staged files on commit)
+bash scripts/install-pre-commit-hook.sh
+```
+
+CI also runs this check on each push and pull request via `.github/workflows/ascii-check.yml`.
+
 ## Notes
 
 - Usage stats are derived from Codex session JSONL logs. If you have no session data yet, values will be empty.
 - Limits/credits require `codex app-server` to start successfully (auth, environment, and a usable working directory).
 - comon stores local app state in `~/.comon/state.json` by default (or `$COMON_HOME`, or `--comon-home`).
 - comon stores scan cache in `~/.comon/comon.db` to avoid rereading unchanged session files.
+- Large session logs are parsed incrementally with persisted parser offsets in `comon.db`; unchanged files are reused from cache.
+- If historical days look incomplete after adding old session files, run once with `--full-scan --scan-time-budget-ms 0` to complete backfill.
 - comon uses embedded SQLite (`rusqlite` with bundled SQLite); no system `sqlite3` CLI is required at runtime.
 - comon stores user-editable runtime settings in `~/.comon/config.json` by default.
 - Privacy: comon stores metadata (workspace paths, timestamps, token/run/time aggregates) and does not persist prompt/completion text.

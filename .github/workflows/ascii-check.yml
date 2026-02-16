@@ -1,0 +1,14 @@
+name: ASCII Check
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  ascii-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Run ASCII check
+        run: bash scripts/check-ascii.sh

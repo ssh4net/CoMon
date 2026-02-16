@@ -6,16 +6,18 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::{Duration as StdDuration, SystemTime};
+use std::time::{Duration as StdDuration, Instant, SystemTime};
 
 const MAX_ACTIVITY_GAP_MS: i64 = 2 * 60 * 1000;
 const DEFAULT_MAX_SESSION_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_MAX_SESSION_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_MAX_SESSION_FILES_SCANNED: usize = 10_000;
+const DEFAULT_MAX_JSONL_LINE_BYTES: usize = 512 * 1024;
+const DEFAULT_SCAN_TIME_BUDGET_MS: u64 = 1500;
 const MAX_DISTINCT_MODELS: usize = 5_000;
-const SCAN_CACHE_DB_SCHEMA_VERSION: i64 = 1;
+const SCAN_CACHE_DB_SCHEMA_VERSION: i64 = 2;
 pub const DEFAULT_SCAN_CACHE_MAX_ENTRIES: usize = 50_000;
 
 #[derive(Debug, Clone, Copy)]
@@ -23,6 +25,8 @@ pub struct ScanLimits {
     pub max_session_file_bytes: u64,
     pub max_session_total_bytes: u64,
     pub max_session_files_scanned: usize,
+    pub max_jsonl_line_bytes: usize,
+    pub scan_time_budget_ms: u64,
     pub full_scan: bool,
     pub scan_cache_max_entries: usize,
 }
@@ -33,6 +37,8 @@ impl Default for ScanLimits {
             max_session_file_bytes: DEFAULT_MAX_SESSION_FILE_BYTES,
             max_session_total_bytes: DEFAULT_MAX_SESSION_TOTAL_BYTES,
             max_session_files_scanned: DEFAULT_MAX_SESSION_FILES_SCANNED,
+            max_jsonl_line_bytes: DEFAULT_MAX_JSONL_LINE_BYTES,
+            scan_time_budget_ms: DEFAULT_SCAN_TIME_BUDGET_MS,
             full_scan: false,
             scan_cache_max_entries: DEFAULT_SCAN_CACHE_MAX_ENTRIES,
         }
@@ -343,11 +349,21 @@ struct DailyTotals {
     agent_runs: i64,
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 struct UsageTotals {
     input: i64,
     cached: i64,
     output: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ParserState {
+    #[serde(default)]
+    previous_totals: Option<UsageTotals>,
+    #[serde(default)]
+    current_model: Option<String>,
+    #[serde(default)]
+    last_activity_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -359,7 +375,13 @@ struct ScanCacheStore {
 struct CachedFileScanEntry {
     size: u64,
     modified_epoch_secs: Option<u64>,
+    #[serde(default)]
+    file_offset: u64,
+    #[serde(default = "default_true")]
+    fully_parsed: bool,
     session_cwd: Option<String>,
+    #[serde(default)]
+    parser_state: ParserState,
     #[serde(default)]
     daily: HashMap<String, DailyTotals>,
     #[serde(default)]
@@ -370,8 +392,15 @@ struct CachedFileScanEntry {
 #[derive(Debug, Clone, Default)]
 struct FileScanSummary {
     session_cwd: Option<String>,
+    parser_state: ParserState,
+    file_offset: u64,
+    fully_parsed: bool,
     daily: HashMap<String, DailyTotals>,
     model_totals_by_day: HashMap<String, HashMap<String, i64>>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug)]
@@ -424,17 +453,9 @@ pub fn compute_snapshot(
         return Ok(build_snapshot(day_keys, daily, model_totals, 0));
     }
 
-    // Prefer scanning by file mtime instead of directory date: long-running sessions can live in an
-    // older day folder but still accrue usage today.
-    let cutoff = if limits.full_scan {
-        None
-    } else {
-        SystemTime::now().checked_sub(StdDuration::from_secs(
-            (days as u64).saturating_mul(24 * 60 * 60),
-        ))
-    };
-    let mut candidates =
-        collect_session_file_candidates(&sessions_root, cutoff, limits.max_session_file_bytes);
+    // Build a full candidate list (metadata-only). We still apply scan limits for parsing, but we
+    // can safely reuse unchanged cached summaries for files that fall outside current scan budget.
+    let mut candidates = collect_session_file_candidates(&sessions_root);
     // Newest activity first.
     candidates.sort_by(|a, b| {
         b.modified_epoch_secs
@@ -442,82 +463,181 @@ pub fn compute_snapshot(
             .then_with(|| a.len.cmp(&b.len))
     });
 
+    // Prefer scanning by file mtime instead of directory date: long-running sessions can live in an
+    // older day folder but still accrue usage today.
+    let cutoff_epoch_secs = if limits.full_scan {
+        None
+    } else {
+        SystemTime::now()
+            .checked_sub(StdDuration::from_secs(
+                (days as u64).saturating_mul(24 * 60 * 60),
+            ))
+            .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs())
+    };
+
     let mut planned_indices: Vec<usize> = Vec::new();
     let mut planned_total_bytes: u64 = 0;
     let mut planned_files: usize = 0;
     for (idx, candidate) in candidates.iter().enumerate() {
+        if let (Some(cutoff), Some(modified)) = (cutoff_epoch_secs, candidate.modified_epoch_secs) {
+            if modified < cutoff {
+                continue;
+            }
+        }
         if planned_files >= limits.max_session_files_scanned
             || planned_total_bytes >= limits.max_session_total_bytes
         {
             break;
         }
-        if planned_total_bytes.saturating_add(candidate.len) > limits.max_session_total_bytes {
+        let candidate_weight = candidate.len.min(limits.max_session_file_bytes.max(1));
+        if planned_files > 0
+            && planned_total_bytes.saturating_add(candidate_weight) > limits.max_session_total_bytes
+        {
             continue;
         }
         planned_indices.push(idx);
         planned_files += 1;
-        planned_total_bytes = planned_total_bytes.saturating_add(candidate.len);
+        planned_total_bytes = planned_total_bytes.saturating_add(candidate_weight);
     }
 
     let mut matched_session_files: u32 = 0;
     let mut scan_cache_db = scan_cache_db_path
         .map(open_or_init_scan_cache_db)
         .transpose()?;
-    let cache_candidate_paths: Vec<String> = planned_indices
+    let candidate_paths: Vec<String> = candidates
         .iter()
-        .map(|idx| candidates[*idx].path.to_string_lossy().to_string())
+        .map(|candidate| candidate.path.to_string_lossy().to_string())
         .collect();
-    let (mut scan_cache_store, removed_cache_paths) = if let Some(db) = scan_cache_db.as_ref() {
-        load_scan_cache_store_for_candidates(db, &cache_candidate_paths)?
+    let planned_set: HashSet<usize> = planned_indices.iter().copied().collect();
+    let (mut scan_cache_store, mut removed_cache_paths) = if let Some(db) = scan_cache_db.as_ref() {
+        load_scan_cache_store(db)?
     } else {
         (ScanCacheStore::default(), HashSet::new())
     };
     let mut dirty_cache_paths: HashSet<String> = HashSet::new();
+    let scan_deadline = if limits.scan_time_budget_ms == 0 {
+        None
+    } else {
+        Instant::now().checked_add(StdDuration::from_millis(limits.scan_time_budget_ms))
+    };
 
-    for idx in planned_indices {
-        let candidate = &candidates[idx];
-        if scan_cache_db.is_some() {
-            let candidate_key = candidate.path.to_string_lossy().to_string();
-            let cached_entry = scan_cache_store
-                .entries
-                .get(&candidate_key)
-                .filter(|entry| {
-                    entry.size == candidate.len
-                        && entry.modified_epoch_secs == candidate.modified_epoch_secs
-                })
+    if scan_cache_db.is_some() {
+        let valid_paths: HashSet<&str> =
+            candidate_paths.iter().map(|value| value.as_str()).collect();
+        scan_cache_store.entries.retain(|file_path, _| {
+            let keep = valid_paths.contains(file_path.as_str());
+            if !keep {
+                removed_cache_paths.insert(file_path.clone());
+            }
+            keep
+        });
+
+        for (idx, candidate) in candidates.iter().enumerate() {
+            let candidate_key = &candidate_paths[idx];
+            let cached_entry = scan_cache_store.entries.get(candidate_key).cloned();
+            let cached_entry_matches = cached_entry
+                .as_ref()
+                .filter(|entry| cache_entry_matches_candidate(entry, candidate))
                 .cloned();
-            let entry = if let Some(entry) = cached_entry {
-                entry
-            } else {
-                let parsed = parse_file_summary(&candidate.path, limits.max_session_file_bytes)?;
-                let entry = CachedFileScanEntry {
-                    size: candidate.len,
-                    modified_epoch_secs: candidate.modified_epoch_secs,
-                    session_cwd: parsed.session_cwd,
-                    daily: parsed.daily,
-                    model_totals_by_day: parsed.model_totals_by_day,
-                    updated_at: unix_time_seconds(),
+
+            if planned_set.contains(&idx) {
+                let entry = if let Some(entry) = cached_entry_matches {
+                    entry
+                } else {
+                    if let Some(deadline) = scan_deadline {
+                        if Instant::now() >= deadline {
+                            if let Some(stale) = cached_entry {
+                                apply_cached_file_entry(
+                                    &stale,
+                                    workspace_path,
+                                    &mut daily,
+                                    &mut model_totals,
+                                    &mut matched_session_files,
+                                );
+                            }
+                            continue;
+                        }
+                    }
+
+                    let parsed = match parse_file_summary(
+                        &candidate.path,
+                        limits.max_jsonl_line_bytes,
+                        cached_entry.as_ref(),
+                        scan_deadline,
+                    ) {
+                        Ok(parsed) => parsed,
+                        Err(_) => {
+                            if let Some(stale) = cached_entry {
+                                apply_cached_file_entry(
+                                    &stale,
+                                    workspace_path,
+                                    &mut daily,
+                                    &mut model_totals,
+                                    &mut matched_session_files,
+                                );
+                            }
+                            continue;
+                        }
+                    };
+                    let entry = CachedFileScanEntry {
+                        size: candidate.len,
+                        modified_epoch_secs: candidate.modified_epoch_secs,
+                        file_offset: parsed.file_offset.min(candidate.len),
+                        fully_parsed: parsed.fully_parsed,
+                        session_cwd: parsed.session_cwd,
+                        parser_state: parsed.parser_state,
+                        daily: parsed.daily,
+                        model_totals_by_day: parsed.model_totals_by_day,
+                        updated_at: unix_time_seconds(),
+                    };
+                    scan_cache_store
+                        .entries
+                        .insert(candidate_key.clone(), entry.clone());
+                    dirty_cache_paths.insert(candidate_key.clone());
+                    entry
                 };
-                scan_cache_store
-                    .entries
-                    .insert(candidate_key.clone(), entry.clone());
-                dirty_cache_paths.insert(candidate_key);
-                entry
-            };
-            apply_cached_file_entry(
-                &entry,
-                workspace_path,
-                &mut daily,
-                &mut model_totals,
-                &mut matched_session_files,
-            );
-        } else {
+                apply_cached_file_entry(
+                    &entry,
+                    workspace_path,
+                    &mut daily,
+                    &mut model_totals,
+                    &mut matched_session_files,
+                );
+                continue;
+            }
+
+            if let Some(entry) = cached_entry_matches {
+                apply_cached_file_entry(
+                    &entry,
+                    workspace_path,
+                    &mut daily,
+                    &mut model_totals,
+                    &mut matched_session_files,
+                );
+                continue;
+            }
+
+            if let Some(stale) = cached_entry {
+                apply_cached_file_entry(
+                    &stale,
+                    workspace_path,
+                    &mut daily,
+                    &mut model_totals,
+                    &mut matched_session_files,
+                );
+            }
+        }
+    } else {
+        for idx in planned_indices {
+            let candidate = &candidates[idx];
             scan_file(
                 &candidate.path,
                 &mut daily,
                 &mut model_totals,
                 workspace_path,
                 limits.max_session_file_bytes,
+                limits.max_jsonl_line_bytes,
                 &mut matched_session_files,
             )?;
         }
@@ -553,11 +673,7 @@ struct SessionFileCandidate {
     modified_epoch_secs: Option<u64>,
 }
 
-fn collect_session_file_candidates(
-    sessions_root: &Path,
-    cutoff: Option<SystemTime>,
-    max_session_file_bytes: u64,
-) -> Vec<SessionFileCandidate> {
+fn collect_session_file_candidates(sessions_root: &Path) -> Vec<SessionFileCandidate> {
     let mut out: Vec<SessionFileCandidate> = Vec::new();
     let mut stack: Vec<PathBuf> = vec![sessions_root.to_path_buf()];
 
@@ -589,17 +705,11 @@ fn collect_session_file_candidates(
             }
 
             let len = meta.len();
-            if len == 0 || len > max_session_file_bytes {
+            if len == 0 {
                 continue;
             }
 
             let modified = meta.modified().ok();
-            if let (Some(cutoff), Some(modified)) = (cutoff, modified) {
-                if modified < cutoff {
-                    continue;
-                }
-            }
-
             let modified_epoch_secs = modified
                 .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs());
@@ -612,6 +722,16 @@ fn collect_session_file_candidates(
     }
 
     out
+}
+
+fn cache_entry_matches_candidate(
+    entry: &CachedFileScanEntry,
+    candidate: &SessionFileCandidate,
+) -> bool {
+    entry.fully_parsed
+        && entry.size == candidate.len
+        && entry.modified_epoch_secs == candidate.modified_epoch_secs
+        && entry.file_offset >= candidate.len
 }
 
 fn build_snapshot(
@@ -750,7 +870,12 @@ fn apply_cached_file_entry(
     }
 }
 
-fn parse_file_summary(path: &Path, max_session_file_bytes: u64) -> Result<FileScanSummary> {
+fn parse_file_summary(
+    path: &Path,
+    max_jsonl_line_bytes: usize,
+    existing: Option<&CachedFileScanEntry>,
+    deadline: Option<Instant>,
+) -> Result<FileScanSummary> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(_) => return Ok(FileScanSummary::default()),
@@ -759,30 +884,93 @@ fn parse_file_summary(path: &Path, max_session_file_bytes: u64) -> Result<FileSc
     if ft.is_symlink() || !ft.is_file() {
         return Ok(FileScanSummary::default());
     }
-    if meta.len() == 0 || meta.len() > max_session_file_bytes {
+    if meta.len() == 0 {
         return Ok(FileScanSummary::default());
     }
 
-    let file = match File::open(path) {
+    let mut file = match File::open(path) {
         Ok(file) => file,
         Err(_) => return Ok(FileScanSummary::default()),
     };
+    let file_len = meta.len();
+    let current_modified_epoch = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs());
 
-    let mut daily: HashMap<String, DailyTotals> = HashMap::new();
-    let mut model_totals_by_day: HashMap<String, HashMap<String, i64>> = HashMap::new();
-    let mut session_cwd: Option<String> = None;
-    let reader = BufReader::new(file);
-    let mut previous_totals: Option<UsageTotals> = None;
-    let mut current_model: Option<String> = None;
-    let mut last_activity_ms: Option<i64> = None;
+    let can_resume = existing
+        .filter(|entry| entry.file_offset > 0 && entry.file_offset <= file_len)
+        .filter(|entry| {
+            if entry.size < file_len {
+                return true;
+            }
+            entry.size == file_len
+                && !entry.fully_parsed
+                && entry.modified_epoch_secs == current_modified_epoch
+        })
+        .is_some();
+    let mut file_offset: u64 = if can_resume {
+        existing.map(|entry| entry.file_offset).unwrap_or(0)
+    } else {
+        0
+    };
+    if file_offset > 0 {
+        let _ = file.seek(SeekFrom::Start(file_offset));
+    }
+
+    let mut daily: HashMap<String, DailyTotals> = if can_resume {
+        existing
+            .map(|entry| entry.daily.clone())
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+    let mut model_totals_by_day: HashMap<String, HashMap<String, i64>> = if can_resume {
+        existing
+            .map(|entry| entry.model_totals_by_day.clone())
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+    let mut session_cwd: Option<String> = if can_resume {
+        existing.and_then(|entry| entry.session_cwd.clone())
+    } else {
+        None
+    };
+    let mut parser_state = if can_resume {
+        existing
+            .map(|entry| entry.parser_state.clone())
+            .unwrap_or_default()
+    } else {
+        ParserState::default()
+    };
+    let mut reader = BufReader::new(file);
+    let mut previous_totals: Option<UsageTotals> = parser_state.previous_totals;
+    let mut current_model: Option<String> = parser_state.current_model.clone();
+    let mut last_activity_ms: Option<i64> = parser_state.last_activity_ms;
     let mut seen_runs: HashSet<i64> = HashSet::new();
+    let mut line = String::new();
+    let mut fully_parsed = true;
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(_) => continue,
+    loop {
+        if let Some(deadline) = deadline {
+            if Instant::now() >= deadline {
+                fully_parsed = false;
+                break;
+            }
+        }
+
+        line.clear();
+        let bytes_read = match reader.read_line(&mut line) {
+            Ok(bytes_read) => bytes_read,
+            Err(_) => break,
         };
-        if line.len() > 512_000 {
+        if bytes_read == 0 {
+            break;
+        }
+        file_offset = file_offset.saturating_add(bytes_read as u64);
+        if line.len() > max_jsonl_line_bytes {
             continue;
         }
 
@@ -962,8 +1150,15 @@ fn parse_file_summary(path: &Path, max_session_file_bytes: u64) -> Result<FileSc
         }
     }
 
+    parser_state.previous_totals = previous_totals;
+    parser_state.current_model = current_model;
+    parser_state.last_activity_ms = last_activity_ms;
+
     Ok(FileScanSummary {
         session_cwd,
+        parser_state,
+        file_offset: file_offset.min(file_len),
+        fully_parsed: fully_parsed && file_offset >= file_len,
         daily,
         model_totals_by_day,
     })
@@ -1001,7 +1196,10 @@ fn open_or_init_scan_cache_db(path: &Path) -> Result<ScanCacheDb> {
             file_path TEXT PRIMARY KEY,
             file_size INTEGER NOT NULL,
             file_mtime INTEGER,
+            file_offset INTEGER NOT NULL DEFAULT 0,
+            fully_parsed INTEGER NOT NULL DEFAULT 1,
             session_cwd TEXT,
+            parser_state_json TEXT NOT NULL DEFAULT '{}',
             daily_json TEXT NOT NULL,
             model_daily_json TEXT NOT NULL,
             updated_at INTEGER NOT NULL
@@ -1044,10 +1242,42 @@ fn open_or_init_scan_cache_db(path: &Path) -> Result<ScanCacheDb> {
     let Some(schema_version) = schema_version else {
         anyhow::bail!("Missing scan cache schema version metadata");
     };
-    if schema_version != SCAN_CACHE_DB_SCHEMA_VERSION {
+    let has_v2_columns = table_has_column(&conn, "file_cache", "file_offset")?
+        && table_has_column(&conn, "file_cache", "fully_parsed")?
+        && table_has_column(&conn, "file_cache", "parser_state_json")?;
+    if schema_version == 1 || !has_v2_columns {
+        migrate_scan_cache_db_v1_to_v2(&conn, path)?;
+        conn.execute(
+            "UPDATE cache_meta SET value = ?1 WHERE key = 'schema_version';",
+            params![SCAN_CACHE_DB_SCHEMA_VERSION],
+        )
+        .with_context(|| {
+            format!(
+                "Unable to update schema version metadata for {}",
+                path.display()
+            )
+        })?;
+    }
+    let effective_schema_version: Option<i64> = conn
+        .query_row(
+            "SELECT value FROM cache_meta WHERE key = 'schema_version';",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .with_context(|| {
+            format!(
+                "Unable to re-read schema version metadata for {}",
+                path.display()
+            )
+        })?;
+    let Some(effective_schema_version) = effective_schema_version else {
+        anyhow::bail!("Missing scan cache schema version metadata after migration");
+    };
+    if effective_schema_version != SCAN_CACHE_DB_SCHEMA_VERSION {
         anyhow::bail!(
             "Unsupported scan cache schema version: {} (expected {})",
-            schema_version,
+            effective_schema_version,
             SCAN_CACHE_DB_SCHEMA_VERSION
         );
     }
@@ -1060,7 +1290,68 @@ fn open_or_init_scan_cache_db(path: &Path) -> Result<ScanCacheDb> {
     Ok(db)
 }
 
-#[cfg(test)]
+fn migrate_scan_cache_db_v1_to_v2(conn: &Connection, path: &Path) -> Result<()> {
+    if !table_has_column(conn, "file_cache", "file_offset")? {
+        conn.execute(
+            "ALTER TABLE file_cache ADD COLUMN file_offset INTEGER NOT NULL DEFAULT 0;",
+            [],
+        )
+        .with_context(|| {
+            format!(
+                "Unable to add file_offset column while migrating {}",
+                path.display()
+            )
+        })?;
+    }
+    if !table_has_column(conn, "file_cache", "fully_parsed")? {
+        conn.execute(
+            "ALTER TABLE file_cache ADD COLUMN fully_parsed INTEGER NOT NULL DEFAULT 1;",
+            [],
+        )
+        .with_context(|| {
+            format!(
+                "Unable to add fully_parsed column while migrating {}",
+                path.display()
+            )
+        })?;
+    }
+    if !table_has_column(conn, "file_cache", "parser_state_json")? {
+        conn.execute(
+            "ALTER TABLE file_cache ADD COLUMN parser_state_json TEXT NOT NULL DEFAULT '{}';",
+            [],
+        )
+        .with_context(|| {
+            format!(
+                "Unable to add parser_state_json column while migrating {}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let pragma = format!("PRAGMA table_info({table});");
+    let mut stmt = conn
+        .prepare(&pragma)
+        .with_context(|| format!("Unable to inspect table metadata for {table}"))?;
+    let mut rows = stmt
+        .query([])
+        .with_context(|| format!("Unable to query table metadata for {table}"))?;
+    while let Some(row) = rows
+        .next()
+        .with_context(|| format!("Unable to read table metadata row for {table}"))?
+    {
+        let name: String = row.get(1).with_context(|| {
+            format!("Unable to read column name while inspecting table {table}")
+        })?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn load_scan_cache_store(db: &ScanCacheDb) -> Result<(ScanCacheStore, HashSet<String>)> {
     let mut store = ScanCacheStore::default();
     let mut invalid_paths: HashSet<String> = HashSet::new();
@@ -1068,7 +1359,17 @@ fn load_scan_cache_store(db: &ScanCacheDb) -> Result<(ScanCacheStore, HashSet<St
         .conn
         .prepare(
             "
-            SELECT file_path, file_size, file_mtime, session_cwd, daily_json, model_daily_json, updated_at
+            SELECT
+                file_path,
+                file_size,
+                file_mtime,
+                file_offset,
+                fully_parsed,
+                session_cwd,
+                parser_state_json,
+                daily_json,
+                model_daily_json,
+                updated_at
             FROM file_cache;
             ",
         )
@@ -1098,25 +1399,43 @@ fn load_scan_cache_store(db: &ScanCacheDb) -> Result<(ScanCacheStore, HashSet<St
                 db.path.display()
             )
         })?;
-        let session_cwd: Option<String> = row.get(3).with_context(|| {
+        let file_offset_raw: i64 = row.get(3).with_context(|| {
+            format!(
+                "Unable to read file_offset from cache row in {}",
+                db.path.display()
+            )
+        })?;
+        let fully_parsed_raw: i64 = row.get(4).with_context(|| {
+            format!(
+                "Unable to read fully_parsed from cache row in {}",
+                db.path.display()
+            )
+        })?;
+        let session_cwd: Option<String> = row.get(5).with_context(|| {
             format!(
                 "Unable to read session_cwd from cache row in {}",
                 db.path.display()
             )
         })?;
-        let daily_json: String = row.get(4).with_context(|| {
+        let parser_state_json: String = row.get(6).with_context(|| {
+            format!(
+                "Unable to read parser_state_json from cache row in {}",
+                db.path.display()
+            )
+        })?;
+        let daily_json: String = row.get(7).with_context(|| {
             format!(
                 "Unable to read daily_json from cache row in {}",
                 db.path.display()
             )
         })?;
-        let model_daily_json: String = row.get(5).with_context(|| {
+        let model_daily_json: String = row.get(8).with_context(|| {
             format!(
                 "Unable to read model_daily_json from cache row in {}",
                 db.path.display()
             )
         })?;
-        let updated_at: i64 = row.get(6).with_context(|| {
+        let updated_at: i64 = row.get(9).with_context(|| {
             format!(
                 "Unable to read updated_at from cache row in {}",
                 db.path.display()
@@ -1128,6 +1447,20 @@ fn load_scan_cache_store(db: &ScanCacheDb) -> Result<(ScanCacheStore, HashSet<St
             continue;
         };
         let file_mtime = file_mtime_raw.and_then(|value| u64::try_from(value).ok());
+        let file_offset = match u64::try_from(file_offset_raw.max(0)) {
+            Ok(value) => value,
+            Err(_) => {
+                invalid_paths.insert(file_path);
+                continue;
+            }
+        };
+        let parser_state = match serde_json::from_str::<ParserState>(&parser_state_json) {
+            Ok(value) => value,
+            Err(_) => {
+                invalid_paths.insert(file_path);
+                continue;
+            }
+        };
         let daily = match serde_json::from_str::<HashMap<String, DailyTotals>>(&daily_json) {
             Ok(value) => value,
             Err(_) => {
@@ -1150,108 +1483,10 @@ fn load_scan_cache_store(db: &ScanCacheDb) -> Result<(ScanCacheStore, HashSet<St
             CachedFileScanEntry {
                 size: file_size,
                 modified_epoch_secs: file_mtime,
+                file_offset,
+                fully_parsed: fully_parsed_raw != 0,
                 session_cwd,
-                daily,
-                model_totals_by_day,
-                updated_at,
-            },
-        );
-    }
-
-    Ok((store, invalid_paths))
-}
-
-fn load_scan_cache_store_for_candidates(
-    db: &ScanCacheDb,
-    candidate_paths: &[String],
-) -> Result<(ScanCacheStore, HashSet<String>)> {
-    let mut store = ScanCacheStore::default();
-    let mut invalid_paths: HashSet<String> = HashSet::new();
-    if candidate_paths.is_empty() {
-        return Ok((store, invalid_paths));
-    }
-
-    let mut seen: HashSet<&str> = HashSet::new();
-    let mut stmt = db
-        .conn
-        .prepare(
-            "
-            SELECT file_size, file_mtime, session_cwd, daily_json, model_daily_json, updated_at
-            FROM file_cache
-            WHERE file_path = ?1;
-            ",
-        )
-        .with_context(|| {
-            format!(
-                "Unable to prepare candidate cache query for {}",
-                db.path.display()
-            )
-        })?;
-
-    for file_path in candidate_paths {
-        if !seen.insert(file_path.as_str()) {
-            continue;
-        }
-
-        let row: Option<(i64, Option<i64>, Option<String>, String, String, i64)> = stmt
-            .query_row(params![file_path], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            })
-            .optional()
-            .with_context(|| {
-                format!(
-                    "Unable to load cache row for candidate {} in {}",
-                    file_path,
-                    db.path.display()
-                )
-            })?;
-        let Some((
-            file_size_raw,
-            file_mtime_raw,
-            session_cwd,
-            daily_json,
-            model_daily_json,
-            updated_at,
-        )) = row
-        else {
-            continue;
-        };
-
-        let Ok(file_size) = u64::try_from(file_size_raw.max(0)) else {
-            invalid_paths.insert(file_path.clone());
-            continue;
-        };
-        let file_mtime = file_mtime_raw.and_then(|value| u64::try_from(value).ok());
-        let daily = match serde_json::from_str::<HashMap<String, DailyTotals>>(&daily_json) {
-            Ok(value) => value,
-            Err(_) => {
-                invalid_paths.insert(file_path.clone());
-                continue;
-            }
-        };
-        let model_totals_by_day = match serde_json::from_str::<HashMap<String, HashMap<String, i64>>>(
-            &model_daily_json,
-        ) {
-            Ok(value) => value,
-            Err(_) => {
-                invalid_paths.insert(file_path.clone());
-                continue;
-            }
-        };
-
-        store.entries.insert(
-            file_path.clone(),
-            CachedFileScanEntry {
-                size: file_size,
-                modified_epoch_secs: file_mtime,
-                session_cwd,
+                parser_state,
                 daily,
                 model_totals_by_day,
                 updated_at,
@@ -1342,19 +1577,36 @@ fn persist_scan_cache_changes(
         .prepare(
             "
             INSERT INTO file_cache(
-                file_path, file_size, file_mtime, session_cwd, daily_json, model_daily_json, updated_at
+                file_path,
+                file_size,
+                file_mtime,
+                file_offset,
+                fully_parsed,
+                session_cwd,
+                parser_state_json,
+                daily_json,
+                model_daily_json,
+                updated_at
             )
-            VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             ON CONFLICT(file_path) DO UPDATE SET
                 file_size=excluded.file_size,
                 file_mtime=excluded.file_mtime,
+                file_offset=excluded.file_offset,
+                fully_parsed=excluded.fully_parsed,
                 session_cwd=excluded.session_cwd,
+                parser_state_json=excluded.parser_state_json,
                 daily_json=excluded.daily_json,
                 model_daily_json=excluded.model_daily_json,
                 updated_at=excluded.updated_at;
             ",
         )
-        .with_context(|| format!("Unable to prepare upsert statement for {}", db.path.display()))?;
+        .with_context(|| {
+            format!(
+                "Unable to prepare upsert statement for {}",
+                db.path.display()
+            )
+        })?;
 
     let mut removed_sorted: Vec<&String> = removed_paths.iter().collect();
     removed_sorted.sort();
@@ -1379,17 +1631,28 @@ fn persist_scan_cache_changes(
                     file_path
                 )
             })?;
+        let parser_state_json = serde_json::to_string(&entry.parser_state).with_context(|| {
+            format!(
+                "Unable to serialize parser-state cache JSON for {}",
+                file_path
+            )
+        })?;
         let file_size = i64::try_from(entry.size).unwrap_or(i64::MAX);
         let file_mtime = entry
             .modified_epoch_secs
             .and_then(|value| i64::try_from(value).ok());
+        let file_offset = i64::try_from(entry.file_offset).unwrap_or(i64::MAX);
+        let fully_parsed = if entry.fully_parsed { 1_i64 } else { 0_i64 };
 
         upsert_stmt
             .execute(params![
                 file_path,
                 file_size,
                 file_mtime,
+                file_offset,
+                fully_parsed,
                 entry.session_cwd.as_deref(),
+                parser_state_json,
                 daily_json,
                 model_daily_json,
                 entry.updated_at
@@ -1530,7 +1793,8 @@ fn scan_file(
     daily: &mut HashMap<String, DailyTotals>,
     model_totals: &mut HashMap<String, i64>,
     workspace_path: Option<&Path>,
-    max_session_file_bytes: u64,
+    _max_session_file_bytes: u64,
+    max_jsonl_line_bytes: usize,
     matched_session_files: &mut u32,
 ) -> Result<()> {
     // Defensive: do not follow symlinks / special files even if called directly.
@@ -1542,7 +1806,7 @@ fn scan_file(
     if ft.is_symlink() || !ft.is_file() {
         return Ok(());
     }
-    if meta.len() == 0 || meta.len() > max_session_file_bytes {
+    if meta.len() == 0 {
         return Ok(());
     }
 
@@ -1564,7 +1828,7 @@ fn scan_file(
             Ok(line) => line,
             Err(_) => continue,
         };
-        if line.len() > 512_000 {
+        if line.len() > max_jsonl_line_bytes {
             continue;
         }
 
@@ -1960,7 +2224,7 @@ pub fn format_duration(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::SystemTime;
 
@@ -1980,6 +2244,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    fn write_token_file(path: &Path, timestamp_ms: i64, input_tokens: i64, output_tokens: i64) {
+        let timestamp = Utc
+            .timestamp_millis_opt(timestamp_ms)
+            .single()
+            .expect("valid timestamp")
+            .to_rfc3339();
+        let line = serde_json::json!({
+            "type": "event_msg",
+            "timestamp": timestamp,
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": input_tokens,
+                        "cached_input_tokens": 0,
+                        "output_tokens": output_tokens
+                    },
+                    "model": "gpt-test"
+                }
+            }
+        });
+        std::fs::write(path, format!("{line}\n")).expect("write token file");
+    }
+
+    #[test]
+    fn compute_snapshot_keeps_cached_totals_for_unplanned_unchanged_files() {
+        let root = make_temp_dir("cache-unplanned");
+        let codex_home = root.join("codex");
+        let sessions_root = codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions root");
+
+        let now_ms = Utc::now().timestamp_millis();
+        let older_ms = now_ms - Duration::days(20).num_milliseconds();
+        let newer_ms = now_ms - Duration::days(5).num_milliseconds();
+
+        let older_path = sessions_root.join("older.jsonl");
+        let newer_path = sessions_root.join("newer.jsonl");
+        write_token_file(&older_path, older_ms, 100, 25);
+        write_token_file(&newer_path, newer_ms, 80, 20);
+
+        let cache_db_path = root.join("comon.db");
+        let warm_limits = ScanLimits {
+            max_session_file_bytes: 4 * 1024 * 1024,
+            max_session_total_bytes: 16 * 1024 * 1024,
+            max_session_files_scanned: 10,
+            max_jsonl_line_bytes: 512 * 1024,
+            scan_time_budget_ms: 0,
+            full_scan: true,
+            scan_cache_max_entries: 1000,
+        };
+        let warmed = compute_snapshot(
+            30,
+            &codex_home,
+            None,
+            warm_limits,
+            Some(cache_db_path.as_path()),
+        )
+        .expect("warm snapshot");
+        assert_eq!(warmed.totals.last30_days_tokens, 225);
+
+        let restrictive_limits = ScanLimits {
+            max_session_file_bytes: 4 * 1024 * 1024,
+            max_session_total_bytes: 16 * 1024 * 1024,
+            max_session_files_scanned: 1,
+            max_jsonl_line_bytes: 512 * 1024,
+            scan_time_budget_ms: 0,
+            full_scan: false,
+            scan_cache_max_entries: 1000,
+        };
+        let restricted = compute_snapshot(
+            30,
+            &codex_home,
+            None,
+            restrictive_limits,
+            Some(cache_db_path.as_path()),
+        )
+        .expect("restricted snapshot");
+        assert_eq!(
+            restricted.totals.last30_days_tokens, warmed.totals.last30_days_tokens,
+            "unchanged files outside current scan plan should still contribute via cache"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2010,7 +2359,10 @@ mod tests {
         let base = CachedFileScanEntry {
             size: 4,
             modified_epoch_secs: Some(1),
+            file_offset: 4,
+            fully_parsed: true,
             session_cwd: None,
+            parser_state: ParserState::default(),
             daily: HashMap::new(),
             model_totals_by_day: HashMap::new(),
             updated_at: 1,
@@ -2081,7 +2433,10 @@ mod tests {
                 CachedFileScanEntry {
                     size: 1,
                     modified_epoch_secs: Some(1),
+                    file_offset: 1,
+                    fully_parsed: true,
                     session_cwd: None,
+                    parser_state: ParserState::default(),
                     daily: HashMap::new(),
                     model_totals_by_day: HashMap::new(),
                     updated_at,
@@ -2102,6 +2457,65 @@ mod tests {
         let mut paths: Vec<String> = reloaded_store.entries.keys().cloned().collect();
         paths.sort();
         assert_eq!(paths, vec!["a".to_string(), "c".to_string()]);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn open_or_init_scan_cache_db_migrates_v1_schema() {
+        let root = make_temp_dir("cache-migrate");
+        let db_path = root.join("comon.db");
+        let conn = Connection::open(&db_path).expect("open legacy db");
+        conn.execute_batch(
+            "
+            CREATE TABLE cache_meta (
+                key TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            );
+            INSERT INTO cache_meta(key, value) VALUES('schema_version', 1);
+            CREATE TABLE file_cache (
+                file_path TEXT PRIMARY KEY,
+                file_size INTEGER NOT NULL,
+                file_mtime INTEGER,
+                session_cwd TEXT,
+                daily_json TEXT NOT NULL,
+                model_daily_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            INSERT INTO file_cache(
+                file_path, file_size, file_mtime, session_cwd, daily_json, model_daily_json, updated_at
+            ) VALUES(
+                'legacy.jsonl', 42, 123, '/tmp', '{}', '{}', 1
+            );
+            ",
+        )
+        .expect("create legacy schema");
+        drop(conn);
+
+        let db = open_or_init_scan_cache_db(&db_path).expect("open and migrate");
+        let schema_version: i64 = db
+            .conn
+            .query_row(
+                "SELECT value FROM cache_meta WHERE key = 'schema_version';",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read schema version");
+        assert_eq!(schema_version, SCAN_CACHE_DB_SCHEMA_VERSION);
+        assert!(table_has_column(&db.conn, "file_cache", "file_offset").expect("file_offset"));
+        assert!(table_has_column(&db.conn, "file_cache", "fully_parsed").expect("fully_parsed"));
+        assert!(
+            table_has_column(&db.conn, "file_cache", "parser_state_json")
+                .expect("parser_state_json")
+        );
+
+        let (store, _) = load_scan_cache_store(&db).expect("load migrated cache");
+        let entry = store
+            .entries
+            .get("legacy.jsonl")
+            .expect("legacy row should remain readable");
+        assert_eq!(entry.file_offset, 0);
+        assert!(entry.fully_parsed);
 
         let _ = std::fs::remove_dir_all(root);
     }

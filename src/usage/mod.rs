@@ -453,8 +453,7 @@ pub fn compute_snapshot(
         return Ok(build_snapshot(day_keys, daily, model_totals, 0));
     }
 
-    // Build a full candidate list (metadata-only). We still apply scan limits for parsing, but we
-    // can safely reuse unchanged cached summaries for files that fall outside current scan budget.
+    // Build a full candidate list (metadata-only).
     let mut candidates = collect_session_file_candidates(&sessions_root);
     // Newest activity first.
     candidates.sort_by(|a, b| {
@@ -476,6 +475,7 @@ pub fn compute_snapshot(
             .map(|duration| duration.as_secs())
     };
 
+    let force_reparse_all = limits.full_scan && limits.scan_time_budget_ms == 0;
     let mut planned_indices: Vec<usize> = Vec::new();
     let mut planned_total_bytes: u64 = 0;
     let mut planned_files: usize = 0;
@@ -484,6 +484,10 @@ pub fn compute_snapshot(
             if modified < cutoff {
                 continue;
             }
+        }
+        if limits.full_scan {
+            planned_indices.push(idx);
+            continue;
         }
         if planned_files >= limits.max_session_files_scanned
             || planned_total_bytes >= limits.max_session_total_bytes
@@ -536,10 +540,14 @@ pub fn compute_snapshot(
         for (idx, candidate) in candidates.iter().enumerate() {
             let candidate_key = &candidate_paths[idx];
             let cached_entry = scan_cache_store.entries.get(candidate_key).cloned();
-            let cached_entry_matches = cached_entry
-                .as_ref()
-                .filter(|entry| cache_entry_matches_candidate(entry, candidate))
-                .cloned();
+            let cached_entry_matches = if force_reparse_all {
+                None
+            } else {
+                cached_entry
+                    .as_ref()
+                    .filter(|entry| cache_entry_matches_candidate(entry, candidate))
+                    .cloned()
+            };
 
             if planned_set.contains(&idx) {
                 let entry = if let Some(entry) = cached_entry_matches {
@@ -2270,6 +2278,35 @@ mod tests {
         std::fs::write(path, format!("{line}\n")).expect("write token file");
     }
 
+    fn append_token_file(path: &Path, timestamp_ms: i64, input_tokens: i64, output_tokens: i64) {
+        let timestamp = Utc
+            .timestamp_millis_opt(timestamp_ms)
+            .single()
+            .expect("valid timestamp")
+            .to_rfc3339();
+        let line = serde_json::json!({
+            "type": "event_msg",
+            "timestamp": timestamp,
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": input_tokens,
+                        "cached_input_tokens": 0,
+                        "output_tokens": output_tokens
+                    },
+                    "model": "gpt-test"
+                }
+            }
+        });
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("open token file for append");
+        use std::io::Write as _;
+        writeln!(file, "{line}").expect("append token line");
+    }
+
     #[test]
     fn compute_snapshot_keeps_cached_totals_for_unplanned_unchanged_files() {
         let root = make_temp_dir("cache-unplanned");
@@ -2326,6 +2363,212 @@ mod tests {
         assert_eq!(
             restricted.totals.last30_days_tokens, warmed.totals.last30_days_tokens,
             "unchanged files outside current scan plan should still contribute via cache"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compute_snapshot_resumes_from_cached_offset_after_append() {
+        let root = make_temp_dir("cache-append-resume");
+        let codex_home = root.join("codex");
+        let sessions_root = codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions root");
+
+        let now_ms = Utc::now().timestamp_millis();
+        let session_path = sessions_root.join("session.jsonl");
+        write_token_file(
+            &session_path,
+            now_ms - Duration::hours(2).num_milliseconds(),
+            100,
+            20,
+        );
+
+        let cache_db_path = root.join("comon.db");
+        let limits = ScanLimits {
+            max_session_file_bytes: 4 * 1024 * 1024,
+            max_session_total_bytes: 4 * 1024 * 1024,
+            max_session_files_scanned: 10,
+            max_jsonl_line_bytes: 512 * 1024,
+            scan_time_budget_ms: 0,
+            full_scan: false,
+            scan_cache_max_entries: 1000,
+        };
+
+        let first = compute_snapshot(30, &codex_home, None, limits, Some(cache_db_path.as_path()))
+            .expect("first snapshot");
+        assert_eq!(first.totals.last30_days_tokens, 120);
+
+        append_token_file(
+            &session_path,
+            now_ms - Duration::hours(1).num_milliseconds(),
+            40,
+            10,
+        );
+
+        let second = compute_snapshot(30, &codex_home, None, limits, Some(cache_db_path.as_path()))
+            .expect("second snapshot");
+        assert_eq!(second.totals.last30_days_tokens, 170);
+
+        let third = compute_snapshot(30, &codex_home, None, limits, Some(cache_db_path.as_path()))
+            .expect("third snapshot");
+        assert_eq!(
+            third.totals.last30_days_tokens, 170,
+            "unchanged file should not double-count appended usage after resume"
+        );
+
+        let db = open_or_init_scan_cache_db(&cache_db_path).expect("open cache db");
+        let (store, _) = load_scan_cache_store(&db).expect("load cache store");
+        let key = session_path.to_string_lossy().to_string();
+        let entry = store
+            .entries
+            .get(&key)
+            .expect("cache row for appended session");
+        assert!(entry.file_offset > 0);
+        assert!(entry.fully_parsed);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compute_snapshot_full_scan_ignores_file_and_byte_scan_caps() {
+        let root = make_temp_dir("full-scan-caps");
+        let codex_home = root.join("codex");
+        let sessions_root = codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions root");
+
+        let now_ms = Utc::now().timestamp_millis();
+        let files = [
+            (
+                "a.jsonl",
+                now_ms - Duration::days(3).num_milliseconds(),
+                90,
+                10,
+            ),
+            (
+                "b.jsonl",
+                now_ms - Duration::days(2).num_milliseconds(),
+                70,
+                5,
+            ),
+            (
+                "c.jsonl",
+                now_ms - Duration::days(1).num_milliseconds(),
+                40,
+                15,
+            ),
+        ];
+        let mut expected_total = 0_i64;
+        for (name, ts, input, output) in files {
+            write_token_file(&sessions_root.join(name), ts, input, output);
+            expected_total += input + output;
+        }
+
+        let capped_limits = ScanLimits {
+            max_session_file_bytes: 1,
+            max_session_total_bytes: 1,
+            max_session_files_scanned: 1,
+            max_jsonl_line_bytes: 512 * 1024,
+            scan_time_budget_ms: 0,
+            full_scan: false,
+            scan_cache_max_entries: 1000,
+        };
+        let capped =
+            compute_snapshot(30, &codex_home, None, capped_limits, None).expect("capped snapshot");
+        assert!(
+            capped.totals.last30_days_tokens < expected_total,
+            "planner caps should leave some files unscanned in non-full mode"
+        );
+
+        let uncapped_limits = ScanLimits {
+            full_scan: true,
+            ..capped_limits
+        };
+        let full =
+            compute_snapshot(30, &codex_home, None, uncapped_limits, None).expect("full snapshot");
+        assert_eq!(
+            full.totals.last30_days_tokens, expected_total,
+            "full scan should include all files even when scan caps are tiny"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compute_snapshot_full_scan_reparses_when_cache_row_is_stale() {
+        let root = make_temp_dir("full-scan-reparse");
+        let codex_home = root.join("codex");
+        let sessions_root = codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions root");
+
+        let now_ms = Utc::now().timestamp_millis();
+        let session_path = sessions_root.join("session.jsonl");
+        write_token_file(
+            &session_path,
+            now_ms - Duration::hours(6).num_milliseconds(),
+            120,
+            30,
+        );
+        let expected_total = 150_i64;
+
+        let cache_db_path = root.join("comon.db");
+        let baseline_limits = ScanLimits {
+            max_session_file_bytes: 4 * 1024 * 1024,
+            max_session_total_bytes: 4 * 1024 * 1024,
+            max_session_files_scanned: 10,
+            max_jsonl_line_bytes: 512 * 1024,
+            scan_time_budget_ms: 0,
+            full_scan: false,
+            scan_cache_max_entries: 1000,
+        };
+        let baseline = compute_snapshot(
+            30,
+            &codex_home,
+            None,
+            baseline_limits,
+            Some(cache_db_path.as_path()),
+        )
+        .expect("baseline snapshot");
+        assert_eq!(baseline.totals.last30_days_tokens, expected_total);
+
+        let db = open_or_init_scan_cache_db(&cache_db_path).expect("open cache db");
+        let file_key = session_path.to_string_lossy().to_string();
+        db.conn
+            .execute(
+                "UPDATE file_cache SET daily_json='{}', model_daily_json='{}' WHERE file_path = ?1;",
+                rusqlite::params![file_key],
+            )
+            .expect("corrupt cache row");
+        drop(db);
+
+        let stale = compute_snapshot(
+            30,
+            &codex_home,
+            None,
+            baseline_limits,
+            Some(cache_db_path.as_path()),
+        )
+        .expect("stale snapshot");
+        assert_eq!(
+            stale.totals.last30_days_tokens, 0,
+            "non-full scan should still trust unchanged cache rows"
+        );
+
+        let full_limits = ScanLimits {
+            full_scan: true,
+            ..baseline_limits
+        };
+        let repaired = compute_snapshot(
+            30,
+            &codex_home,
+            None,
+            full_limits,
+            Some(cache_db_path.as_path()),
+        )
+        .expect("repaired snapshot");
+        assert_eq!(
+            repaired.totals.last30_days_tokens, expected_total,
+            "full scan with unlimited time should reparse files and repair stale cache rows"
         );
 
         let _ = std::fs::remove_dir_all(root);

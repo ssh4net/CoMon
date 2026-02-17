@@ -11,10 +11,12 @@ See `CHANGELOG.md` for release history.
 
 <img width="1647" height="861" alt="Dkh7CxLgx7" src="https://github.com/user-attachments/assets/edec765d-0924-493b-8c10-cb32bca867a9" />
 
-## Release 0.3.0
+## Release 0.3.2
 
 - Added incremental session parsing with persisted offsets and parser state in `comon.db`.
 - Reduced restart regressions: unchanged files outside current scan plan now stay visible via cache.
+- Fixed full backfill behavior: `--full-scan --scan-time-budget-ms 0` now forces a full reparse and cache refresh.
+- Fixed workspace startup behavior: non-repo launches show **All workspaces** and do not reuse a stale last workspace filter.
 - Added `--scan-time-budget-ms` for bounded per-refresh parse time (`0` disables budget).
 - Added `--max-jsonl-line-kib` to cap parsed line size without hard-dropping large files.
 - Added cache DB schema migration (`v1 -> v2`) for offset/parser-state fields.
@@ -40,6 +42,9 @@ If started outside a git repo, usage is shown as **All workspaces**.
 If you start outside a git repo but pass `--cwd` (or `--project`) pointing inside a git repo,
 `comon` will auto-detect the git root from that path.
 
+If `--cwd` (or `--project`) points to a non-git directory, `comon` shows **All workspaces**
+even when launched from inside a git repo.
+
 ```bash
 # If installed (recommended):
 comon
@@ -64,7 +69,7 @@ Common flags:
 - `--max-session-files <n>`: max number of session files to scan per refresh (default from config)
 - `--max-jsonl-line-kib <n>`: max parsed JSONL line size in KiB (default from config)
 - `--scan-time-budget-ms <n>`: max parse time budget per refresh in ms (`0` disables budget)
-- `--full-scan`: scan all files under `CODEX_HOME/sessions`, including old months (ignores mtime cutoff)
+- `--full-scan`: scan all files under `CODEX_HOME/sessions`, including old months (ignores mtime cutoff and file/byte planning caps)
 - `--no-full-scan`: disable full scan for this run (overrides config)
 - `--scan-cache-max-entries <n>`: max entries kept in cache database (`comon.db`) (default from config)
 - `--rebuild-cache-on-start`: delete local scan cache DB files (`comon.db`, `comon.db-wal`, `comon.db-shm`) before first usage scan
@@ -102,7 +107,7 @@ comon --codex-home "C:\\Users\\You\\.codex" --cwd "C:\\Repos\\some-git-repo"
 Large-log recovery/tuning example:
 
 ```bash
-# One-time backfill for copied/old sessions:
+# One-time backfill for copied/old sessions (full reparse + cache refresh):
 comon --full-scan --scan-time-budget-ms 0
 
 # Normal usage with bounded incremental refresh:
@@ -293,7 +298,7 @@ CI also runs this check on each push and pull request via `.github/workflows/asc
 - comon stores local app state in `~/.comon/state.json` by default (or `$COMON_HOME`, or `--comon-home`).
 - comon stores scan cache in `~/.comon/comon.db` to avoid rereading unchanged session files.
 - Large session logs are parsed incrementally with persisted parser offsets in `comon.db`; unchanged files are reused from cache.
-- If historical days look incomplete after adding old session files, run once with `--full-scan --scan-time-budget-ms 0` to complete backfill.
+- If historical days look incomplete after adding old session files, run once with `--full-scan --scan-time-budget-ms 0` to force a full reparse and refresh cached summaries.
 - comon uses embedded SQLite (`rusqlite` with bundled SQLite); no system `sqlite3` CLI is required at runtime.
 - comon stores user-editable runtime settings in `~/.comon/config.json` by default.
 - Privacy: comon stores metadata (workspace paths, timestamps, token/run/time aggregates) and does not persist prompt/completion text.

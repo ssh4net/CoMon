@@ -574,9 +574,6 @@ fn load_persisted_ui_state(
             state.orientation = orientation;
         }
     }
-    if state.workspace_path.is_none() {
-        state.workspace_path = store.global.last_workspace_path.map(PathBuf::from);
-    }
 
     if let Some(workspace_path) = state.workspace_path.as_ref() {
         let workspace_key = workspace_path.to_string_lossy();
@@ -706,5 +703,65 @@ impl AppState {
     pub(crate) fn limits_updated_label(&self) -> Option<String> {
         let updated_at = self.limits_updated_at?;
         Some(crate::ui::format_updated_label(updated_at))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn make_temp_dir(prefix: &str) -> PathBuf {
+        let unique = format!(
+            "{}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0),
+            TEMP_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let dir = std::env::temp_dir().join(format!("comon-app-{prefix}-{unique}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn load_persisted_ui_state_does_not_restore_last_workspace_without_hint() {
+        let comon_home = make_temp_dir("state-no-hint");
+        let mut store = StateStore::default();
+        store.global.last_workspace_path = Some("/tmp/old-workspace".to_string());
+        write_state_store(&comon_home, &store).expect("write state store");
+
+        let loaded = load_persisted_ui_state(&comon_home, None).expect("load persisted ui state");
+        assert_eq!(loaded.workspace_path, None);
+
+        let _ = std::fs::remove_dir_all(comon_home);
+    }
+
+    #[test]
+    fn load_persisted_ui_state_uses_workspace_hint_and_workspace_state() {
+        let comon_home = make_temp_dir("state-hint");
+        let workspace_path = PathBuf::from("/tmp/repo-workspace");
+        let mut store = StateStore::default();
+        store.global.last_workspace_path = Some("/tmp/other-workspace".to_string());
+        store.workspaces.insert(
+            workspace_path.to_string_lossy().into_owned(),
+            StoredWorkspaceState {
+                no_sessions_confirm_dismissed: true,
+                updated_at: 1,
+            },
+        );
+        write_state_store(&comon_home, &store).expect("write state store");
+
+        let loaded = load_persisted_ui_state(&comon_home, Some(workspace_path.as_path()))
+            .expect("load persisted ui state");
+        assert_eq!(loaded.workspace_path, Some(workspace_path));
+        assert!(loaded.no_sessions_confirm_dismissed);
+
+        let _ = std::fs::remove_dir_all(comon_home);
     }
 }

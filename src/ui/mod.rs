@@ -1,4 +1,4 @@
-use crate::app::{AppState, ChartOrientation};
+use crate::app::{ActiveScreen, AppState, ChartOrientation};
 use crate::usage::{
     format_compact_kmb, format_count, format_duration_compact, format_tokens_compact, ChartRange,
     UsageMetric,
@@ -6,6 +6,7 @@ use crate::usage::{
 use anyhow::Result;
 use chrono::{Datelike, Local, NaiveDate, TimeZone};
 use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -23,7 +24,7 @@ use std::time::Instant;
 pub fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
     Ok(terminal)
@@ -31,7 +32,11 @@ pub fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
 
 pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -53,14 +58,18 @@ pub fn format_updated_label(updated_at: Instant) -> String {
     }
 }
 
-pub fn render(frame: &mut Frame<'_>, state: &AppState) {
+pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
     let area = frame.area();
+    let title = match state.active_screen {
+        ActiveScreen::Usage => " comon :: usage ",
+        ActiveScreen::Read => " comon :: session history ",
+    };
 
     let outer = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .title(Span::styled(
-            " comon ",
+            title,
             Style::default().add_modifier(Modifier::BOLD),
         ));
     frame.render_widget(outer, area);
@@ -73,24 +82,31 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         },
     );
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .split(inner);
+    match state.active_screen {
+        ActiveScreen::Usage => {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(0),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
 
-    render_header(frame, chunks[0], state);
-    render_usage(frame, chunks[1], state);
-    render_footer(frame, chunks[2], state);
+            render_header(frame, chunks[0], state);
+            render_usage(frame, chunks[1], state);
+            render_footer(frame, chunks[2], state);
 
-    if state.show_help {
-        render_help_overlay(frame, area);
-    }
-    if state.no_sessions_confirm_open {
-        render_no_sessions_overlay(frame, area, state);
+            if state.show_help {
+                render_help_overlay(frame, area);
+            }
+            if state.no_sessions_confirm_open {
+                render_no_sessions_overlay(frame, area, state);
+            }
+        }
+        ActiveScreen::Read => {
+            crate::read::tui::render(frame, inner, &mut state.read_browser);
+        }
     }
 }
 
@@ -117,6 +133,8 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         Span::raw(updated),
         Span::raw("  "),
         Span::styled("[r/F5]", Style::default().fg(Color::Gray)),
+        Span::raw("  "),
+        Span::styled("[s/F2]", Style::default().fg(Color::Gray)),
     ]))
     .alignment(Alignment::Right);
     frame.render_widget(right, row[1]);
@@ -135,7 +153,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     };
 
     let usage_hint =
-        "Usage: Statistic [tab] (tokens/time/runs), Timeframe [w] (week/month), Layout [f] (horizontal/vertical), Refresh [r/F5], Help [?], Quit [q]";
+        "Usage: Statistic [tab] (tokens/time/runs), Timeframe [w] (week/month), Layout [f] (horizontal/vertical), Refresh [r/F5], Switch [s/F2], Help [?], Quit [q]";
     let line = Line::from(vec![
         Span::styled(usage_hint, Style::default().fg(Color::Gray)),
         Span::raw("  "),

@@ -5,18 +5,24 @@
 Single-binary, cross-platform TUI for:
 
 - Local Codex usage stats (last 7/30 days, chart, top models) by scanning `CODEX_HOME/sessions`.
+- Local session-history browser grouped by project path, with session titles and prompt previews.
 - Live account limits/credits by spawning `codex app-server` and calling `account/rateLimits/read`.
 
 See `CHANGELOG.md` for release history.
 
 <img width="1647" height="861" alt="Dkh7CxLgx7" src="https://github.com/user-attachments/assets/edec765d-0924-493b-8c10-cb32bca867a9" />
 
-## Release 0.3.2
+## Release 0.3.3
 
+- Merged the session-history browser into the main `comon` TUI.
+- Added runtime screen switching between Usage and Session history with `s` / `F2`.
+- Added `--read` to start on the Session history screen.
+- Added `--sessions-dir` and `--print-sessions-dir` for browsing alternate Codex session trees.
 - Added incremental session parsing with persisted offsets and parser state in `comon.db`.
 - Reduced restart regressions: unchanged files outside current scan plan now stay visible via cache.
 - Fixed full backfill behavior: `--full-scan --scan-time-budget-ms 0` now forces a full reparse and cache refresh.
-- Fixed workspace startup behavior: non-repo launches show **All workspaces** and do not reuse a stale last workspace filter.
+- Changed default workspace scope: `comon` without `--project` now always shows **All workspaces**.
+- Fixed workspace startup behavior: no stale last workspace filter is restored when no explicit project is provided.
 - Added `--scan-time-budget-ms` for bounded per-refresh parse time (`0` disables budget).
 - Added `--max-jsonl-line-kib` to cap parsed line size without hard-dropping large files.
 - Added cache DB schema migration (`v1 -> v2`) for offset/parser-state fields.
@@ -32,22 +38,22 @@ See `CHANGELOG.md` for release history.
 
 ## Run
 
-When started inside a git repository, `comon` auto-detects the repo root and:
+By default, `comon` shows usage for **All workspaces** (regardless of current directory).
 
-- Filters usage stats to that project
-- Uses it as the default working directory for `codex app-server`
+Press `s` / `F2` at runtime to switch between the Usage and Session history screens.
 
-If started outside a git repo, usage is shown as **All workspaces**.
+Use `--project <path>` (or `--workspace <path>`) to filter usage stats to a specific git repo.
 
-If you start outside a git repo but pass `--cwd` (or `--project`) pointing inside a git repo,
-`comon` will auto-detect the git root from that path.
+If `--project` points to a non-git directory, `comon` falls back to **All workspaces**.
 
-If `--cwd` (or `--project`) points to a non-git directory, `comon` shows **All workspaces**
-even when launched from inside a git repo.
+`--cwd` controls where `codex app-server` is launched and does not change usage scope.
 
 ```bash
 # If installed (recommended):
 comon
+
+# Start directly on the Session history screen:
+comon --read
 
 # Or run from the repo without installing:
 cargo run --release
@@ -58,8 +64,11 @@ Common flags:
 - `--codex-home <path>`: override CODEX_HOME (default: `$CODEX_HOME` or `~/.codex`)
 - `--comon-home <path>`: override COMON_HOME for comon state/cache files (default: `$COMON_HOME` or `~/.comon`)
 - `--print-config-path`: print effective comon config path and exit
+- `-r` / `--read`: start on the Session history screen
+- `--sessions-dir <path>`: override the Codex sessions directory used by the Session history screen
+- `--print-sessions-dir`: print effective sessions directory and exit
 - `--codex-bin <path>`: override Codex CLI binary (default: `codex`)
-- `--cwd <path>`: directory to launch `codex app-server` in (default: current directory)
+- `--cwd <path>`: directory to launch `codex app-server` in (default: current directory; does not change usage scope)
 - `--project <path>` / `--workspace <path>`: filter usage stats to a specific project/workspace (also becomes default `--cwd` if `--cwd` not set)
 - `--usage-days <n>`: days to scan for usage (clamped 1..=90; default from config)
 - `--refresh-usage-secs <n>`: usage refresh interval in seconds (default from config)
@@ -119,10 +128,12 @@ comon --scan-time-budget-ms 1500 --max-jsonl-line-kib 512
 - `Tab` Toggle data (Tokens/Time/Runs)
 - `w` Toggle timeframe (Week/Month)
 - `f` Toggle layout (Horz/Vert)
-- `r` / `F5` Refresh now (usage + limits)
+- `s` / `F2` Switch between Usage and Session history
+- `r` / `F5` Refresh current screen
 - `?` Help overlay
 - `Esc` / `q` Quit
 - `Enter` / `y` Continue past "no sessions found" warning (when shown)
+- Session history: `Up` / `Down` / mouse wheel navigate, `Enter` / `Right` open project sessions, `Backspace` / `Left` / `Esc` go back
 
 ## Build from source
 

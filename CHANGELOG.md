@@ -2,11 +2,28 @@
 
 All notable changes to this project are documented in this file.
 
+## 0.3.3 - 2026-03-18
+
+- Added a built-in Session history screen to the main `comon` TUI:
+  - Project list grouped by session `cwd`
+  - Session list with derived titles from user prompts
+  - Session detail view with prompt previews, token counts, tool-call counts, and git metadata when present
+- Added runtime screen switching:
+  - `s` / `F2` now toggles between Usage and Session history without restarting the app
+  - `r` / `F5` refreshes the active screen and rebuilds the sessions catalog on the Session history screen
+- Added session-browser CLI options:
+  - `--read` starts directly on the Session history screen
+  - `--sessions-dir` overrides the scanned Codex sessions tree
+  - `--print-sessions-dir` prints the effective sessions directory and exits
+- Hardened startup behavior for session browsing:
+  - Missing default `CODEX_HOME/sessions` now opens an empty Session history view instead of failing startup
+
 ## 0.3.2 - 2026-02-17
 
 - Fixed workspace startup scoping:
-  - Launching outside a git repo now always uses **All workspaces**.
-  - A non-git `--project`/`--cwd` now disables repo filtering, even if launch dir is inside a repo.
+  - `comon` without `--project` now always uses **All workspaces**, even when launched inside a repo.
+  - A non-git `--project` now disables repo filtering, even if launch dir is inside a repo.
+  - `--cwd` now only controls app-server launch directory and never changes usage scope.
   - `comon` no longer restores a stale last workspace filter when no workspace hint is detected.
 - Hardened long-history backfill behavior:
   - `--full-scan --scan-time-budget-ms 0` now forces full reparse instead of trusting unchanged cache rows.

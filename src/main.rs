@@ -1,5 +1,6 @@
 mod app;
 mod codex_rpc;
+mod read;
 mod storage;
 mod ui;
 mod usage;
@@ -78,12 +79,8 @@ fn detect_git_root(start: &std::path::Path) -> Option<PathBuf> {
     None
 }
 
-fn resolve_workspace_path(
-    launch_dir: &Path,
-    cwd_override: Option<&Path>,
-    project_override: Option<&Path>,
-) -> Option<PathBuf> {
-    let project_candidate = project_override.or(cwd_override).unwrap_or(launch_dir);
+fn resolve_workspace_filter(project_override: Option<&Path>) -> Option<PathBuf> {
+    let project_candidate = project_override?;
     detect_git_root(project_candidate).map(|path| std::fs::canonicalize(&path).unwrap_or(path))
 }
 
@@ -139,8 +136,12 @@ fn load_or_bootstrap_user_config(comon_home: &Path) -> Result<UserConfig> {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "comon", version, about = "Codex usage + limits TUI")]
+#[command(name = "comon", version, about = "Codex usage + session browser TUI")]
 struct Args {
+    /// Launch with the session history screen active.
+    #[arg(short = 'r', long = "read")]
+    read_mode: bool,
+
     /// Override path to the Codex CLI binary (default: `codex` in PATH).
     #[arg(long)]
     codex_bin: Option<String>,
@@ -156,6 +157,14 @@ struct Args {
     /// Print effective comon config path and exit.
     #[arg(long)]
     print_config_path: bool,
+
+    /// Override the sessions directory directly for read mode.
+    #[arg(long)]
+    sessions_dir: Option<PathBuf>,
+
+    /// Print the effective sessions directory for read mode and exit.
+    #[arg(long)]
+    print_sessions_dir: bool,
 
     /// Working directory to launch `codex app-server` in (default: current directory).
     #[arg(long)]
@@ -230,12 +239,15 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if args.print_sessions_dir {
+        read::print_sessions_dir(args.codex_home.clone(), args.sessions_dir.clone())?;
+        return Ok(());
+    }
+    let read_config = read::build_config(args.codex_home.clone(), args.sessions_dir.clone())?;
+
     let launch_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-    // Determine a candidate directory to infer the "project" from:
-    // - Explicit `--project` wins
-    // - Else infer from `--cwd` (user intent: run in that repo)
-    // - Else infer from current directory
+    // `--project` controls usage scope.
     let cwd_override = args
         .cwd
         .clone()
@@ -247,12 +259,8 @@ async fn main() -> Result<()> {
         .map(|p| validate_dir(&p, "--project"))
         .transpose()?;
 
-    // Only treat something as a "project" if it is inside a git work tree.
-    let project = resolve_workspace_path(
-        launch_dir.as_path(),
-        cwd_override.as_deref(),
-        project_override.as_deref(),
-    );
+    // Default to all workspaces unless user explicitly provides `--project`.
+    let project = resolve_workspace_filter(project_override.as_deref());
 
     // `cwd` controls where `codex app-server` is launched.
     let cwd = cwd_override
@@ -329,6 +337,8 @@ async fn main() -> Result<()> {
         codex_bin: args.codex_bin.clone(),
         comon_home,
         codex_home,
+        read_sessions_dir: read_config.sessions_dir,
+        start_in_read_screen: args.read_mode,
         cwd,
         workspace_path: project,
         usage_days,
@@ -373,49 +383,43 @@ mod tests {
     #[test]
     fn resolve_workspace_path_uses_all_workspaces_outside_repo() {
         let root = make_temp_dir("non-repo");
-        let workspace = resolve_workspace_path(root.as_path(), None, None);
+        let workspace = resolve_workspace_filter(None);
         assert!(workspace.is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn resolve_workspace_path_uses_launch_repo_when_no_overrides() {
+    fn resolve_workspace_filter_uses_all_workspaces_without_project_override() {
         let root = make_temp_dir("launch-repo");
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).expect("create repo dir");
-        let expected = make_git_repo(&repo);
+        let _ = make_git_repo(&repo);
 
-        let workspace = resolve_workspace_path(repo.as_path(), None, None);
-        assert_eq!(workspace, Some(expected));
+        let workspace = resolve_workspace_filter(None);
+        assert!(workspace.is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn resolve_workspace_path_prefers_project_override_repo() {
+    fn resolve_workspace_filter_uses_project_override_repo() {
         let root = make_temp_dir("project-override-repo");
-        let launch = root.join("launch");
-        std::fs::create_dir_all(&launch).expect("create launch dir");
         let repo = root.join("repo");
         let nested = repo.join("nested");
         std::fs::create_dir_all(&nested).expect("create nested repo dir");
         let expected = make_git_repo(&repo);
 
-        let workspace = resolve_workspace_path(launch.as_path(), None, Some(nested.as_path()));
+        let workspace = resolve_workspace_filter(Some(nested.as_path()));
         assert_eq!(workspace, Some(expected));
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn resolve_workspace_path_uses_all_when_project_override_not_repo() {
+    fn resolve_workspace_filter_uses_all_when_project_override_not_repo() {
         let root = make_temp_dir("project-override-non-repo");
-        let launch_repo = root.join("launch-repo");
-        std::fs::create_dir_all(&launch_repo).expect("create launch repo dir");
-        let _ = make_git_repo(&launch_repo);
         let non_repo = root.join("plain-dir");
         std::fs::create_dir_all(&non_repo).expect("create non-repo dir");
 
-        let workspace =
-            resolve_workspace_path(launch_repo.as_path(), None, Some(non_repo.as_path()));
+        let workspace = resolve_workspace_filter(Some(non_repo.as_path()));
         assert!(workspace.is_none());
         let _ = std::fs::remove_dir_all(root);
     }

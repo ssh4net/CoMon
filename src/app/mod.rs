@@ -1,4 +1,5 @@
 use crate::codex_rpc::{AccountRateLimits, CodexRpc};
+use crate::read;
 use crate::usage::{ChartRange, LocalUsageSnapshot, UsageMetric};
 use anyhow::{anyhow, Context, Result};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -16,6 +17,8 @@ pub struct Config {
     pub codex_bin: Option<String>,
     pub comon_home: std::path::PathBuf,
     pub codex_home: std::path::PathBuf,
+    pub read_sessions_dir: std::path::PathBuf,
+    pub start_in_read_screen: bool,
     pub cwd: std::path::PathBuf,
     pub workspace_path: Option<std::path::PathBuf>,
     pub usage_days: u32,
@@ -32,14 +35,13 @@ pub(crate) enum ChartOrientation {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum UiCommand {
+enum UsageCommand {
     RefreshAll,
     ToggleMetric,
     ToggleRange,
     ToggleOrientation,
     ToggleHelp,
     ConfirmContinue,
-    Quit,
 }
 
 #[derive(Debug)]
@@ -49,8 +51,21 @@ enum AppEvent {
     LimitsUnavailable(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActiveScreen {
+    Usage,
+    Read,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputOutcome {
+    Continue(bool),
+    Quit,
+}
+
 #[derive(Debug)]
 pub(crate) struct AppState {
+    pub(crate) active_screen: ActiveScreen,
     pub(crate) metric: UsageMetric,
     pub(crate) range: ChartRange,
     pub(crate) orientation: ChartOrientation,
@@ -67,6 +82,8 @@ pub(crate) struct AppState {
     pub(crate) limits_updated_at: Option<Instant>,
     pub(crate) limits_error: Option<String>,
     pub(crate) limits_enabled: bool,
+    pub(crate) read_sessions_dir: PathBuf,
+    pub(crate) read_browser: crate::read::tui::BrowserState,
 }
 
 const STATE_STORE_SCHEMA_VERSION: u32 = 1;
@@ -149,7 +166,7 @@ async fn run_inner(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     config: Config,
 ) -> Result<()> {
-    let (cmd_tx, mut cmd_rx) = mpsc::channel::<UiCommand>(64);
+    let (input_tx, mut input_rx) = mpsc::channel::<Event>(64);
     let (evt_tx, mut evt_rx) = mpsc::channel::<AppEvent>(64);
     let (usage_refresh_tx, usage_refresh_rx) = mpsc::channel::<()>(1);
     let (limits_refresh_tx, limits_refresh_rx) = mpsc::channel::<()>(1);
@@ -164,6 +181,10 @@ async fn run_inner(
     if config.rebuild_cache_on_start {
         clear_scan_cache_files(&scan_cache_db_path)?;
     }
+    let read_config = read::Config {
+        sessions_dir: config.read_sessions_dir.clone(),
+    };
+    let read_browser = read::build_browser(&read_config)?;
 
     // Spawn usage worker.
     {
@@ -283,7 +304,7 @@ async fn run_inner(
 
     // Spawn input reader.
     {
-        let cmd_tx = cmd_tx.clone();
+        let input_tx = input_tx.clone();
         let shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             let shutdown_rx = shutdown_rx;
@@ -305,19 +326,19 @@ async fn run_inner(
 
                 let Some(event) = event else { continue };
 
-                if let Some(cmd) = map_event_to_cmd(event) {
-                    if cmd_tx.send(cmd).await.is_err() {
-                        break;
-                    }
-                    if matches!(cmd, UiCommand::Quit) {
-                        break;
-                    }
+                if input_tx.send(event).await.is_err() {
+                    break;
                 }
             }
         });
     }
 
     let mut state = AppState {
+        active_screen: if config.start_in_read_screen {
+            ActiveScreen::Read
+        } else {
+            ActiveScreen::Usage
+        },
         metric: restored_ui_state.metric,
         range: restored_ui_state.range,
         orientation: restored_ui_state.orientation,
@@ -332,10 +353,12 @@ async fn run_inner(
         limits_updated_at: None,
         limits_error: None,
         limits_enabled: true,
+        read_sessions_dir: config.read_sessions_dir.clone(),
+        read_browser,
     };
 
     // Initial draw.
-    terminal.draw(|f| crate::ui::render(f, &state))?;
+    terminal.draw(|f| crate::ui::render(f, &mut state))?;
 
     let mut last_redraw = Instant::now();
     let min_redraw = Duration::from_millis(50);
@@ -347,18 +370,27 @@ async fn run_inner(
         let mut dirty = false;
 
         tokio::select! {
-            cmd = cmd_rx.recv() => {
-                if let Some(cmd) = cmd {
-                    dirty |= handle_cmd(&mut state, cmd, &usage_refresh_tx, &limits_refresh_tx).await?;
-                    if matches!(cmd, UiCommand::Quit) {
-                        let _ = shutdown_tx.send(true);
-                        break;
+            input = input_rx.recv() => {
+                if let Some(input) = input {
+                    match handle_input_event(
+                        &mut state,
+                        input,
+                        &usage_refresh_tx,
+                        &limits_refresh_tx,
+                    )? {
+                        InputOutcome::Continue(should_redraw) => {
+                            dirty |= should_redraw;
+                        }
+                        InputOutcome::Quit => {
+                            let _ = shutdown_tx.send(true);
+                            break;
+                        }
                     }
                 }
             }
             evt = evt_rx.recv() => {
                 if let Some(evt) = evt {
-                    dirty |= handle_event(&mut state, evt);
+                    dirty |= handle_app_event(&mut state, evt);
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
@@ -368,7 +400,7 @@ async fn run_inner(
         }
 
         if dirty && last_redraw.elapsed() >= min_redraw {
-            terminal.draw(|f| crate::ui::render(f, &state))?;
+            terminal.draw(|f| crate::ui::render(f, &mut state))?;
             last_redraw = Instant::now();
         }
 
@@ -428,26 +460,75 @@ fn clear_scan_cache_files(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn map_event_to_cmd(event: Event) -> Option<UiCommand> {
+fn handle_input_event(
+    state: &mut AppState,
+    event: Event,
+    usage_refresh_tx: &mpsc::Sender<()>,
+    limits_refresh_tx: &mpsc::Sender<()>,
+) -> Result<InputOutcome> {
+    if let Event::Key(key) = &event {
+        if key.kind != KeyEventKind::Press {
+            return Ok(InputOutcome::Continue(false));
+        }
+
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('q'), _) => return Ok(InputOutcome::Quit),
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(InputOutcome::Quit),
+            (KeyCode::Char('s'), _) | (KeyCode::Char('S'), _) | (KeyCode::F(2), _) => {
+                state.active_screen = match state.active_screen {
+                    ActiveScreen::Usage => ActiveScreen::Read,
+                    ActiveScreen::Read => ActiveScreen::Usage,
+                };
+                return Ok(InputOutcome::Continue(true));
+            }
+            (KeyCode::Char('r'), _) | (KeyCode::F(5), _)
+                if state.active_screen == ActiveScreen::Read =>
+            {
+                let read_config = read::Config {
+                    sessions_dir: state.read_sessions_dir.clone(),
+                };
+                state.read_browser = read::build_browser(&read_config)?;
+                return Ok(InputOutcome::Continue(true));
+            }
+            _ => {}
+        }
+    }
+
+    if matches!(event, Event::Resize(_, _)) {
+        return Ok(InputOutcome::Continue(true));
+    }
+
+    match state.active_screen {
+        ActiveScreen::Usage => {
+            let Some(command) = map_event_to_usage_cmd(event) else {
+                return Ok(InputOutcome::Continue(false));
+            };
+            let dirty = handle_usage_command(state, command, usage_refresh_tx, limits_refresh_tx);
+            Ok(InputOutcome::Continue(dirty))
+        }
+        ActiveScreen::Read => Ok(InputOutcome::Continue(read::tui::handle_event(
+            &mut state.read_browser,
+            event,
+        )?)),
+    }
+}
+
+fn map_event_to_usage_cmd(event: Event) -> Option<UsageCommand> {
     match event {
-        Event::Resize(_, _) => Some(UiCommand::RefreshAll),
         Event::Key(key) => {
             if key.kind != KeyEventKind::Press {
                 return None;
             }
             match (key.code, key.modifiers) {
-                (KeyCode::Char('q'), _) => Some(UiCommand::Quit),
-                (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(UiCommand::Quit),
-                (KeyCode::Esc, _) => Some(UiCommand::Quit),
-                (KeyCode::Char('r'), _) => Some(UiCommand::RefreshAll),
-                (KeyCode::F(5), _) => Some(UiCommand::RefreshAll),
-                (KeyCode::Tab, _) => Some(UiCommand::ToggleMetric),
-                (KeyCode::Char('w'), _) => Some(UiCommand::ToggleRange),
-                (KeyCode::Char('f'), _) => Some(UiCommand::ToggleOrientation),
-                (KeyCode::Char('?'), _) => Some(UiCommand::ToggleHelp),
-                (KeyCode::Enter, _) => Some(UiCommand::ConfirmContinue),
-                (KeyCode::Char('y'), _) => Some(UiCommand::ConfirmContinue),
-                (KeyCode::Char('Y'), _) => Some(UiCommand::ConfirmContinue),
+                (KeyCode::Char('r'), _) | (KeyCode::F(5), _) => Some(UsageCommand::RefreshAll),
+                (KeyCode::Tab, _) => Some(UsageCommand::ToggleMetric),
+                (KeyCode::Char('w'), _) => Some(UsageCommand::ToggleRange),
+                (KeyCode::Char('f'), _) => Some(UsageCommand::ToggleOrientation),
+                (KeyCode::Char('?'), _) => Some(UsageCommand::ToggleHelp),
+                (KeyCode::Enter, _) => Some(UsageCommand::ConfirmContinue),
+                (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
+                    Some(UsageCommand::ConfirmContinue)
+                }
                 _ => None,
             }
         }
@@ -455,61 +536,59 @@ fn map_event_to_cmd(event: Event) -> Option<UiCommand> {
     }
 }
 
-async fn handle_cmd(
+fn handle_usage_command(
     state: &mut AppState,
-    cmd: UiCommand,
+    cmd: UsageCommand,
     usage_refresh_tx: &mpsc::Sender<()>,
     limits_refresh_tx: &mpsc::Sender<()>,
-) -> Result<bool> {
+) -> bool {
     if state.no_sessions_confirm_open {
         match cmd {
-            UiCommand::ConfirmContinue => {
+            UsageCommand::ConfirmContinue => {
                 state.no_sessions_confirm_open = false;
                 state.no_sessions_confirm_dismissed = true;
-                return Ok(true);
+                return true;
             }
-            UiCommand::Quit => return Ok(true),
-            _ => return Ok(false),
+            _ => return false,
         }
     }
     match cmd {
-        UiCommand::Quit => Ok(true),
-        UiCommand::ToggleHelp => {
+        UsageCommand::ToggleHelp => {
             state.show_help = !state.show_help;
-            Ok(true)
+            true
         }
-        UiCommand::ConfirmContinue => Ok(false),
-        UiCommand::ToggleMetric => {
+        UsageCommand::ConfirmContinue => false,
+        UsageCommand::ToggleMetric => {
             state.metric = match state.metric {
                 UsageMetric::Tokens => UsageMetric::Time,
                 UsageMetric::Time => UsageMetric::Runs,
                 UsageMetric::Runs => UsageMetric::Tokens,
             };
-            Ok(true)
+            true
         }
-        UiCommand::ToggleRange => {
+        UsageCommand::ToggleRange => {
             state.range = match state.range {
                 ChartRange::Week => ChartRange::Month,
                 ChartRange::Month => ChartRange::Week,
             };
-            Ok(true)
+            true
         }
-        UiCommand::ToggleOrientation => {
+        UsageCommand::ToggleOrientation => {
             state.orientation = match state.orientation {
                 ChartOrientation::Horizontal => ChartOrientation::Vertical,
                 ChartOrientation::Vertical => ChartOrientation::Horizontal,
             };
-            Ok(true)
+            true
         }
-        UiCommand::RefreshAll => {
+        UsageCommand::RefreshAll => {
             let _ = usage_refresh_tx.try_send(());
             let _ = limits_refresh_tx.try_send(());
-            Ok(true)
+            true
         }
     }
 }
 
-fn handle_event(state: &mut AppState, evt: AppEvent) -> bool {
+fn handle_app_event(state: &mut AppState, evt: AppEvent) -> bool {
     match evt {
         AppEvent::UsageUpdated(res) => {
             match res {

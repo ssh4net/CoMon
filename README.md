@@ -12,6 +12,10 @@ See `CHANGELOG.md` for release history.
 
 <img width="1647" height="861" alt="Dkh7CxLgx7" src="https://github.com/user-attachments/assets/edec765d-0924-493b-8c10-cb32bca867a9" />
 
+<img width="2088" height="952" alt="WindowsTerminal_nrizljNtk5" src="https://github.com/user-attachments/assets/cf2ac2e7-3a94-48cd-9d3b-1a4a98016f45" />
+<img width="2088" height="952" alt="WindowsTerminal_HjIAOZQKWE" src="https://github.com/user-attachments/assets/4e3eed0a-d3aa-4ae5-bc4e-c6e5400bc1dd" />
+
+
 ## Release 0.3.3
 
 - Merged the session-history browser into the main `comon` TUI.

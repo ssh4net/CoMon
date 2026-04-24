@@ -16,8 +16,10 @@ See `CHANGELOG.md` for release history.
 <img width="2088" height="952" alt="WindowsTerminal_HjIAOZQKWE" src="https://github.com/user-attachments/assets/4e3eed0a-d3aa-4ae5-bc4e-c6e5400bc1dd" />
 
 
-## Release 0.3.3
+## Release 0.3.4
 
+- Fixed inflated usage totals from forked/subagent session logs.
+- Reparse stale forked-session cache rows with scan-cache schema v3.
 - Merged the session-history browser into the main `comon` TUI.
 - Added runtime screen switching between Usage and Session history with `s` / `F2`.
 - Added `--read` to start on the Session history screen.

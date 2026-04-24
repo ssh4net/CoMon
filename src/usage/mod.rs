@@ -17,7 +17,9 @@ const DEFAULT_MAX_SESSION_FILES_SCANNED: usize = 10_000;
 const DEFAULT_MAX_JSONL_LINE_BYTES: usize = 512 * 1024;
 const DEFAULT_SCAN_TIME_BUDGET_MS: u64 = 1500;
 const MAX_DISTINCT_MODELS: usize = 5_000;
-const SCAN_CACHE_DB_SCHEMA_VERSION: i64 = 2;
+const SCAN_CACHE_DB_SCHEMA_VERSION: i64 = 3;
+const FORK_REPLAY_END_GAP_MS: i64 = 1_000;
+const FORK_REPLAY_NO_TOKEN_GRACE_MS: i64 = 2_000;
 pub const DEFAULT_SCAN_CACHE_MAX_ENTRIES: usize = 50_000;
 
 #[derive(Debug, Clone, Copy)]
@@ -364,6 +366,24 @@ struct ParserState {
     current_model: Option<String>,
     #[serde(default)]
     last_activity_ms: Option<i64>,
+    #[serde(default)]
+    first_session_meta_seen: bool,
+    #[serde(default)]
+    fork_replay: ForkReplayState,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+struct ForkReplayState {
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    done: bool,
+    #[serde(default)]
+    start_ms: Option<i64>,
+    #[serde(default)]
+    last_event_ms: Option<i64>,
+    #[serde(default)]
+    token_events: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -957,6 +977,8 @@ fn parse_file_summary(
     let mut previous_totals: Option<UsageTotals> = parser_state.previous_totals;
     let mut current_model: Option<String> = parser_state.current_model.clone();
     let mut last_activity_ms: Option<i64> = parser_state.last_activity_ms;
+    let mut first_session_meta_seen = parser_state.first_session_meta_seen;
+    let mut fork_replay = parser_state.fork_replay;
     let mut seen_runs: HashSet<i64> = HashSet::new();
     let mut line = String::new();
     let mut fully_parsed = true;
@@ -995,9 +1017,18 @@ fn parse_file_summary(
             session_cwd = extract_cwd(&value);
         }
 
+        if entry_type == "session_meta" {
+            maybe_start_fork_replay(&value, &mut first_session_meta_seen, &mut fork_replay);
+        }
+
+        let event_timestamp_ms = read_timestamp_ms(&value);
+        let skip_fork_replay = fork_replay_should_skip_event(&mut fork_replay, event_timestamp_ms);
+
         if entry_type == "turn_context" {
-            if let Some(model) = extract_model_from_turn_context(&value) {
-                current_model = Some(model);
+            if !skip_fork_replay {
+                if let Some(model) = extract_model_from_turn_context(&value) {
+                    current_model = Some(model);
+                }
             }
             continue;
         }
@@ -1012,8 +1043,12 @@ fn parse_file_summary(
                 .and_then(|payload| payload.get("type"))
                 .and_then(|value| value.as_str());
 
+            if skip_fork_replay && payload_type != Some("token_count") {
+                continue;
+            }
+
             if payload_type == Some("agent_message") {
-                if let Some(timestamp_ms) = read_timestamp_ms(&value) {
+                if let Some(timestamp_ms) = event_timestamp_ms {
                     if seen_runs.insert(timestamp_ms) {
                         if let Some(day_key) = day_key_for_timestamp_ms(timestamp_ms) {
                             daily.entry(day_key).or_default().agent_runs += 1;
@@ -1025,7 +1060,7 @@ fn parse_file_summary(
             }
 
             if payload_type == Some("agent_reasoning") {
-                if let Some(timestamp_ms) = read_timestamp_ms(&value) {
+                if let Some(timestamp_ms) = event_timestamp_ms {
                     track_activity(&mut daily, &mut last_activity_ms, timestamp_ms);
                 }
                 continue;
@@ -1105,11 +1140,16 @@ fn parse_file_summary(
                 previous_totals = Some(next);
             }
 
+            if skip_fork_replay {
+                note_fork_replay_token(&mut fork_replay);
+                continue;
+            }
+
             if delta.input == 0 && delta.cached == 0 && delta.output == 0 {
                 continue;
             }
 
-            let timestamp_ms = read_timestamp_ms(&value);
+            let timestamp_ms = event_timestamp_ms;
             if let Some(day_key) = timestamp_ms.and_then(day_key_for_timestamp_ms) {
                 let entry = daily.entry(day_key.clone()).or_default();
                 let cached_clamped = delta.cached.min(delta.input);
@@ -1131,6 +1171,10 @@ fn parse_file_summary(
             continue;
         }
 
+        if skip_fork_replay {
+            continue;
+        }
+
         if entry_type == "response_item" {
             let payload = value.get("payload").and_then(|value| value.as_object());
             let payload_type = payload
@@ -1142,7 +1186,7 @@ fn parse_file_summary(
                 .unwrap_or("");
 
             if role == "assistant" {
-                if let Some(timestamp_ms) = read_timestamp_ms(&value) {
+                if let Some(timestamp_ms) = event_timestamp_ms {
                     if seen_runs.insert(timestamp_ms) {
                         if let Some(day_key) = day_key_for_timestamp_ms(timestamp_ms) {
                             daily.entry(day_key).or_default().agent_runs += 1;
@@ -1151,7 +1195,7 @@ fn parse_file_summary(
                     track_activity(&mut daily, &mut last_activity_ms, timestamp_ms);
                 }
             } else if payload_type != Some("message") {
-                if let Some(timestamp_ms) = read_timestamp_ms(&value) {
+                if let Some(timestamp_ms) = event_timestamp_ms {
                     track_activity(&mut daily, &mut last_activity_ms, timestamp_ms);
                 }
             }
@@ -1161,6 +1205,8 @@ fn parse_file_summary(
     parser_state.previous_totals = previous_totals;
     parser_state.current_model = current_model;
     parser_state.last_activity_ms = last_activity_ms;
+    parser_state.first_session_meta_seen = first_session_meta_seen;
+    parser_state.fork_replay = fork_replay;
 
     Ok(FileScanSummary {
         session_cwd,
@@ -1255,6 +1301,9 @@ fn open_or_init_scan_cache_db(path: &Path) -> Result<ScanCacheDb> {
         && table_has_column(&conn, "file_cache", "parser_state_json")?;
     if schema_version == 1 || !has_v2_columns {
         migrate_scan_cache_db_v1_to_v2(&conn, path)?;
+    }
+    if schema_version < SCAN_CACHE_DB_SCHEMA_VERSION {
+        migrate_scan_cache_db_to_v3(&conn, path)?;
         conn.execute(
             "UPDATE cache_meta SET value = ?1 WHERE key = 'schema_version';",
             params![SCAN_CACHE_DB_SCHEMA_VERSION],
@@ -1336,6 +1385,85 @@ fn migrate_scan_cache_db_v1_to_v2(conn: &Connection, path: &Path) -> Result<()> 
         })?;
     }
     Ok(())
+}
+
+fn migrate_scan_cache_db_to_v3(conn: &Connection, path: &Path) -> Result<()> {
+    // v3 changes forked-session accounting semantics. Reusing those old rows would keep
+    // inflated totals, but non-forked cache rows are still valid.
+    let mut stmt = conn
+        .prepare("SELECT file_path FROM file_cache;")
+        .with_context(|| {
+            format!(
+                "Unable to list cache rows while migrating {}",
+                path.display()
+            )
+        })?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .with_context(|| {
+            format!(
+                "Unable to read cache row paths while migrating {}",
+                path.display()
+            )
+        })?;
+    let mut stale_paths = Vec::new();
+    for row in rows {
+        let file_path = row.with_context(|| {
+            format!(
+                "Unable to read cache row path while migrating {}",
+                path.display()
+            )
+        })?;
+        if cached_session_needs_v3_reparse(&file_path) {
+            stale_paths.push(file_path);
+        }
+    }
+    drop(stmt);
+
+    let mut delete_stmt = conn
+        .prepare("DELETE FROM file_cache WHERE file_path = ?1;")
+        .with_context(|| {
+            format!(
+                "Unable to prepare stale row delete while migrating {}",
+                path.display()
+            )
+        })?;
+    for file_path in stale_paths {
+        delete_stmt
+            .execute(params![file_path])
+            .with_context(|| format!("Unable to clear stale cache row in {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn cached_session_needs_v3_reparse(file_path: &str) -> bool {
+    let file = match File::open(file_path) {
+        Ok(file) => file,
+        Err(_) => return true,
+    };
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    if reader
+        .read_line(&mut line)
+        .ok()
+        .filter(|bytes| *bytes > 0)
+        .is_none()
+    {
+        return true;
+    }
+    let value = match serde_json::from_str::<Value>(&line) {
+        Ok(value) => value,
+        Err(_) => return true,
+    };
+    value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|entry_type| entry_type == "session_meta")
+        && value
+            .get("payload")
+            .and_then(|payload| payload.get("forked_from_id"))
+            .and_then(Value::as_str)
+            .is_some()
 }
 
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -1830,6 +1958,8 @@ fn scan_file(
     let mut match_known = workspace_path.is_none();
     let mut matches_workspace = workspace_path.is_none();
     let mut counted_match = false;
+    let mut first_session_meta_seen = false;
+    let mut fork_replay = ForkReplayState::default();
 
     for line in reader.lines() {
         let line = match line {
@@ -1865,9 +1995,18 @@ fn scan_file(
             }
         }
 
+        if entry_type == "session_meta" {
+            maybe_start_fork_replay(&value, &mut first_session_meta_seen, &mut fork_replay);
+        }
+
+        let event_timestamp_ms = read_timestamp_ms(&value);
+        let skip_fork_replay = fork_replay_should_skip_event(&mut fork_replay, event_timestamp_ms);
+
         if entry_type == "turn_context" {
-            if let Some(model) = extract_model_from_turn_context(&value) {
-                current_model = Some(model);
+            if !skip_fork_replay {
+                if let Some(model) = extract_model_from_turn_context(&value) {
+                    current_model = Some(model);
+                }
             }
             continue;
         }
@@ -1893,8 +2032,12 @@ fn scan_file(
                 .and_then(|payload| payload.get("type"))
                 .and_then(|value| value.as_str());
 
+            if skip_fork_replay && payload_type != Some("token_count") {
+                continue;
+            }
+
             if payload_type == Some("agent_message") {
-                if let Some(timestamp_ms) = read_timestamp_ms(&value) {
+                if let Some(timestamp_ms) = event_timestamp_ms {
                     if seen_runs.insert(timestamp_ms) {
                         if let Some(day_key) = day_key_for_timestamp_ms(timestamp_ms) {
                             if let Some(entry) = daily.get_mut(&day_key) {
@@ -1908,7 +2051,7 @@ fn scan_file(
             }
 
             if payload_type == Some("agent_reasoning") {
-                if let Some(timestamp_ms) = read_timestamp_ms(&value) {
+                if let Some(timestamp_ms) = event_timestamp_ms {
                     track_activity(daily, &mut last_activity_ms, timestamp_ms);
                 }
                 continue;
@@ -1990,11 +2133,16 @@ fn scan_file(
                 previous_totals = Some(next);
             }
 
+            if skip_fork_replay {
+                note_fork_replay_token(&mut fork_replay);
+                continue;
+            }
+
             if delta.input == 0 && delta.cached == 0 && delta.output == 0 {
                 continue;
             }
 
-            let timestamp_ms = read_timestamp_ms(&value);
+            let timestamp_ms = event_timestamp_ms;
             if let Some(day_key) = timestamp_ms.and_then(day_key_for_timestamp_ms) {
                 if let Some(entry) = daily.get_mut(&day_key) {
                     let cached_clamped = delta.cached.min(delta.input);
@@ -2016,6 +2164,10 @@ fn scan_file(
             continue;
         }
 
+        if skip_fork_replay {
+            continue;
+        }
+
         if entry_type == "response_item" {
             let payload = value.get("payload").and_then(|value| value.as_object());
             let payload_type = payload
@@ -2027,7 +2179,7 @@ fn scan_file(
                 .unwrap_or("");
 
             if role == "assistant" {
-                if let Some(timestamp_ms) = read_timestamp_ms(&value) {
+                if let Some(timestamp_ms) = event_timestamp_ms {
                     if seen_runs.insert(timestamp_ms) {
                         if let Some(day_key) = day_key_for_timestamp_ms(timestamp_ms) {
                             if let Some(entry) = daily.get_mut(&day_key) {
@@ -2038,7 +2190,7 @@ fn scan_file(
                     track_activity(daily, &mut last_activity_ms, timestamp_ms);
                 }
             } else if payload_type != Some("message") {
-                if let Some(timestamp_ms) = read_timestamp_ms(&value) {
+                if let Some(timestamp_ms) = event_timestamp_ms {
                     track_activity(daily, &mut last_activity_ms, timestamp_ms);
                 }
             }
@@ -2093,7 +2245,10 @@ fn read_i64(map: &serde_json::Map<String, Value>, keys: &[&str]) -> i64 {
 }
 
 fn read_timestamp_ms(value: &Value) -> Option<i64> {
-    let raw = value.get("timestamp")?;
+    parse_timestamp_value_ms(value.get("timestamp")?)
+}
+
+fn parse_timestamp_value_ms(raw: &Value) -> Option<i64> {
     if let Some(text) = raw.as_str() {
         return DateTime::parse_from_rfc3339(text)
             .map(|value| value.timestamp_millis())
@@ -2106,6 +2261,78 @@ fn read_timestamp_ms(value: &Value) -> Option<i64> {
         return Some(numeric * 1000);
     }
     Some(numeric)
+}
+
+fn maybe_start_fork_replay(
+    value: &Value,
+    first_session_meta_seen: &mut bool,
+    replay: &mut ForkReplayState,
+) {
+    if *first_session_meta_seen {
+        return;
+    }
+    *first_session_meta_seen = true;
+
+    let payload = value.get("payload").and_then(Value::as_object);
+    let Some(payload) = payload else {
+        return;
+    };
+    if payload
+        .get("forked_from_id")
+        .and_then(Value::as_str)
+        .is_none()
+    {
+        return;
+    }
+
+    let start_ms = payload
+        .get("timestamp")
+        .and_then(parse_timestamp_value_ms)
+        .or_else(|| read_timestamp_ms(value));
+    *replay = ForkReplayState {
+        active: true,
+        done: false,
+        start_ms,
+        last_event_ms: start_ms,
+        token_events: 0,
+    };
+}
+
+fn fork_replay_should_skip_event(
+    replay: &mut ForkReplayState,
+    event_timestamp_ms: Option<i64>,
+) -> bool {
+    if !replay.active || replay.done {
+        return false;
+    }
+
+    let Some(timestamp_ms) = event_timestamp_ms else {
+        return true;
+    };
+    let start_ms = replay.start_ms.unwrap_or(timestamp_ms);
+    let elapsed_ms = timestamp_ms - start_ms;
+    let gap_ms = replay
+        .last_event_ms
+        .map(|last_ms| timestamp_ms - last_ms)
+        .unwrap_or(0);
+
+    if gap_ms >= FORK_REPLAY_END_GAP_MS
+        || (replay.token_events == 0 && elapsed_ms >= FORK_REPLAY_NO_TOKEN_GRACE_MS)
+    {
+        replay.active = false;
+        replay.done = true;
+        replay.last_event_ms = Some(timestamp_ms);
+        return false;
+    }
+
+    replay.last_event_ms = Some(timestamp_ms);
+    true
+}
+
+fn note_fork_replay_token(replay: &mut ForkReplayState) {
+    if replay.active && !replay.done {
+        replay.token_events = replay.token_events.saturating_add(1);
+    }
 }
 
 fn unix_time_seconds() -> i64 {
@@ -2305,6 +2532,185 @@ mod tests {
             .expect("open token file for append");
         use std::io::Write as _;
         writeln!(file, "{line}").expect("append token line");
+    }
+
+    fn append_json_line(path: &Path, line: serde_json::Value) {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+            .expect("open jsonl file for append");
+        use std::io::Write as _;
+        writeln!(file, "{line}").expect("append json line");
+    }
+
+    fn append_total_token_line(
+        path: &Path,
+        timestamp_ms: i64,
+        input_tokens: i64,
+        cached_input_tokens: i64,
+        output_tokens: i64,
+    ) {
+        let timestamp = Utc
+            .timestamp_millis_opt(timestamp_ms)
+            .single()
+            .expect("valid timestamp")
+            .to_rfc3339();
+        append_json_line(
+            path,
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": timestamp,
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": input_tokens,
+                            "cached_input_tokens": cached_input_tokens,
+                            "output_tokens": output_tokens
+                        },
+                        "model": "gpt-test"
+                    }
+                }
+            }),
+        );
+    }
+
+    fn append_agent_message_line(path: &Path, timestamp_ms: i64) {
+        let timestamp = Utc
+            .timestamp_millis_opt(timestamp_ms)
+            .single()
+            .expect("valid timestamp")
+            .to_rfc3339();
+        append_json_line(
+            path,
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": timestamp,
+                "payload": {
+                    "type": "agent_message",
+                    "message": "ok"
+                }
+            }),
+        );
+    }
+
+    fn write_forked_replay_file(path: &Path, timestamp_ms: i64) {
+        let fork_timestamp = Utc
+            .timestamp_millis_opt(timestamp_ms)
+            .single()
+            .expect("valid timestamp")
+            .to_rfc3339();
+        append_json_line(
+            path,
+            serde_json::json!({
+                "type": "session_meta",
+                "timestamp": fork_timestamp,
+                "payload": {
+                    "id": "fork-child",
+                    "forked_from_id": "parent",
+                    "timestamp": fork_timestamp,
+                    "cwd": "/tmp/forked-project"
+                }
+            }),
+        );
+        append_json_line(
+            path,
+            serde_json::json!({
+                "type": "session_meta",
+                "timestamp": fork_timestamp,
+                "payload": {
+                    "id": "parent",
+                    "timestamp": fork_timestamp,
+                    "cwd": "/tmp/forked-project"
+                }
+            }),
+        );
+
+        append_total_token_line(path, timestamp_ms + 100, 1_000, 800, 100);
+        append_agent_message_line(path, timestamp_ms + 200);
+        append_total_token_line(path, timestamp_ms + 400, 1_500, 1_300, 130);
+        append_total_token_line(path, timestamp_ms + 1_700, 1_700, 1_400, 150);
+        append_agent_message_line(path, timestamp_ms + 1_800);
+    }
+
+    fn default_test_limits(full_scan: bool) -> ScanLimits {
+        ScanLimits {
+            max_session_file_bytes: 4 * 1024 * 1024,
+            max_session_total_bytes: 16 * 1024 * 1024,
+            max_session_files_scanned: 10,
+            max_jsonl_line_bytes: 512 * 1024,
+            scan_time_budget_ms: 0,
+            full_scan,
+            scan_cache_max_entries: 1000,
+        }
+    }
+
+    #[test]
+    fn compute_snapshot_ignores_forked_session_replay_without_cache() {
+        let root = make_temp_dir("fork-replay-no-cache");
+        let codex_home = root.join("codex");
+        let sessions_root = codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions root");
+
+        let now_ms = Utc::now().timestamp_millis();
+        let session_path = sessions_root.join("forked.jsonl");
+        write_forked_replay_file(
+            &session_path,
+            now_ms - Duration::hours(1).num_milliseconds(),
+        );
+
+        let snapshot = compute_snapshot(30, &codex_home, None, default_test_limits(false), None)
+            .expect("snapshot");
+        assert_eq!(
+            snapshot.totals.last30_days_tokens, 220,
+            "only token deltas after the fork replay should count"
+        );
+        assert_eq!(
+            snapshot.days.iter().map(|day| day.agent_runs).sum::<i64>(),
+            1
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compute_snapshot_ignores_forked_session_replay_with_cache() {
+        let root = make_temp_dir("fork-replay-cache");
+        let codex_home = root.join("codex");
+        let sessions_root = codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions root");
+
+        let now_ms = Utc::now().timestamp_millis();
+        let session_path = sessions_root.join("forked.jsonl");
+        write_forked_replay_file(
+            &session_path,
+            now_ms - Duration::hours(1).num_milliseconds(),
+        );
+
+        let cache_db_path = root.join("comon.db");
+        let first = compute_snapshot(
+            30,
+            &codex_home,
+            None,
+            default_test_limits(false),
+            Some(cache_db_path.as_path()),
+        )
+        .expect("first snapshot");
+        assert_eq!(first.totals.last30_days_tokens, 220);
+
+        let cached = compute_snapshot(
+            30,
+            &codex_home,
+            None,
+            default_test_limits(false),
+            Some(cache_db_path.as_path()),
+        )
+        .expect("cached snapshot");
+        assert_eq!(cached.totals.last30_days_tokens, 220);
+        assert_eq!(cached.days.iter().map(|day| day.agent_runs).sum::<i64>(), 1);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2705,7 +3111,67 @@ mod tests {
     }
 
     #[test]
-    fn open_or_init_scan_cache_db_migrates_v1_schema() {
+    fn open_or_init_scan_cache_db_v3_migration_preserves_nonforked_rows() {
+        let root = make_temp_dir("cache-migrate-v3");
+        let sessions_root = root.join("sessions");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions root");
+        let keep_path = sessions_root.join("keep.jsonl");
+        let forked_path = sessions_root.join("forked.jsonl");
+        let now_ms = Utc::now().timestamp_millis();
+        write_token_file(&keep_path, now_ms, 10, 5);
+        write_forked_replay_file(&forked_path, now_ms);
+
+        let db_path = root.join("comon.db");
+        let conn = Connection::open(&db_path).expect("open v2 db");
+        conn.execute_batch(
+            "
+            CREATE TABLE cache_meta (
+                key TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            );
+            INSERT INTO cache_meta(key, value) VALUES('schema_version', 2);
+            CREATE TABLE file_cache (
+                file_path TEXT PRIMARY KEY,
+                file_size INTEGER NOT NULL,
+                file_mtime INTEGER,
+                file_offset INTEGER NOT NULL DEFAULT 0,
+                fully_parsed INTEGER NOT NULL DEFAULT 1,
+                session_cwd TEXT,
+                parser_state_json TEXT NOT NULL DEFAULT '{}',
+                daily_json TEXT NOT NULL,
+                model_daily_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            ",
+        )
+        .expect("create v2 schema");
+        for path in [&keep_path, &forked_path] {
+            let key = path.to_string_lossy().to_string();
+            conn.execute(
+                "
+                INSERT INTO file_cache(
+                    file_path, file_size, file_mtime, file_offset, fully_parsed,
+                    session_cwd, parser_state_json, daily_json, model_daily_json, updated_at
+                ) VALUES(?1, 1, 1, 1, 1, '/tmp', '{}', '{}', '{}', 1);
+                ",
+                rusqlite::params![key],
+            )
+            .expect("insert cache row");
+        }
+        drop(conn);
+
+        let db = open_or_init_scan_cache_db(&db_path).expect("open and migrate");
+        let (store, _) = load_scan_cache_store(&db).expect("load migrated cache");
+        let keep_key = keep_path.to_string_lossy().to_string();
+        let forked_key = forked_path.to_string_lossy().to_string();
+        assert!(store.entries.contains_key(&keep_key));
+        assert!(!store.entries.contains_key(&forked_key));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn open_or_init_scan_cache_db_migrates_v1_schema_and_clears_stale_rows() {
         let root = make_temp_dir("cache-migrate");
         let db_path = root.join("comon.db");
         let conn = Connection::open(&db_path).expect("open legacy db");
@@ -2753,12 +3219,10 @@ mod tests {
         );
 
         let (store, _) = load_scan_cache_store(&db).expect("load migrated cache");
-        let entry = store
-            .entries
-            .get("legacy.jsonl")
-            .expect("legacy row should remain readable");
-        assert_eq!(entry.file_offset, 0);
-        assert!(entry.fully_parsed);
+        assert!(
+            store.entries.is_empty(),
+            "v3 migration should clear rows computed with older parser semantics"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

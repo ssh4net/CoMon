@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented in this file.
 
+## 0.3.4 - 2026-04-24
+
+- Fixed inflated usage totals from forked/subagent session logs by ignoring replayed parent-session token history while preserving new post-fork usage.
+- Bumped the scan-cache schema to reparse stale forked-session cache rows.
+
 ## 0.3.3 - 2026-03-18
 
 - Added a built-in Session history screen to the main `comon` TUI:

@@ -1,10 +1,10 @@
 use crate::app::{ActiveScreen, AppState, ChartOrientation};
 use crate::usage::{
     format_compact_kmb, format_count, format_duration_compact, format_tokens_compact, ChartRange,
-    UsageMetric,
+    ProjectActivity, UsageMetric, ACTIVITY_TIMELINE_WEEKS,
 };
 use anyhow::Result;
-use chrono::{Datelike, Local, NaiveDate, TimeZone};
+use chrono::{Datelike, Local, NaiveDate, TimeZone, Weekday};
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
@@ -20,6 +20,16 @@ use ratatui::{
 };
 use std::io::{self, Stdout};
 use std::time::Instant;
+
+const ACTIVITY_PROJECT_HEIGHT: u16 = 9;
+const ACTIVITY_PROJECT_STRIDE: u16 = 10;
+const ACTIVITY_WEEKDAY_LABEL_WIDTH: u16 = 4;
+const ACTIVITY_COLORS: [Color; 4] = [
+    Color::Indexed(23),
+    Color::Indexed(30),
+    Color::Indexed(37),
+    Color::Cyan,
+];
 
 pub fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
@@ -62,6 +72,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
     let area = frame.area();
     let title = match state.active_screen {
         ActiveScreen::Usage => " comon :: usage ",
+        ActiveScreen::Activity => " comon :: activity ",
         ActiveScreen::Read => " comon :: session history ",
     };
 
@@ -98,10 +109,28 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
             render_footer(frame, chunks[2], state);
 
             if state.show_help {
-                render_help_overlay(frame, area);
+                render_help_overlay(frame, area, state.active_screen);
             }
             if state.no_sessions_confirm_open {
                 render_no_sessions_overlay(frame, area, state);
+            }
+        }
+        ActiveScreen::Activity => {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(0),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
+
+            render_activity_header(frame, chunks[0], state);
+            render_activity(frame, chunks[1], state);
+            render_footer(frame, chunks[2], state);
+
+            if state.show_help {
+                render_help_overlay(frame, area, state.active_screen);
             }
         }
         ActiveScreen::Read => {
@@ -140,6 +169,33 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(right, row[1]);
 }
 
+fn render_activity_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(20), Constraint::Length(36)])
+        .split(area);
+
+    let left = Paragraph::new(Line::from(Span::styled(
+        "PROJECT_ACTIVITY",
+        Style::default().add_modifier(Modifier::BOLD),
+    )))
+    .alignment(Alignment::Left);
+    frame.render_widget(left, row[0]);
+
+    let updated = state
+        .usage_updated_label()
+        .unwrap_or_else(|| "Updated --".to_string());
+    let right = Paragraph::new(Line::from(vec![
+        Span::raw(updated),
+        Span::raw("  "),
+        Span::styled("[+/-]", Style::default().fg(Color::Gray)),
+        Span::raw("  "),
+        Span::styled("[s/F2]", Style::default().fg(Color::Gray)),
+    ]))
+    .alignment(Alignment::Right);
+    frame.render_widget(right, row[1]);
+}
+
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let err = state
         .usage_error
@@ -152,8 +208,15 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         Span::styled(truncate_middle(err, 80), Style::default().fg(Color::Red))
     };
 
-    let usage_hint =
-        "Usage: Statistic [tab] (tokens/time/runs), Timeframe [w] (week/month), Layout [f] (horizontal/vertical), Refresh [r/F5], Switch [s/F2], Help [?], Quit [q]";
+    let usage_hint = match state.active_screen {
+        ActiveScreen::Usage => {
+            "Usage: Statistic [tab] (tokens/time/runs), Timeframe [w] (week/month), Layout [f] (horizontal/vertical), Refresh [r/F5], Switch [s/F2], Help [?], Quit [q]"
+        }
+        ActiveScreen::Activity => {
+            "Activity: Statistic [tab] (tokens/time/runs), Projects [+/-], Refresh [r/F5], Switch [s/F2], Help [?], Quit [q]"
+        }
+        ActiveScreen::Read => "",
+    };
     let line = Line::from(vec![
         Span::styled(usage_hint, Style::default().fg(Color::Gray)),
         Span::raw("  "),
@@ -164,7 +227,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 }
 
 fn render_usage(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let cards_height = if area.width >= 150 { 7 } else { 15 };
+    let cards_height = usage_cards_height(area.width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -179,6 +242,458 @@ fn render_usage(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     render_usage_cards(frame, chunks[1], state);
     render_usage_chart(frame, chunks[2], state);
     render_top_models(frame, chunks[3], state);
+}
+
+fn usage_cards_height(width: u16) -> u16 {
+    if width >= 150 {
+        7
+    } else {
+        15
+    }
+}
+
+fn render_activity(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let cards_height = usage_cards_height(area.width);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(cards_height),
+            Constraint::Min(1),
+        ])
+        .split(area);
+
+    render_activity_controls(frame, chunks[0], state);
+    render_usage_cards(frame, chunks[1], state);
+    render_activity_heatmaps(frame, chunks[2], state);
+}
+
+fn render_activity_controls(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(20), Constraint::Min(0)])
+        .split(area);
+
+    let workspace_label = state
+        .workspace_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "All workspaces".to_string());
+    let left = Paragraph::new(Line::from(vec![
+        Span::styled("WORKSPACE", Style::default().fg(Color::Gray)),
+        Span::raw("  "),
+        Span::styled(
+            truncate_middle(&workspace_label, 48),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    frame.render_widget(left, row[0]);
+
+    let tokens = pill("TOKENS", state.metric == UsageMetric::Tokens);
+    let time = pill("TIME", state.metric == UsageMetric::Time);
+    let runs = pill("RUNS", state.metric == UsageMetric::Runs);
+    let right = Paragraph::new(Line::from(vec![
+        Span::styled("VIEW", Style::default().fg(Color::Gray)),
+        Span::raw(" "),
+        tokens,
+        time,
+        runs,
+        Span::raw(" "),
+        Span::styled("PROJECTS", Style::default().fg(Color::Gray)),
+        Span::raw(" "),
+        Span::styled(
+            state.activity_project_limit.to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ]))
+    .alignment(Alignment::Right);
+    frame.render_widget(right, row[1]);
+}
+
+fn render_activity_heatmaps(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let metric_label = match state.metric {
+        UsageMetric::Tokens => "TOKENS",
+        UsageMetric::Time => "TIME",
+        UsageMetric::Runs => "RUNS",
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .title_top(
+            Line::from(Span::styled(
+                format!(" Last {ACTIVITY_TIMELINE_WEEKS} weeks "),
+                Style::default().fg(Color::Gray),
+            ))
+            .left_aligned(),
+        )
+        .title_top(
+            Line::from(Span::styled(
+                format!(" {metric_label} "),
+                Style::default().add_modifier(Modifier::BOLD),
+            ))
+            .right_aligned(),
+        );
+    frame.render_widget(block, area);
+
+    let inner = inset_with_border_and_padding(
+        area,
+        Padding {
+            left: 2,
+            right: 2,
+            top: 1,
+            bottom: 0,
+        },
+    );
+
+    let Some(snapshot) = state.usage.as_ref() else {
+        render_activity_message(frame, inner, "Loading activity...");
+        return;
+    };
+    if snapshot.project_activity.is_empty() {
+        render_activity_message(frame, inner, "No project activity found.");
+        return;
+    }
+    if inner.width <= ACTIVITY_WEEKDAY_LABEL_WIDTH || inner.height < ACTIVITY_PROJECT_HEIGHT {
+        render_activity_message(frame, inner, "Activity view needs more space.");
+        return;
+    }
+
+    let fit_by_height = ((inner.height.saturating_add(1)) / ACTIVITY_PROJECT_STRIDE).max(1);
+    let visible_projects = state
+        .activity_project_limit
+        .min(snapshot.project_activity.len())
+        .min(fit_by_height as usize);
+
+    let mut y = inner.y;
+    for project in snapshot.project_activity.iter().take(visible_projects) {
+        let slot = Rect {
+            x: inner.x,
+            y,
+            width: inner.width,
+            height: ACTIVITY_PROJECT_HEIGHT
+                .min(inner.y.saturating_add(inner.height).saturating_sub(y)),
+        };
+        render_project_activity_heatmap(
+            frame,
+            slot,
+            project,
+            state.metric,
+            snapshot.activity_first_weekday,
+        );
+        y = y.saturating_add(ACTIVITY_PROJECT_STRIDE);
+        if y >= inner.y.saturating_add(inner.height) {
+            break;
+        }
+    }
+}
+
+fn render_activity_message(frame: &mut Frame<'_>, area: Rect, message: &str) {
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            message.to_string(),
+            Style::default().fg(Color::Gray),
+        )))
+        .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_project_activity_heatmap(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    project: &ProjectActivity,
+    metric: UsageMetric,
+    first_weekday: Weekday,
+) {
+    if area.height < ACTIVITY_PROJECT_HEIGHT || area.width <= ACTIVITY_WEEKDAY_LABEL_WIDTH {
+        return;
+    }
+
+    let weeks_total = project.days.len() / 7;
+    if weeks_total == 0 {
+        return;
+    }
+    let grid_width = area.width.saturating_sub(ACTIVITY_WEEKDAY_LABEL_WIDTH);
+    let cell_width = activity_day_cell_width(grid_width, weeks_total);
+    let weeks_visible = weeks_total.min((grid_width / cell_width) as usize);
+    if weeks_visible == 0 {
+        return;
+    }
+    let week_offset = weeks_total.saturating_sub(weeks_visible);
+    let grid_x = area.x.saturating_add(ACTIVITY_WEEKDAY_LABEL_WIDTH);
+
+    let header = format_activity_project_header(project, metric, area.width as usize);
+    let buf = frame.buffer_mut();
+    write_text(
+        buf,
+        area.x,
+        area.y,
+        area.width,
+        &header,
+        Style::default().add_modifier(Modifier::BOLD),
+    );
+
+    render_activity_month_labels(
+        buf,
+        project,
+        week_offset,
+        weeks_visible,
+        grid_x,
+        cell_width,
+        area.y + 1,
+    );
+
+    let max_value = project
+        .days
+        .iter()
+        .map(|day| activity_day_value(day, metric))
+        .max()
+        .unwrap_or(0);
+    for row in 0..7usize {
+        let y = area.y.saturating_add(2 + row as u16);
+        if y >= area.y.saturating_add(area.height) {
+            break;
+        }
+        write_text(
+            buf,
+            area.x,
+            y,
+            ACTIVITY_WEEKDAY_LABEL_WIDTH,
+            activity_weekday_label(first_weekday, row),
+            Style::default().fg(Color::Gray),
+        );
+        for week in 0..weeks_visible {
+            let day_idx = (week_offset + week) * 7 + row;
+            let Some(day) = project.days.get(day_idx) else {
+                continue;
+            };
+            let value = activity_day_value(day, metric);
+            let level = activity_color_level(value, max_value);
+            let x = grid_x.saturating_add((week as u16).saturating_mul(cell_width));
+            write_activity_cell(buf, x, y, cell_width, level);
+        }
+    }
+}
+
+fn render_activity_month_labels(
+    buf: &mut ratatui::buffer::Buffer,
+    project: &ProjectActivity,
+    week_offset: usize,
+    weeks_visible: usize,
+    grid_x: u16,
+    cell_width: u16,
+    y: u16,
+) {
+    let mut next_free_x = grid_x;
+    let grid_end = grid_x.saturating_add((weeks_visible as u16).saturating_mul(cell_width));
+    for week in 0..weeks_visible {
+        let absolute_week = week_offset + week;
+        let Some(label) = activity_month_label_for_week(project, absolute_week, week == 0) else {
+            continue;
+        };
+        let x = grid_x.saturating_add((week as u16).saturating_mul(cell_width));
+        if x < next_free_x || x >= grid_end {
+            continue;
+        }
+        let available = grid_end.saturating_sub(x);
+        write_text(
+            buf,
+            x,
+            y,
+            (label.len() as u16).min(available),
+            label,
+            Style::default().fg(Color::Gray),
+        );
+        next_free_x = x.saturating_add(label.len() as u16).saturating_add(1);
+    }
+}
+
+fn activity_month_label_for_week(
+    project: &ProjectActivity,
+    week: usize,
+    force: bool,
+) -> Option<&'static str> {
+    let start = week.saturating_mul(7);
+    let end = start.saturating_add(7).min(project.days.len());
+    let days = project.days.get(start..end)?;
+    if force {
+        let date = parse_activity_date(&days.first()?.day)?;
+        return Some(month_abbrev(date.month()));
+    }
+    for day in days {
+        let date = parse_activity_date(&day.day)?;
+        if date.day() == 1 {
+            return Some(month_abbrev(date.month()));
+        }
+    }
+    None
+}
+
+fn parse_activity_date(day: &str) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(day, "%Y-%m-%d").ok()
+}
+
+fn month_abbrev(month: u32) -> &'static str {
+    match month {
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        12 => "Dec",
+        _ => "",
+    }
+}
+
+fn format_activity_project_header(
+    project: &ProjectActivity,
+    metric: UsageMetric,
+    max_width: usize,
+) -> String {
+    let name = activity_project_name(&project.display_path);
+    let active_days = project
+        .days
+        .iter()
+        .filter(|day| activity_day_value(day, metric) > 0)
+        .count();
+    let total = activity_metric_total_label(project, metric);
+    let last = project
+        .last_activity_day
+        .as_deref()
+        .map(format_activity_date_short)
+        .unwrap_or_else(|| "--".to_string());
+    truncate_middle(
+        &format!("[{name}]  {active_days} days  {total}  last {last}"),
+        max_width,
+    )
+}
+
+fn activity_project_name(path: &str) -> String {
+    let trimmed = path.trim().trim_end_matches(|ch| ch == '/' || ch == '\\');
+    trimmed
+        .rsplit(|ch| ch == '/' || ch == '\\')
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+fn activity_metric_total_label(project: &ProjectActivity, metric: UsageMetric) -> String {
+    match metric {
+        UsageMetric::Tokens => format!("{} tokens", format_tokens_compact(project.total_tokens)),
+        UsageMetric::Time => format_duration_compact(project.agent_time_ms),
+        UsageMetric::Runs => format!("{} runs", format_count(project.agent_runs)),
+    }
+}
+
+fn format_activity_date_short(day: &str) -> String {
+    let Some(date) = parse_activity_date(day) else {
+        return day.to_string();
+    };
+    format!("{} {}", month_abbrev(date.month()), date.day())
+}
+
+fn activity_day_value(day: &crate::usage::UsageDay, metric: UsageMetric) -> i64 {
+    match metric {
+        UsageMetric::Tokens => day.total_tokens.max(0),
+        UsageMetric::Time => day.agent_time_ms.max(0),
+        UsageMetric::Runs => day.agent_runs.max(0),
+    }
+}
+
+fn activity_color_level(value: i64, max_value: i64) -> usize {
+    if value <= 0 || max_value <= 0 {
+        return 0;
+    }
+    let level = ((value as f64 / max_value as f64) * ACTIVITY_COLORS.len() as f64).ceil() as usize;
+    level.clamp(1, ACTIVITY_COLORS.len())
+}
+
+fn activity_day_cell_width(grid_width: u16, weeks_total: usize) -> u16 {
+    if weeks_total > 0 && usize::from(grid_width) >= weeks_total.saturating_mul(2) {
+        2
+    } else {
+        1
+    }
+}
+
+fn activity_weekday_label(first_weekday: Weekday, row: usize) -> &'static str {
+    let monday_row = activity_weekday_row(first_weekday, Weekday::Mon);
+    if row < monday_row || (row - monday_row) % 2 != 0 {
+        return "";
+    }
+    match activity_weekday_for_row(first_weekday, row) {
+        Weekday::Mon => "Mon",
+        Weekday::Wed => "Wed",
+        Weekday::Fri => "Fri",
+        Weekday::Sun => "Sun",
+        _ => "",
+    }
+}
+
+fn activity_weekday_for_row(first_weekday: Weekday, row: usize) -> Weekday {
+    weekday_from_monday_index((first_weekday.num_days_from_monday() as usize + row) % 7)
+}
+
+fn activity_weekday_row(first_weekday: Weekday, weekday: Weekday) -> usize {
+    let first = first_weekday.num_days_from_monday() as usize;
+    let day = weekday.num_days_from_monday() as usize;
+    (7 + day - first) % 7
+}
+
+fn weekday_from_monday_index(index: usize) -> Weekday {
+    match index % 7 {
+        0 => Weekday::Mon,
+        1 => Weekday::Tue,
+        2 => Weekday::Wed,
+        3 => Weekday::Thu,
+        4 => Weekday::Fri,
+        5 => Weekday::Sat,
+        _ => Weekday::Sun,
+    }
+}
+
+fn write_activity_cell(
+    buf: &mut ratatui::buffer::Buffer,
+    x: u16,
+    y: u16,
+    width: u16,
+    level: usize,
+) {
+    let style = if level > 0 {
+        Style::default().bg(ACTIVITY_COLORS[level - 1])
+    } else {
+        Style::default()
+    };
+    for dx in 0..width {
+        if let Some(cell) = buf.cell_mut((x.saturating_add(dx), y)) {
+            cell.set_char(' ').set_style(style);
+        }
+    }
+}
+
+fn write_text(
+    buf: &mut ratatui::buffer::Buffer,
+    x: u16,
+    y: u16,
+    max_width: u16,
+    text: &str,
+    style: Style,
+) {
+    if max_width == 0 {
+        return;
+    }
+    for (idx, ch) in text.chars().take(max_width as usize).enumerate() {
+        if let Some(cell) = buf.cell_mut((x.saturating_add(idx as u16), y)) {
+            cell.set_char(ch).set_style(style);
+        }
+    }
 }
 
 fn render_usage_controls(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -1292,9 +1807,9 @@ fn render_top_models(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
+fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) {
     let w = area.width.min(60);
-    let h = area.height.min(12);
+    let h = area.height.min(13);
     let popup = centered_rect(w, h, area);
     frame.render_widget(Clear, popup);
 
@@ -1312,15 +1827,29 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
             Style::default().add_modifier(Modifier::BOLD),
         ));
 
-    let text = Text::from(vec![
-        Line::from("Keys:"),
-        Line::from("  Tab  - toggle statistic (Tokens/Time/Runs)"),
-        Line::from("  w    - toggle timeframe (Week/Month)"),
-        Line::from("  f    - toggle layout (Horz/Vert)"),
-        Line::from("  r/F5 - refresh usage + limits"),
-        Line::from("  ?    - toggle help"),
-        Line::from("  q/Esc - quit"),
-    ]);
+    let text = match screen {
+        ActiveScreen::Usage => Text::from(vec![
+            Line::from("Keys:"),
+            Line::from("  Tab  - toggle statistic (Tokens/Time/Runs)"),
+            Line::from("  w    - toggle timeframe (Week/Month)"),
+            Line::from("  f    - toggle layout (Horz/Vert)"),
+            Line::from("  r/F5 - refresh usage + limits"),
+            Line::from("  s/F2 - switch screen"),
+            Line::from("  ?    - toggle help"),
+            Line::from("  q/Esc - quit"),
+        ]),
+        ActiveScreen::Activity => Text::from(vec![
+            Line::from("Keys:"),
+            Line::from("  Tab  - toggle statistic (Tokens/Time/Runs)"),
+            Line::from("  +/=  - show more projects"),
+            Line::from("  -    - show fewer projects"),
+            Line::from("  r/F5 - refresh usage + limits"),
+            Line::from("  s/F2 - switch screen"),
+            Line::from("  ?    - toggle help"),
+            Line::from("  q/Esc - quit"),
+        ]),
+        ActiveScreen::Read => Text::from(vec![Line::from("Keys:"), Line::from("  q/Esc - quit")]),
+    };
     frame.render_widget(
         Paragraph::new(text)
             .block(block)
@@ -1674,5 +2203,35 @@ mod tests {
         let out = format_horizontal_value(45_456_785, Some(1_756_241), UsageMetric::Tokens, 10);
         assert!(out.contains(" / "));
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn activity_color_levels_scale_to_project_max() {
+        assert_eq!(activity_color_level(0, 100), 0);
+        assert_eq!(activity_color_level(1, 100), 1);
+        assert_eq!(activity_color_level(50, 100), 2);
+        assert_eq!(activity_color_level(100, 100), 4);
+    }
+
+    #[test]
+    fn activity_project_name_uses_path_leaf() {
+        assert_eq!(activity_project_name("/tmp/Photonia"), "Photonia");
+        assert_eq!(activity_project_name(r"C:\src\SFM"), "SFM");
+    }
+
+    #[test]
+    fn activity_day_cell_width_expands_when_all_weeks_fit() {
+        assert_eq!(activity_day_cell_width(108, 54), 2);
+        assert_eq!(activity_day_cell_width(107, 54), 1);
+    }
+
+    #[test]
+    fn activity_weekday_labels_follow_first_weekday() {
+        assert_eq!(activity_weekday_label(Weekday::Mon, 0), "Mon");
+        assert_eq!(activity_weekday_label(Weekday::Mon, 6), "Sun");
+        assert_eq!(activity_weekday_label(Weekday::Sun, 0), "");
+        assert_eq!(activity_weekday_label(Weekday::Sun, 1), "Mon");
+        assert_eq!(activity_weekday_label(Weekday::Sun, 6), "");
+        assert_eq!(activity_weekday_label(Weekday::Sat, 2), "Mon");
     }
 }

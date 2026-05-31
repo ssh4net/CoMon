@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, Local, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Utc, Weekday};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,6 +21,8 @@ const SCAN_CACHE_DB_SCHEMA_VERSION: i64 = 3;
 const FORK_REPLAY_END_GAP_MS: i64 = 1_000;
 const FORK_REPLAY_NO_TOKEN_GRACE_MS: i64 = 2_000;
 pub const DEFAULT_SCAN_CACHE_MAX_ENTRIES: usize = 50_000;
+pub const ACTIVITY_TIMELINE_WEEKS: usize = 54;
+pub const ACTIVITY_TIMELINE_DAYS: usize = ACTIVITY_TIMELINE_WEEKS * 7;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ScanLimits {
@@ -189,10 +191,22 @@ pub struct LocalUsageModel {
 }
 
 #[derive(Debug, Clone)]
+pub struct ProjectActivity {
+    pub display_path: String,
+    pub days: Vec<UsageDay>,
+    pub last_activity_day: Option<String>,
+    pub total_tokens: i64,
+    pub agent_time_ms: i64,
+    pub agent_runs: i64,
+}
+
+#[derive(Debug, Clone)]
 pub struct LocalUsageSnapshot {
     pub days: Vec<UsageDay>,
     pub totals: UsageTotalsTokens,
     pub top_models: Vec<LocalUsageModel>,
+    pub activity_first_weekday: Weekday,
+    pub project_activity: Vec<ProjectActivity>,
     // Number of session files that were identified as belonging to the selected workspace filter.
     // When no workspace filter is used, this is 0.
     pub matched_session_files: u32,
@@ -419,6 +433,12 @@ struct FileScanSummary {
     model_totals_by_day: HashMap<String, HashMap<String, i64>>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ProjectActivityBuilder {
+    display_path: String,
+    daily: HashMap<String, DailyTotals>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -462,15 +482,34 @@ pub fn compute_snapshot(
     let days = days.clamp(1, 90);
 
     let sessions_root = codex_home.join("sessions");
-    let day_keys = make_day_keys(days);
-    let mut daily: HashMap<String, DailyTotals> = day_keys
+    let chart_day_keys = make_day_keys(days);
+    let chart_day_filter: HashSet<String> = chart_day_keys.iter().cloned().collect();
+    let activity_first_weekday = system_first_weekday();
+    let activity_day_keys = make_activity_day_keys(activity_first_weekday);
+    let activity_oldest_day = activity_day_keys.first().cloned();
+    let mut scan_day_keys = activity_day_keys.clone();
+    for day_key in &chart_day_keys {
+        if !scan_day_keys.contains(day_key) {
+            scan_day_keys.push(day_key.clone());
+        }
+    }
+    let mut daily: HashMap<String, DailyTotals> = scan_day_keys
         .iter()
         .map(|key| (key.clone(), DailyTotals::default()))
         .collect();
     let mut model_totals: HashMap<String, i64> = HashMap::new();
+    let mut project_activity: HashMap<String, ProjectActivityBuilder> = HashMap::new();
 
     if !sessions_root.exists() {
-        return Ok(build_snapshot(day_keys, daily, model_totals, 0));
+        return Ok(build_snapshot(
+            chart_day_keys,
+            daily,
+            model_totals,
+            0,
+            activity_first_weekday,
+            activity_day_keys,
+            project_activity,
+        ));
     }
 
     // Build a full candidate list (metadata-only).
@@ -487,12 +526,17 @@ pub fn compute_snapshot(
     let cutoff_epoch_secs = if limits.full_scan {
         None
     } else {
-        SystemTime::now()
-            .checked_sub(StdDuration::from_secs(
-                (days as u64).saturating_mul(24 * 60 * 60),
-            ))
-            .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
-            .map(|duration| duration.as_secs())
+        activity_oldest_day
+            .as_deref()
+            .and_then(epoch_secs_for_local_day_start)
+            .or_else(|| {
+                SystemTime::now()
+                    .checked_sub(StdDuration::from_secs(
+                        (ACTIVITY_TIMELINE_DAYS as u64).saturating_mul(24 * 60 * 60),
+                    ))
+                    .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs())
+            })
     };
 
     let force_reparse_all = limits.full_scan && limits.scan_time_budget_ms == 0;
@@ -581,6 +625,8 @@ pub fn compute_snapshot(
                                     workspace_path,
                                     &mut daily,
                                     &mut model_totals,
+                                    &chart_day_filter,
+                                    &mut project_activity,
                                     &mut matched_session_files,
                                 );
                             }
@@ -602,6 +648,8 @@ pub fn compute_snapshot(
                                     workspace_path,
                                     &mut daily,
                                     &mut model_totals,
+                                    &chart_day_filter,
+                                    &mut project_activity,
                                     &mut matched_session_files,
                                 );
                             }
@@ -630,6 +678,8 @@ pub fn compute_snapshot(
                     workspace_path,
                     &mut daily,
                     &mut model_totals,
+                    &chart_day_filter,
+                    &mut project_activity,
                     &mut matched_session_files,
                 );
                 continue;
@@ -641,6 +691,8 @@ pub fn compute_snapshot(
                     workspace_path,
                     &mut daily,
                     &mut model_totals,
+                    &chart_day_filter,
+                    &mut project_activity,
                     &mut matched_session_files,
                 );
                 continue;
@@ -652,6 +704,8 @@ pub fn compute_snapshot(
                     workspace_path,
                     &mut daily,
                     &mut model_totals,
+                    &chart_day_filter,
+                    &mut project_activity,
                     &mut matched_session_files,
                 );
             }
@@ -659,15 +713,28 @@ pub fn compute_snapshot(
     } else {
         for idx in planned_indices {
             let candidate = &candidates[idx];
-            scan_file(
-                &candidate.path,
+            let parsed =
+                parse_file_summary(&candidate.path, limits.max_jsonl_line_bytes, None, None)?;
+            let entry = CachedFileScanEntry {
+                size: candidate.len,
+                modified_epoch_secs: candidate.modified_epoch_secs,
+                file_offset: parsed.file_offset.min(candidate.len),
+                fully_parsed: parsed.fully_parsed,
+                session_cwd: parsed.session_cwd,
+                parser_state: parsed.parser_state,
+                daily: parsed.daily,
+                model_totals_by_day: parsed.model_totals_by_day,
+                updated_at: unix_time_seconds(),
+            };
+            apply_cached_file_entry(
+                &entry,
+                workspace_path,
                 &mut daily,
                 &mut model_totals,
-                workspace_path,
-                limits.max_session_file_bytes,
-                limits.max_jsonl_line_bytes,
+                &chart_day_filter,
+                &mut project_activity,
                 &mut matched_session_files,
-            )?;
+            );
         }
     }
 
@@ -687,10 +754,13 @@ pub fn compute_snapshot(
     }
 
     Ok(build_snapshot(
-        day_keys,
+        chart_day_keys,
         daily,
         model_totals,
         matched_session_files,
+        activity_first_weekday,
+        activity_day_keys,
+        project_activity,
     ))
 }
 
@@ -767,6 +837,9 @@ fn build_snapshot(
     daily: HashMap<String, DailyTotals>,
     model_totals: HashMap<String, i64>,
     matched_session_files: u32,
+    activity_first_weekday: Weekday,
+    activity_day_keys: Vec<String>,
+    project_activity: HashMap<String, ProjectActivityBuilder>,
 ) -> LocalUsageSnapshot {
     let mut days: Vec<UsageDay> = Vec::with_capacity(day_keys.len());
     let mut total_tokens = 0i64;
@@ -836,8 +909,69 @@ fn build_snapshot(
             peak_day_tokens,
         },
         top_models,
+        activity_first_weekday,
+        project_activity: build_project_activity(activity_day_keys, project_activity),
         matched_session_files,
     }
+}
+
+fn build_project_activity(
+    day_keys: Vec<String>,
+    projects: HashMap<String, ProjectActivityBuilder>,
+) -> Vec<ProjectActivity> {
+    let mut out: Vec<ProjectActivity> = Vec::with_capacity(projects.len());
+
+    for (_, project) in projects {
+        let mut days: Vec<UsageDay> = Vec::with_capacity(day_keys.len());
+        let mut total_tokens = 0i64;
+        let mut agent_time_ms = 0i64;
+        let mut agent_runs = 0i64;
+        let mut last_activity_day: Option<String> = None;
+
+        for day_key in &day_keys {
+            let totals = project.daily.get(day_key).copied().unwrap_or_default();
+            let total = totals.input + totals.output;
+            total_tokens += total;
+            agent_time_ms += totals.agent_ms;
+            agent_runs += totals.agent_runs;
+            if daily_has_activity(totals) {
+                last_activity_day = Some(day_key.clone());
+            }
+            days.push(UsageDay {
+                day: day_key.clone(),
+                input_tokens: totals.input,
+                cached_input_tokens: totals.cached,
+                total_tokens: total,
+                agent_time_ms: totals.agent_ms,
+                agent_runs: totals.agent_runs,
+            });
+        }
+
+        if last_activity_day.is_none() {
+            continue;
+        }
+
+        out.push(ProjectActivity {
+            display_path: project.display_path,
+            days,
+            last_activity_day,
+            total_tokens,
+            agent_time_ms,
+            agent_runs,
+        });
+    }
+
+    out.sort_by(|left, right| {
+        right
+            .last_activity_day
+            .cmp(&left.last_activity_day)
+            .then_with(|| left.display_path.cmp(&right.display_path))
+    });
+    out
+}
+
+fn daily_has_activity(totals: DailyTotals) -> bool {
+    totals.input > 0 || totals.output > 0 || totals.agent_ms > 0 || totals.agent_runs > 0
 }
 
 fn add_model_tokens_limited(
@@ -860,6 +994,8 @@ fn apply_cached_file_entry(
     workspace_path: Option<&Path>,
     daily: &mut HashMap<String, DailyTotals>,
     model_totals: &mut HashMap<String, i64>,
+    chart_day_filter: &HashSet<String>,
+    project_activity: &mut HashMap<String, ProjectActivityBuilder>,
     matched_session_files: &mut u32,
 ) {
     let matches_workspace = match workspace_path {
@@ -889,12 +1025,51 @@ fn apply_cached_file_entry(
     }
 
     for (day_key, per_day_models) in &entry.model_totals_by_day {
-        if !daily.contains_key(day_key) {
+        if !chart_day_filter.contains(day_key) {
             continue;
         }
         for (model, tokens) in per_day_models {
             add_model_tokens_limited(model_totals, model.clone(), *tokens);
         }
+    }
+
+    if let Some(cwd) = entry.session_cwd.as_deref() {
+        apply_project_activity(cwd, &entry.daily, daily, project_activity);
+    }
+}
+
+fn apply_project_activity(
+    cwd: &str,
+    entry_daily: &HashMap<String, DailyTotals>,
+    day_filter: &HashMap<String, DailyTotals>,
+    project_activity: &mut HashMap<String, ProjectActivityBuilder>,
+) {
+    if cwd.trim().is_empty() {
+        return;
+    }
+    let key = normalize_project_key(cwd);
+    if key.is_empty() {
+        return;
+    }
+
+    let builder = project_activity.entry(key).or_default();
+    if builder.display_path.is_empty()
+        || cwd.len() < builder.display_path.len()
+        || (cwd.len() == builder.display_path.len() && cwd < builder.display_path.as_str())
+    {
+        builder.display_path = cwd.to_string();
+    }
+
+    for (day_key, totals) in entry_daily {
+        if !day_filter.contains_key(day_key) {
+            continue;
+        }
+        let dst = builder.daily.entry(day_key.clone()).or_default();
+        dst.input += totals.input;
+        dst.cached += totals.cached;
+        dst.output += totals.output;
+        dst.agent_ms += totals.agent_ms;
+        dst.agent_runs += totals.agent_runs;
     }
 }
 
@@ -1924,282 +2099,6 @@ fn ensure_regular_file_or_missing(path: &Path, label: &str) -> Result<()> {
     }
 }
 
-fn scan_file(
-    path: &Path,
-    daily: &mut HashMap<String, DailyTotals>,
-    model_totals: &mut HashMap<String, i64>,
-    workspace_path: Option<&Path>,
-    _max_session_file_bytes: u64,
-    max_jsonl_line_bytes: usize,
-    matched_session_files: &mut u32,
-) -> Result<()> {
-    // Defensive: do not follow symlinks / special files even if called directly.
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(_) => return Ok(()),
-    };
-    let ft = meta.file_type();
-    if ft.is_symlink() || !ft.is_file() {
-        return Ok(());
-    }
-    if meta.len() == 0 {
-        return Ok(());
-    }
-
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(_) => return Ok(()),
-    };
-    let reader = BufReader::new(file);
-    let mut previous_totals: Option<UsageTotals> = None;
-    let mut current_model: Option<String> = None;
-    let mut last_activity_ms: Option<i64> = None;
-    let mut seen_runs: HashSet<i64> = HashSet::new();
-    let mut match_known = workspace_path.is_none();
-    let mut matches_workspace = workspace_path.is_none();
-    let mut counted_match = false;
-    let mut first_session_meta_seen = false;
-    let mut fork_replay = ForkReplayState::default();
-
-    for line in reader.lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(_) => continue,
-        };
-        if line.len() > max_jsonl_line_bytes {
-            continue;
-        }
-
-        let value = match serde_json::from_str::<Value>(&line) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        let entry_type = value
-            .get("type")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-
-        if entry_type == "session_meta" || entry_type == "turn_context" {
-            if let Some(cwd) = extract_cwd(&value) {
-                if let Some(filter) = workspace_path {
-                    matches_workspace = path_matches_workspace(&cwd, filter);
-                    match_known = true;
-                    if matches_workspace && !counted_match {
-                        *matched_session_files = matched_session_files.saturating_add(1);
-                        counted_match = true;
-                    }
-                    if !matches_workspace {
-                        break;
-                    }
-                }
-            }
-        }
-
-        if entry_type == "session_meta" {
-            maybe_start_fork_replay(&value, &mut first_session_meta_seen, &mut fork_replay);
-        }
-
-        let event_timestamp_ms = read_timestamp_ms(&value);
-        let skip_fork_replay = fork_replay_should_skip_event(&mut fork_replay, event_timestamp_ms);
-
-        if entry_type == "turn_context" {
-            if !skip_fork_replay {
-                if let Some(model) = extract_model_from_turn_context(&value) {
-                    current_model = Some(model);
-                }
-            }
-            continue;
-        }
-
-        if entry_type == "session_meta" {
-            continue;
-        }
-
-        if !matches_workspace {
-            if match_known {
-                break;
-            }
-            continue;
-        }
-
-        if !match_known {
-            continue;
-        }
-
-        if entry_type == "event_msg" || entry_type.is_empty() {
-            let payload = value.get("payload").and_then(|value| value.as_object());
-            let payload_type = payload
-                .and_then(|payload| payload.get("type"))
-                .and_then(|value| value.as_str());
-
-            if skip_fork_replay && payload_type != Some("token_count") {
-                continue;
-            }
-
-            if payload_type == Some("agent_message") {
-                if let Some(timestamp_ms) = event_timestamp_ms {
-                    if seen_runs.insert(timestamp_ms) {
-                        if let Some(day_key) = day_key_for_timestamp_ms(timestamp_ms) {
-                            if let Some(entry) = daily.get_mut(&day_key) {
-                                entry.agent_runs += 1;
-                            }
-                        }
-                    }
-                    track_activity(daily, &mut last_activity_ms, timestamp_ms);
-                }
-                continue;
-            }
-
-            if payload_type == Some("agent_reasoning") {
-                if let Some(timestamp_ms) = event_timestamp_ms {
-                    track_activity(daily, &mut last_activity_ms, timestamp_ms);
-                }
-                continue;
-            }
-
-            if payload_type != Some("token_count") {
-                continue;
-            }
-
-            let info = payload
-                .and_then(|payload| payload.get("info"))
-                .and_then(|v| v.as_object());
-            let (input, cached, output, used_total) = if let Some(info) = info {
-                if let Some(total) = find_usage_map(info, &["total_token_usage", "totalTokenUsage"])
-                {
-                    (
-                        read_i64(total, &["input_tokens", "inputTokens"]),
-                        read_i64(
-                            total,
-                            &[
-                                "cached_input_tokens",
-                                "cache_read_input_tokens",
-                                "cachedInputTokens",
-                                "cacheReadInputTokens",
-                            ],
-                        ),
-                        read_i64(total, &["output_tokens", "outputTokens"]),
-                        true,
-                    )
-                } else if let Some(last) =
-                    find_usage_map(info, &["last_token_usage", "lastTokenUsage"])
-                {
-                    (
-                        read_i64(last, &["input_tokens", "inputTokens"]),
-                        read_i64(
-                            last,
-                            &[
-                                "cached_input_tokens",
-                                "cache_read_input_tokens",
-                                "cachedInputTokens",
-                                "cacheReadInputTokens",
-                            ],
-                        ),
-                        read_i64(last, &["output_tokens", "outputTokens"]),
-                        false,
-                    )
-                } else {
-                    continue;
-                }
-            } else {
-                continue;
-            };
-
-            let mut delta = UsageTotals {
-                input,
-                cached,
-                output,
-            };
-
-            if used_total {
-                let prev = previous_totals.unwrap_or_default();
-                delta = UsageTotals {
-                    input: (input - prev.input).max(0),
-                    cached: (cached - prev.cached).max(0),
-                    output: (output - prev.output).max(0),
-                };
-                previous_totals = Some(UsageTotals {
-                    input,
-                    cached,
-                    output,
-                });
-            } else {
-                // Some streams emit `last_token_usage` deltas between `total_token_usage` snapshots.
-                // Treat those as already-counted to avoid double-counting when the next total arrives.
-                let mut next = previous_totals.unwrap_or_default();
-                next.input += delta.input;
-                next.cached += delta.cached;
-                next.output += delta.output;
-                previous_totals = Some(next);
-            }
-
-            if skip_fork_replay {
-                note_fork_replay_token(&mut fork_replay);
-                continue;
-            }
-
-            if delta.input == 0 && delta.cached == 0 && delta.output == 0 {
-                continue;
-            }
-
-            let timestamp_ms = event_timestamp_ms;
-            if let Some(day_key) = timestamp_ms.and_then(day_key_for_timestamp_ms) {
-                if let Some(entry) = daily.get_mut(&day_key) {
-                    let cached_clamped = delta.cached.min(delta.input);
-                    entry.input += delta.input;
-                    entry.cached += cached_clamped;
-                    entry.output += delta.output;
-
-                    let model = current_model
-                        .clone()
-                        .or_else(|| extract_model_from_token_count(&value))
-                        .unwrap_or_else(|| "unknown".to_string());
-                    add_model_tokens_limited(model_totals, model, delta.input + delta.output);
-                }
-            }
-
-            if let Some(timestamp_ms) = timestamp_ms {
-                track_activity(daily, &mut last_activity_ms, timestamp_ms);
-            }
-            continue;
-        }
-
-        if skip_fork_replay {
-            continue;
-        }
-
-        if entry_type == "response_item" {
-            let payload = value.get("payload").and_then(|value| value.as_object());
-            let payload_type = payload
-                .and_then(|payload| payload.get("type"))
-                .and_then(|value| value.as_str());
-            let role = payload
-                .and_then(|payload| payload.get("role"))
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-
-            if role == "assistant" {
-                if let Some(timestamp_ms) = event_timestamp_ms {
-                    if seen_runs.insert(timestamp_ms) {
-                        if let Some(day_key) = day_key_for_timestamp_ms(timestamp_ms) {
-                            if let Some(entry) = daily.get_mut(&day_key) {
-                                entry.agent_runs += 1;
-                            }
-                        }
-                    }
-                    track_activity(daily, &mut last_activity_ms, timestamp_ms);
-                }
-            } else if payload_type != Some("message") {
-                if let Some(timestamp_ms) = event_timestamp_ms {
-                    track_activity(daily, &mut last_activity_ms, timestamp_ms);
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
 fn extract_model_from_turn_context(value: &Value) -> Option<String> {
     let payload = value.get("payload").and_then(|value| value.as_object())?;
     if let Some(model) = payload.get("model").and_then(|value| value.as_str()) {
@@ -2363,6 +2262,14 @@ fn day_key_for_timestamp_ms(timestamp_ms: i64) -> Option<String> {
     Some(utc.with_timezone(&Local).format("%Y-%m-%d").to_string())
 }
 
+fn epoch_secs_for_local_day_start(day_key: &str) -> Option<u64> {
+    let day = chrono::NaiveDate::parse_from_str(day_key, "%Y-%m-%d").ok()?;
+    let local = Local
+        .with_ymd_and_hms(day.year(), day.month(), day.day(), 0, 0, 0)
+        .single()?;
+    u64::try_from(local.timestamp()).ok()
+}
+
 fn extract_cwd(value: &Value) -> Option<String> {
     value
         .get("payload")
@@ -2384,6 +2291,10 @@ fn path_matches_workspace(cwd: &str, workspace_path: &Path) -> bool {
     cwd_path == workspace_path || cwd_path.starts_with(workspace_path)
 }
 
+fn normalize_project_key(path: &str) -> String {
+    path.trim().to_lowercase()
+}
+
 fn make_day_keys(days: u32) -> Vec<String> {
     let today = Local::now().date_naive();
     (0..days)
@@ -2393,6 +2304,80 @@ fn make_day_keys(days: u32) -> Vec<String> {
             day.format("%Y-%m-%d").to_string()
         })
         .collect()
+}
+
+pub fn system_first_weekday() -> Weekday {
+    locale_region_from_env()
+        .as_deref()
+        .map(first_weekday_for_region)
+        .unwrap_or(Weekday::Mon)
+}
+
+fn locale_region_from_env() -> Option<String> {
+    for key in ["LC_TIME", "LC_ALL", "LANG"] {
+        let Ok(value) = std::env::var(key) else {
+            continue;
+        };
+        if value.trim().is_empty() {
+            continue;
+        }
+        return locale_region(&value);
+    }
+    None
+}
+
+fn locale_region(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("c")
+        || trimmed.eq_ignore_ascii_case("posix")
+    {
+        return None;
+    }
+    let base = trimmed
+        .split(['.', '@'])
+        .next()
+        .unwrap_or(trimmed)
+        .replace('-', "_");
+    let mut parts = base.split('_');
+    let _language = parts.next()?;
+    let region = parts.next()?.trim();
+    if region.len() != 2 || !region.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some(region.to_ascii_uppercase())
+}
+
+fn first_weekday_for_region(region: &str) -> Weekday {
+    match region.to_ascii_uppercase().as_str() {
+        "AE" | "AF" | "BH" | "DJ" | "DZ" | "EG" | "IQ" | "IR" | "JO" | "KW" | "LY" | "OM"
+        | "QA" | "SD" | "SY" | "YE" => Weekday::Sat,
+        "AG" | "AR" | "AS" | "AU" | "BD" | "BR" | "BS" | "BT" | "BW" | "BZ" | "CA" | "CN"
+        | "CO" | "DM" | "DO" | "ET" | "GT" | "GU" | "HK" | "HN" | "ID" | "IL" | "IN" | "JM"
+        | "JP" | "KE" | "KH" | "KR" | "LA" | "MH" | "MM" | "MO" | "MT" | "MX" | "MZ" | "NI"
+        | "NP" | "PA" | "PE" | "PH" | "PK" | "PR" | "PT" | "PY" | "SA" | "SG" | "SV" | "TH"
+        | "TT" | "TW" | "UM" | "US" | "VE" | "VI" | "WS" | "ZA" | "ZW" => Weekday::Sun,
+        _ => Weekday::Mon,
+    }
+}
+
+fn make_activity_day_keys(first_weekday: Weekday) -> Vec<String> {
+    let today = Local::now().date_naive();
+    let days_from_week_start = days_since_week_start(today.weekday(), first_weekday);
+    let current_week_start = today - Duration::days(days_from_week_start);
+    let first_day = current_week_start - Duration::weeks((ACTIVITY_TIMELINE_WEEKS - 1) as i64);
+    (0..ACTIVITY_TIMELINE_DAYS)
+        .map(|offset| {
+            let day = first_day + Duration::days(offset as i64);
+            day.format("%Y-%m-%d").to_string()
+        })
+        .collect()
+}
+
+fn days_since_week_start(day: Weekday, first_weekday: Weekday) -> i64 {
+    let day = day.num_days_from_monday() as i64;
+    let first = first_weekday.num_days_from_monday() as i64;
+    (7 + day - first) % 7
 }
 
 pub fn format_count(value: i64) -> String {
@@ -2595,6 +2580,26 @@ mod tests {
         );
     }
 
+    fn append_session_meta_line(path: &Path, timestamp_ms: i64, cwd: &str) {
+        let timestamp = Utc
+            .timestamp_millis_opt(timestamp_ms)
+            .single()
+            .expect("valid timestamp")
+            .to_rfc3339();
+        append_json_line(
+            path,
+            serde_json::json!({
+                "type": "session_meta",
+                "timestamp": timestamp,
+                "payload": {
+                    "id": cwd,
+                    "timestamp": timestamp,
+                    "cwd": cwd
+                }
+            }),
+        );
+    }
+
     fn write_forked_replay_file(path: &Path, timestamp_ms: i64) {
         let fork_timestamp = Utc
             .timestamp_millis_opt(timestamp_ms)
@@ -2644,6 +2649,32 @@ mod tests {
             full_scan,
             scan_cache_max_entries: 1000,
         }
+    }
+
+    #[test]
+    fn locale_region_parses_common_locale_values() {
+        assert_eq!(locale_region("ja_JP.UTF-8").as_deref(), Some("JP"));
+        assert_eq!(locale_region("en-US").as_deref(), Some("US"));
+        assert_eq!(locale_region("C"), None);
+    }
+
+    #[test]
+    fn first_weekday_uses_region_defaults() {
+        assert_eq!(first_weekday_for_region("JP"), Weekday::Sun);
+        assert_eq!(first_weekday_for_region("US"), Weekday::Sun);
+        assert_eq!(first_weekday_for_region("GB"), Weekday::Mon);
+    }
+
+    #[test]
+    fn activity_day_keys_start_on_requested_weekday() {
+        let sunday_keys = make_activity_day_keys(Weekday::Sun);
+        let monday_keys = make_activity_day_keys(Weekday::Mon);
+        let sunday = chrono::NaiveDate::parse_from_str(&sunday_keys[0], "%Y-%m-%d")
+            .expect("parse sunday-first activity key");
+        let monday = chrono::NaiveDate::parse_from_str(&monday_keys[0], "%Y-%m-%d")
+            .expect("parse monday-first activity key");
+        assert_eq!(sunday.weekday(), Weekday::Sun);
+        assert_eq!(monday.weekday(), Weekday::Mon);
     }
 
     #[test]
@@ -2709,6 +2740,41 @@ mod tests {
         .expect("cached snapshot");
         assert_eq!(cached.totals.last30_days_tokens, 220);
         assert_eq!(cached.days.iter().map(|day| day.agent_runs).sum::<i64>(), 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compute_snapshot_builds_project_activity_sorted_by_last_activity() {
+        let root = make_temp_dir("project-activity");
+        let codex_home = root.join("codex");
+        let sessions_root = codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions root");
+
+        let now_ms = Utc::now().timestamp_millis();
+        let older_ms = now_ms - Duration::days(5).num_milliseconds();
+        let newer_ms = now_ms - Duration::days(1).num_milliseconds();
+
+        let photonia = sessions_root.join("photonia.jsonl");
+        append_session_meta_line(&photonia, older_ms, "/tmp/Photonia");
+        append_total_token_line(&photonia, older_ms + 100, 100, 0, 20);
+
+        let sfm = sessions_root.join("sfm.jsonl");
+        append_session_meta_line(&sfm, newer_ms, "/tmp/SFM");
+        append_total_token_line(&sfm, newer_ms + 100, 200, 0, 50);
+
+        let snapshot = compute_snapshot(30, &codex_home, None, default_test_limits(false), None)
+            .expect("snapshot");
+
+        assert_eq!(snapshot.project_activity.len(), 2);
+        assert_eq!(
+            snapshot.project_activity[0].days.len(),
+            ACTIVITY_TIMELINE_DAYS
+        );
+        assert_eq!(snapshot.project_activity[0].display_path, "/tmp/SFM");
+        assert_eq!(snapshot.project_activity[0].total_tokens, 250);
+        assert_eq!(snapshot.project_activity[1].display_path, "/tmp/Photonia");
+        assert_eq!(snapshot.project_activity[1].total_tokens, 120);
 
         let _ = std::fs::remove_dir_all(root);
     }

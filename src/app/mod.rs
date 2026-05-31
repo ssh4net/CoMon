@@ -54,6 +54,7 @@ enum AppEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ActiveScreen {
     Usage,
+    Activity,
     Read,
 }
 
@@ -63,12 +64,22 @@ enum InputOutcome {
     Quit,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ActivityCommand {
+    RefreshAll,
+    ToggleMetric,
+    IncreaseProjects,
+    DecreaseProjects,
+    ToggleHelp,
+}
+
 #[derive(Debug)]
 pub(crate) struct AppState {
     pub(crate) active_screen: ActiveScreen,
     pub(crate) metric: UsageMetric,
     pub(crate) range: ChartRange,
     pub(crate) orientation: ChartOrientation,
+    pub(crate) activity_project_limit: usize,
     pub(crate) show_help: bool,
     pub(crate) workspace_path: Option<std::path::PathBuf>,
     pub(crate) no_sessions_confirm_open: bool,
@@ -89,12 +100,16 @@ pub(crate) struct AppState {
 const STATE_STORE_SCHEMA_VERSION: u32 = 1;
 const STATE_STORE_FILE_NAME: &str = "state.json";
 const STATE_SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
+pub(crate) const DEFAULT_ACTIVITY_PROJECT_LIMIT: usize = 5;
+pub(crate) const MIN_ACTIVITY_PROJECT_LIMIT: usize = 1;
+pub(crate) const MAX_ACTIVITY_PROJECT_LIMIT: usize = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PersistedUiState {
     metric: UsageMetric,
     range: ChartRange,
     orientation: ChartOrientation,
+    activity_project_limit: usize,
     workspace_path: Option<PathBuf>,
     no_sessions_confirm_dismissed: bool,
 }
@@ -105,6 +120,7 @@ impl PersistedUiState {
             metric: UsageMetric::Tokens,
             range: ChartRange::Week,
             orientation: ChartOrientation::Horizontal,
+            activity_project_limit: DEFAULT_ACTIVITY_PROJECT_LIMIT,
             workspace_path,
             no_sessions_confirm_dismissed: false,
         }
@@ -115,6 +131,7 @@ impl PersistedUiState {
             metric: state.metric,
             range: state.range,
             orientation: state.orientation,
+            activity_project_limit: state.activity_project_limit,
             workspace_path: state.workspace_path.clone(),
             no_sessions_confirm_dismissed: state.no_sessions_confirm_dismissed,
         }
@@ -145,6 +162,7 @@ struct StoredGlobalState {
     metric: Option<String>,
     range: Option<String>,
     orientation: Option<String>,
+    activity_project_limit: Option<usize>,
     last_workspace_path: Option<String>,
     updated_at: i64,
 }
@@ -342,6 +360,7 @@ async fn run_inner(
         metric: restored_ui_state.metric,
         range: restored_ui_state.range,
         orientation: restored_ui_state.orientation,
+        activity_project_limit: restored_ui_state.activity_project_limit,
         show_help: false,
         workspace_path: restored_ui_state.workspace_path.clone(),
         no_sessions_confirm_open: false,
@@ -476,7 +495,8 @@ fn handle_input_event(
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(InputOutcome::Quit),
             (KeyCode::Char('s'), _) | (KeyCode::Char('S'), _) | (KeyCode::F(2), _) => {
                 state.active_screen = match state.active_screen {
-                    ActiveScreen::Usage => ActiveScreen::Read,
+                    ActiveScreen::Usage => ActiveScreen::Activity,
+                    ActiveScreen::Activity => ActiveScreen::Read,
                     ActiveScreen::Read => ActiveScreen::Usage,
                 };
                 return Ok(InputOutcome::Continue(true));
@@ -506,6 +526,14 @@ fn handle_input_event(
             let dirty = handle_usage_command(state, command, usage_refresh_tx, limits_refresh_tx);
             Ok(InputOutcome::Continue(dirty))
         }
+        ActiveScreen::Activity => {
+            let Some(command) = map_event_to_activity_cmd(event) else {
+                return Ok(InputOutcome::Continue(false));
+            };
+            let dirty =
+                handle_activity_command(state, command, usage_refresh_tx, limits_refresh_tx);
+            Ok(InputOutcome::Continue(dirty))
+        }
         ActiveScreen::Read => Ok(InputOutcome::Continue(read::tui::handle_event(
             &mut state.read_browser,
             event,
@@ -529,6 +557,29 @@ fn map_event_to_usage_cmd(event: Event) -> Option<UsageCommand> {
                 (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
                     Some(UsageCommand::ConfirmContinue)
                 }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn map_event_to_activity_cmd(event: Event) -> Option<ActivityCommand> {
+    match event {
+        Event::Key(key) => {
+            if key.kind != KeyEventKind::Press {
+                return None;
+            }
+            match (key.code, key.modifiers) {
+                (KeyCode::Char('r'), _) | (KeyCode::F(5), _) => Some(ActivityCommand::RefreshAll),
+                (KeyCode::Tab, _) => Some(ActivityCommand::ToggleMetric),
+                (KeyCode::Char('+'), _) | (KeyCode::Char('='), _) | (KeyCode::Char(']'), _) => {
+                    Some(ActivityCommand::IncreaseProjects)
+                }
+                (KeyCode::Char('-'), _) | (KeyCode::Char('['), _) => {
+                    Some(ActivityCommand::DecreaseProjects)
+                }
+                (KeyCode::Char('?'), _) => Some(ActivityCommand::ToggleHelp),
                 _ => None,
             }
         }
@@ -581,6 +632,51 @@ fn handle_usage_command(
             true
         }
         UsageCommand::RefreshAll => {
+            let _ = usage_refresh_tx.try_send(());
+            let _ = limits_refresh_tx.try_send(());
+            true
+        }
+    }
+}
+
+fn handle_activity_command(
+    state: &mut AppState,
+    cmd: ActivityCommand,
+    usage_refresh_tx: &mpsc::Sender<()>,
+    limits_refresh_tx: &mpsc::Sender<()>,
+) -> bool {
+    match cmd {
+        ActivityCommand::ToggleHelp => {
+            state.show_help = !state.show_help;
+            true
+        }
+        ActivityCommand::ToggleMetric => {
+            state.metric = match state.metric {
+                UsageMetric::Tokens => UsageMetric::Time,
+                UsageMetric::Time => UsageMetric::Runs,
+                UsageMetric::Runs => UsageMetric::Tokens,
+            };
+            true
+        }
+        ActivityCommand::IncreaseProjects => {
+            let next = state
+                .activity_project_limit
+                .saturating_add(1)
+                .min(MAX_ACTIVITY_PROJECT_LIMIT);
+            let changed = next != state.activity_project_limit;
+            state.activity_project_limit = next;
+            changed
+        }
+        ActivityCommand::DecreaseProjects => {
+            let next = state
+                .activity_project_limit
+                .saturating_sub(1)
+                .max(MIN_ACTIVITY_PROJECT_LIMIT);
+            let changed = next != state.activity_project_limit;
+            state.activity_project_limit = next;
+            changed
+        }
+        ActivityCommand::RefreshAll => {
             let _ = usage_refresh_tx.try_send(());
             let _ = limits_refresh_tx.try_send(());
             true
@@ -653,6 +749,10 @@ fn load_persisted_ui_state(
             state.orientation = orientation;
         }
     }
+    if let Some(limit) = store.global.activity_project_limit {
+        state.activity_project_limit =
+            limit.clamp(MIN_ACTIVITY_PROJECT_LIMIT, MAX_ACTIVITY_PROJECT_LIMIT);
+    }
 
     if let Some(workspace_path) = state.workspace_path.as_ref() {
         let workspace_key = workspace_path.to_string_lossy();
@@ -675,6 +775,11 @@ fn save_persisted_ui_state(comon_home: &Path, state: &PersistedUiState) -> Resul
     store.global.metric = Some(usage_metric_to_store(state.metric).to_string());
     store.global.range = Some(chart_range_to_store(state.range).to_string());
     store.global.orientation = Some(chart_orientation_to_store(state.orientation).to_string());
+    store.global.activity_project_limit = Some(
+        state
+            .activity_project_limit
+            .clamp(MIN_ACTIVITY_PROJECT_LIMIT, MAX_ACTIVITY_PROJECT_LIMIT),
+    );
     store.global.last_workspace_path = workspace_path_text.clone();
     store.global.updated_at = now;
 

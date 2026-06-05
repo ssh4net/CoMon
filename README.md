@@ -262,6 +262,29 @@ bash scripts/package-prebuilt.sh --musl
 bash scripts/package-prebuilt.sh --gnu
 ```
 
+macOS signed release package:
+
+```bash
+# Local verification package with ad-hoc signing and no notarization:
+SKIP_NOTARY=1 bash scripts/package-macos.sh
+
+# Developer ID signed package, submitted with a stored notarytool profile:
+SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
+NOTARY_PROFILE="comon-notary" \
+bash scripts/package-macos.sh
+
+# Optional explicit target:
+bash scripts/package-macos.sh --target aarch64-apple-darwin
+```
+
+The macOS script builds `comon`, signs the executable, bundles Homebrew-linked
+dylibs into the package when needed, and creates:
+
+- `dist/comon-v<version>-<apple-target>.zip`
+
+Signing identity and notarization profile values are read from environment
+variables only; do not commit credentials or Apple account details into the repo.
+
 Package output:
 
 - `dist/comon-v<version>-<target>.zip`

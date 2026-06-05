@@ -15,25 +15,6 @@ See `CHANGELOG.md` for release history.
 <img width="2088" height="952" alt="WindowsTerminal_nrizljNtk5" src="https://github.com/user-attachments/assets/cf2ac2e7-3a94-48cd-9d3b-1a4a98016f45" />
 <img width="2088" height="952" alt="WindowsTerminal_HjIAOZQKWE" src="https://github.com/user-attachments/assets/4e3eed0a-d3aa-4ae5-bc4e-c6e5400bc1dd" />
 
-
-## Release 0.3.4
-
-- Fixed inflated usage totals from forked/subagent session logs.
-- Reparse stale forked-session cache rows with scan-cache schema v3.
-- Merged the session-history browser into the main `comon` TUI.
-- Added runtime screen switching between Usage and Session history with `s` / `F2`.
-- Added `--read` to start on the Session history screen.
-- Added `--sessions-dir` and `--print-sessions-dir` for browsing alternate Codex session trees.
-- Added incremental session parsing with persisted offsets and parser state in `comon.db`.
-- Reduced restart regressions: unchanged files outside current scan plan now stay visible via cache.
-- Fixed full backfill behavior: `--full-scan --scan-time-budget-ms 0` now forces a full reparse and cache refresh.
-- Changed default workspace scope: `comon` without `--project` now always shows **All workspaces**.
-- Fixed workspace startup behavior: no stale last workspace filter is restored when no explicit project is provided.
-- Added `--scan-time-budget-ms` for bounded per-refresh parse time (`0` disables budget).
-- Added `--max-jsonl-line-kib` to cap parsed line size without hard-dropping large files.
-- Added cache DB schema migration (`v1 -> v2`) for offset/parser-state fields.
-- For historical backfill after copying older sessions, run once: `comon --full-scan --scan-time-budget-ms 0`
-
 ## Requirements
 
 - Rust toolchain (stable) installed.

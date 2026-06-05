@@ -15,6 +15,8 @@ use tokio::sync::{mpsc, watch};
 #[derive(Debug, Clone)]
 pub struct Config {
     pub codex_bin: Option<String>,
+    pub app_server_bin: Option<std::path::PathBuf>,
+    pub live_limits_mode: LiveLimitsMode,
     pub comon_home: std::path::PathBuf,
     pub codex_home: std::path::PathBuf,
     pub read_sessions_dir: std::path::PathBuf,
@@ -26,6 +28,13 @@ pub struct Config {
     pub refresh_limits_secs: u64,
     pub usage_scan_limits: crate::usage::ScanLimits,
     pub rebuild_cache_on_start: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveLimitsMode {
+    Auto,
+    On,
+    Off,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +57,7 @@ enum UsageCommand {
 enum AppEvent {
     UsageUpdated(Result<LocalUsageSnapshot>),
     LimitsUpdated(Result<AccountRateLimits>),
-    LimitsUnavailable(String),
+    LimitsUnavailable { message: String, is_error: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +101,7 @@ pub(crate) struct AppState {
     pub(crate) limits: Option<AccountRateLimits>,
     pub(crate) limits_updated_at: Option<Instant>,
     pub(crate) limits_error: Option<String>,
+    pub(crate) limits_notice: Option<String>,
     pub(crate) limits_enabled: bool,
     pub(crate) read_sessions_dir: PathBuf,
     pub(crate) read_browser: crate::read::tui::BrowserState,
@@ -274,16 +284,45 @@ async fn run_inner(
     {
         let evt_tx = evt_tx.clone();
         let codex_bin = config.codex_bin.clone();
+        let app_server_bin = config.app_server_bin.clone();
+        let live_limits_mode = config.live_limits_mode;
         let cwd = config.cwd.clone();
         let refresh = Duration::from_secs(config.refresh_limits_secs);
         let mut limits_refresh_rx = limits_refresh_rx;
         let mut shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
-            let rpc = match CodexRpc::spawn(codex_bin, cwd).await {
+            if live_limits_mode == LiveLimitsMode::Off {
+                let _ = evt_tx
+                    .send(AppEvent::LimitsUnavailable {
+                        message: "Live limits disabled (--live-limits off).".to_string(),
+                        is_error: false,
+                    })
+                    .await;
+                return;
+            }
+
+            let Some(app_server) =
+                crate::codex_rpc::resolve_app_server_command(codex_bin, app_server_bin)
+            else {
+                let _ = evt_tx
+                    .send(AppEvent::LimitsUnavailable {
+                        message: missing_app_server_message().to_string(),
+                        is_error: live_limits_mode == LiveLimitsMode::On,
+                    })
+                    .await;
+                return;
+            };
+            let app_server_is_explicit = app_server.is_explicit();
+
+            let rpc = match CodexRpc::spawn(app_server, cwd).await {
                 Ok(rpc) => rpc,
                 Err(err) => {
                     let _ = evt_tx
-                        .send(AppEvent::LimitsUnavailable(err.to_string()))
+                        .send(AppEvent::LimitsUnavailable {
+                            message: err.to_string(),
+                            is_error: live_limits_mode == LiveLimitsMode::On
+                                || app_server_is_explicit,
+                        })
                         .await;
                     return;
                 }
@@ -371,6 +410,7 @@ async fn run_inner(
         limits: None,
         limits_updated_at: None,
         limits_error: None,
+        limits_notice: None,
         limits_enabled: true,
         read_sessions_dir: config.read_sessions_dir.clone(),
         read_browser,
@@ -705,16 +745,24 @@ fn handle_app_event(state: &mut AppState, evt: AppEvent) -> bool {
             }
             true
         }
-        AppEvent::LimitsUnavailable(msg) => {
+        AppEvent::LimitsUnavailable { message, is_error } => {
             state.limits_enabled = false;
-            state.limits_error = Some(msg);
+            if is_error {
+                state.limits_error = Some(message);
+                state.limits_notice = None;
+            } else {
+                state.limits_error = None;
+                state.limits_notice = Some(message);
+            }
             true
         }
         AppEvent::LimitsUpdated(res) => {
             match res {
                 Ok(limits) => {
+                    state.limits_enabled = true;
                     state.limits = Some(limits);
                     state.limits_error = None;
+                    state.limits_notice = None;
                     state.limits_updated_at = Some(Instant::now());
                 }
                 Err(err) => {
@@ -724,6 +772,10 @@ fn handle_app_event(state: &mut AppState, evt: AppEvent) -> bool {
             true
         }
     }
+}
+
+fn missing_app_server_message() -> &'static str {
+    "Codex App Server not found; usage/history still work. Install Codex CLI or pass --codex-bin/--app-server-bin."
 }
 
 fn load_persisted_ui_state(

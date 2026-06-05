@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
+## 0.3.6 - 2026-06-05
+
+- Added `--live-limits auto|on|off` so app-only installs can run without a live-limits spawn error.
+- Added `--app-server-bin` for standalone Codex App Server executables.
+- Added Windows auto-detection for common Codex App bundled App Server locations.
+- Project activity token headers now show total/out-of-cache token pairs.
+
 ## 0.3.4 - 2026-04-24
 
 - Fixed inflated usage totals from forked/subagent session logs by ignoring replayed parent-session token history while preserving new post-fork usage.

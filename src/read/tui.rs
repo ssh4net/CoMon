@@ -20,19 +20,10 @@ enum ViewMode {
     Sessions,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct UiLayout {
     project_list_area: Rect,
     session_list_area: Rect,
-}
-
-impl Default for UiLayout {
-    fn default() -> Self {
-        Self {
-            project_list_area: Rect::default(),
-            session_list_area: Rect::default(),
-        }
-    }
 }
 
 #[derive(Debug)]

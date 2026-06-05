@@ -6,7 +6,7 @@ mod ui;
 mod usage;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::path::PathBuf;
@@ -135,6 +135,23 @@ fn load_or_bootstrap_user_config(comon_home: &Path) -> Result<UserConfig> {
     Ok(config)
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LiveLimitsArg {
+    Auto,
+    On,
+    Off,
+}
+
+impl From<LiveLimitsArg> for app::LiveLimitsMode {
+    fn from(value: LiveLimitsArg) -> Self {
+        match value {
+            LiveLimitsArg::Auto => Self::Auto,
+            LiveLimitsArg::On => Self::On,
+            LiveLimitsArg::Off => Self::Off,
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "comon", version, about = "Codex usage + session browser TUI")]
 struct Args {
@@ -145,6 +162,14 @@ struct Args {
     /// Override path to the Codex CLI binary (default: `codex` in PATH).
     #[arg(long)]
     codex_bin: Option<String>,
+
+    /// Override a standalone Codex App Server executable (spawned directly).
+    #[arg(long, conflicts_with = "codex_bin")]
+    app_server_bin: Option<PathBuf>,
+
+    /// Live limits behavior: auto tries App Server if found, on requires it, off disables it.
+    #[arg(long, value_enum, default_value = "auto")]
+    live_limits: LiveLimitsArg,
 
     /// Override CODEX_HOME (default: $CODEX_HOME or ~/.codex).
     #[arg(long)]
@@ -166,14 +191,14 @@ struct Args {
     #[arg(long)]
     print_sessions_dir: bool,
 
-    /// Working directory to launch `codex app-server` in (default: current directory).
+    /// Working directory to launch Codex App Server in (default: current directory).
     #[arg(long)]
     cwd: Option<PathBuf>,
 
     /// Filter usage stats to a specific project/workspace path.
     ///
     /// If `--cwd` is not provided, this also becomes the default working directory for
-    /// launching `codex app-server`.
+    /// launching Codex App Server.
     #[arg(long, alias = "workspace")]
     project: Option<PathBuf>,
 
@@ -335,6 +360,8 @@ async fn main() -> Result<()> {
 
     let config = app::Config {
         codex_bin: args.codex_bin.clone(),
+        app_server_bin: args.app_server_bin.clone(),
+        live_limits_mode: args.live_limits.into(),
         comon_home,
         codex_home,
         read_sessions_dir: read_config.sessions_dir,
@@ -369,10 +396,30 @@ mod tests {
                 .unwrap_or(0),
             TEMP_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
         );
-        let dir = std::env::temp_dir().join(format!("comon-main-{prefix}-{unique}"));
+        let dir = test_temp_base_without_git_parent().join(format!("comon-main-{prefix}-{unique}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    fn test_temp_base_without_git_parent() -> PathBuf {
+        let mut candidates = vec![std::env::temp_dir()];
+        #[cfg(unix)]
+        {
+            candidates.push(PathBuf::from("/var/tmp"));
+        }
+
+        for candidate in candidates {
+            if std::fs::metadata(&candidate)
+                .map(|meta| meta.is_dir())
+                .unwrap_or(false)
+                && detect_git_root(&candidate).is_none()
+            {
+                return candidate;
+            }
+        }
+
+        std::env::temp_dir()
     }
 
     fn make_git_repo(path: &Path) -> PathBuf {

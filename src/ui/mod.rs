@@ -575,9 +575,9 @@ fn format_activity_project_header(
 }
 
 fn activity_project_name(path: &str) -> String {
-    let trimmed = path.trim().trim_end_matches(|ch| ch == '/' || ch == '\\');
+    let trimmed = path.trim().trim_end_matches(['/', '\\']);
     trimmed
-        .rsplit(|ch| ch == '/' || ch == '\\')
+        .rsplit(['/', '\\'])
         .next()
         .filter(|value| !value.is_empty())
         .unwrap_or(trimmed)
@@ -586,7 +586,12 @@ fn activity_project_name(path: &str) -> String {
 
 fn activity_metric_total_label(project: &ProjectActivity, metric: UsageMetric) -> String {
     match metric {
-        UsageMetric::Tokens => format!("{} tokens", format_tokens_compact(project.total_tokens)),
+        UsageMetric::Tokens => {
+            let total = project.total_tokens.max(0) as u64;
+            let out_of_cache = (project.total_tokens - project.cached_input_tokens).max(0) as u64;
+            let pair = format_horizontal_value(total, Some(out_of_cache), UsageMetric::Tokens, 20);
+            format!("{pair} tokens")
+        }
         UsageMetric::Time => format_duration_compact(project.agent_time_ms),
         UsageMetric::Runs => format!("{} runs", format_count(project.agent_runs)),
     }
@@ -625,7 +630,7 @@ fn activity_day_cell_width(grid_width: u16, weeks_total: usize) -> u16 {
 
 fn activity_weekday_label(first_weekday: Weekday, row: usize) -> &'static str {
     let monday_row = activity_weekday_row(first_weekday, Weekday::Mon);
-    if row < monday_row || (row - monday_row) % 2 != 0 {
+    if row < monday_row || !(row - monday_row).is_multiple_of(2) {
         return "";
     }
     match activity_weekday_for_row(first_weekday, row) {
@@ -769,6 +774,7 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             let msg = state
                 .limits_error
                 .as_deref()
+                .or(state.limits_notice.as_deref())
                 .unwrap_or("Limits unavailable.");
             ("Unavailable".to_string(), Some(msg.to_string()), None)
         } else if let Some(l) = state.limits.as_ref() {
@@ -1519,7 +1525,7 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             } else {
                 1
             };
-            let bar_h = preferred_h.min(5).max(1);
+            let bar_h = preferred_h.clamp(1, 5);
 
             let fit_bars = (inner.height / bar_h).max(1) as usize;
             let start = count.saturating_sub(fit_bars);
@@ -1757,7 +1763,7 @@ fn format_horizontal_value(
 }
 
 fn format_duration_words(ms: i64) -> String {
-    let mut secs = (ms.max(0) / 1000) as i64;
+    let mut secs = ms.max(0) / 1000;
     let hours = secs / 3600;
     secs %= 3600;
     let mins = secs / 60;
@@ -2203,6 +2209,24 @@ mod tests {
         let out = format_horizontal_value(45_456_785, Some(1_756_241), UsageMetric::Tokens, 10);
         assert!(out.contains(" / "));
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn project_activity_tokens_show_total_and_out_of_cache() {
+        let project = ProjectActivity {
+            display_path: "/tmp/SFM".to_string(),
+            days: Vec::new(),
+            last_activity_day: Some("2026-06-05".to_string()),
+            total_tokens: 250,
+            cached_input_tokens: 150,
+            agent_time_ms: 0,
+            agent_runs: 0,
+        };
+
+        assert_eq!(
+            activity_metric_total_label(&project, UsageMetric::Tokens),
+            "250 / 100 tokens"
+        );
     }
 
     #[test]

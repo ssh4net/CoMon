@@ -6,7 +6,7 @@ Single-binary, cross-platform TUI for:
 
 - Local Codex usage stats (last 7/30 days, chart, top models) by scanning `CODEX_HOME/sessions`.
 - Local session-history browser grouped by project path, with session titles and prompt previews.
-- Live account limits/credits by spawning `codex app-server` and calling `account/rateLimits/read`.
+- Live account limits/credits by spawning Codex App Server and calling `account/rateLimits/read` when an App Server executable is available.
 
 See `CHANGELOG.md` for release history.
 
@@ -38,7 +38,7 @@ See `CHANGELOG.md` for release history.
 
 - Rust toolchain (stable) installed.
 - C/C++ compiler toolchain available (needed to build bundled SQLite through `rusqlite`).
-- Codex CLI installed and available as `codex` on your `PATH` (required for live limits/credits).
+- Codex CLI installed as `codex` on your `PATH`, or a discoverable/explicit Codex App Server executable (required only for live limits/credits).
   - Usage stats still work without Codex CLI (they only need the session logs on disk).
 - For portable Linux builds (`--musl`), `rustup` and musl target toolchain support are required.
 
@@ -52,7 +52,7 @@ Use `--project <path>` (or `--workspace <path>`) to filter usage stats to a spec
 
 If `--project` points to a non-git directory, `comon` falls back to **All workspaces**.
 
-`--cwd` controls where `codex app-server` is launched and does not change usage scope.
+`--cwd` controls where Codex App Server is launched and does not change usage scope.
 
 ```bash
 # If installed (recommended):
@@ -73,8 +73,10 @@ Common flags:
 - `-r` / `--read`: start on the Session history screen
 - `--sessions-dir <path>`: override the Codex sessions directory used by the Session history screen
 - `--print-sessions-dir`: print effective sessions directory and exit
-- `--codex-bin <path>`: override Codex CLI binary (default: `codex`)
-- `--cwd <path>`: directory to launch `codex app-server` in (default: current directory; does not change usage scope)
+- `--codex-bin <path>`: override Codex CLI binary (spawned as `<path> app-server`)
+- `--app-server-bin <path>`: override a standalone Codex App Server executable (spawned directly)
+- `--live-limits <auto|on|off>`: `auto` tries App Server if found, `on` requires it, `off` disables live limits (default: `auto`)
+- `--cwd <path>`: directory to launch Codex App Server in (default: current directory; does not change usage scope)
 - `--project <path>` / `--workspace <path>`: filter usage stats to a specific project/workspace (also becomes default `--cwd` if `--cwd` not set)
 - `--usage-days <n>`: days to scan for usage (clamped 1..=90; default from config)
 - `--refresh-usage-secs <n>`: usage refresh interval in seconds (default from config)
@@ -117,6 +119,19 @@ Example:
 
 ```bash
 comon --codex-home "C:\\Users\\You\\.codex" --cwd "C:\\Repos\\some-git-repo"
+```
+
+Codex App-only Windows installs:
+
+```bash
+# Usage/session history only; avoids App Server probing.
+comon --live-limits off
+
+# If auto-detection misses the bundled CLI-style binary:
+comon --codex-bin "C:\\Path\\To\\Codex\\codex.exe"
+
+# If the app ships a standalone App Server binary:
+comon --app-server-bin "C:\\Path\\To\\Codex\\app-server.exe"
 ```
 
 Large-log recovery/tuning example:
@@ -311,7 +326,7 @@ CI also runs this check on each push and pull request via `.github/workflows/asc
 ## Notes
 
 - Usage stats are derived from Codex session JSONL logs. If you have no session data yet, values will be empty.
-- Limits/credits require `codex app-server` to start successfully (auth, environment, and a usable working directory).
+- Limits/credits require Codex App Server to start successfully (auth, environment, and a usable working directory). CoMon auto-detects `codex` on `PATH` and common Windows Codex App bundle locations; use `--codex-bin` or `--app-server-bin` when needed.
 - comon stores local app state in `~/.comon/state.json` by default (or `$COMON_HOME`, or `--comon-home`).
 - comon stores scan cache in `~/.comon/comon.db` to avoid rereading unchanged session files.
 - Large session logs are parsed incrementally with persisted parser offsets in `comon.db`; unchanged files are reused from cache.

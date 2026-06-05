@@ -196,6 +196,7 @@ pub struct ProjectActivity {
     pub days: Vec<UsageDay>,
     pub last_activity_day: Option<String>,
     pub total_tokens: i64,
+    pub cached_input_tokens: i64,
     pub agent_time_ms: i64,
     pub agent_runs: i64,
 }
@@ -325,8 +326,8 @@ impl LocalUsageSnapshot {
                     (last7_agent_ms as f64 / last7.len() as f64).round() as i64
                 };
                 UsageTotalsView {
-                    last7_primary_label: format!("{}", format_duration_compact(last7_agent_ms)),
-                    last30_primary_label: format!("{}", format_duration_compact(last30_agent_ms)),
+                    last7_primary_label: format_duration_compact(last7_agent_ms),
+                    last30_primary_label: format_duration_compact(last30_agent_ms),
                     avg_primary_label: format_duration_compact(avg_ms),
                     cache_label: "--".to_string(),
                     total_label: format_duration(last30_agent_ms),
@@ -924,6 +925,7 @@ fn build_project_activity(
     for (_, project) in projects {
         let mut days: Vec<UsageDay> = Vec::with_capacity(day_keys.len());
         let mut total_tokens = 0i64;
+        let mut cached_input_tokens = 0i64;
         let mut agent_time_ms = 0i64;
         let mut agent_runs = 0i64;
         let mut last_activity_day: Option<String> = None;
@@ -932,6 +934,7 @@ fn build_project_activity(
             let totals = project.daily.get(day_key).copied().unwrap_or_default();
             let total = totals.input + totals.output;
             total_tokens += total;
+            cached_input_tokens += totals.cached;
             agent_time_ms += totals.agent_ms;
             agent_runs += totals.agent_runs;
             if daily_has_activity(totals) {
@@ -956,6 +959,7 @@ fn build_project_activity(
             days,
             last_activity_day,
             total_tokens,
+            cached_input_tokens,
             agent_time_ms,
             agent_runs,
         });
@@ -2415,7 +2419,7 @@ pub fn format_tokens_compact(value: i64) -> String {
 }
 
 pub fn format_duration_compact(ms: i64) -> String {
-    let mut secs = (ms.max(0) / 1000) as i64;
+    let mut secs = ms.max(0) / 1000;
     let hours = secs / 3600;
     secs %= 3600;
     let mins = secs / 60;
@@ -2427,7 +2431,7 @@ pub fn format_duration_compact(ms: i64) -> String {
 }
 
 pub fn format_duration(ms: i64) -> String {
-    let mut secs = (ms.max(0) / 1000) as i64;
+    let mut secs = ms.max(0) / 1000;
     let hours = secs / 3600;
     secs %= 3600;
     let mins = secs / 60;
@@ -2761,7 +2765,7 @@ mod tests {
 
         let sfm = sessions_root.join("sfm.jsonl");
         append_session_meta_line(&sfm, newer_ms, "/tmp/SFM");
-        append_total_token_line(&sfm, newer_ms + 100, 200, 0, 50);
+        append_total_token_line(&sfm, newer_ms + 100, 200, 150, 50);
 
         let snapshot = compute_snapshot(30, &codex_home, None, default_test_limits(false), None)
             .expect("snapshot");
@@ -2773,8 +2777,10 @@ mod tests {
         );
         assert_eq!(snapshot.project_activity[0].display_path, "/tmp/SFM");
         assert_eq!(snapshot.project_activity[0].total_tokens, 250);
+        assert_eq!(snapshot.project_activity[0].cached_input_tokens, 150);
         assert_eq!(snapshot.project_activity[1].display_path, "/tmp/Photonia");
         assert_eq!(snapshot.project_activity[1].total_tokens, 120);
+        assert_eq!(snapshot.project_activity[1].cached_input_tokens, 0);
 
         let _ = std::fs::remove_dir_all(root);
     }

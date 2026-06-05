@@ -15,13 +15,16 @@ See `CHANGELOG.md` for release history.
 <img width="2088" height="952" alt="WindowsTerminal_nrizljNtk5" src="https://github.com/user-attachments/assets/cf2ac2e7-3a94-48cd-9d3b-1a4a98016f45" />
 <img width="2088" height="952" alt="WindowsTerminal_HjIAOZQKWE" src="https://github.com/user-attachments/assets/4e3eed0a-d3aa-4ae5-bc4e-c6e5400bc1dd" />
 
+
 ## Requirements
 
 - Rust toolchain (stable) installed.
 - C/C++ compiler toolchain available (needed to build bundled SQLite through `rusqlite`).
 - Codex CLI installed as `codex` on your `PATH`, or a discoverable/explicit Codex App Server executable (required only for live limits/credits).
   - Usage stats still work without Codex CLI (they only need the session logs on disk).
-- For portable Linux builds (`--musl`), `rustup` and musl target toolchain support are required.
+- For portable Linux builds (`--musl`), install both the Rust musl target and a musl C compiler.
+  - Debian/Ubuntu: `sudo apt install musl-tools`
+  - Required tool for x86_64 musl builds: `x86_64-linux-musl-gcc`
 
 ## Run
 
@@ -203,6 +206,7 @@ Linux/macOS:
 bash scripts/install-user.sh
 
 # Portable Linux build/install (musl target, auto-detected arch):
+# Requires musl-tools on Debian/Ubuntu.
 bash scripts/install-user.sh --musl
 
 # Explicit target example:
@@ -247,6 +251,11 @@ bash scripts/package-prebuilt.sh --musl
 # 4) Upload generated zip to GitHub Release
 ls dist/comon-v*-unknown-linux-musl.zip
 ```
+
+If a musl build fails with `failed to find tool "x86_64-linux-musl-gcc"`,
+install `musl-tools` and retry. Adding the Rust target with `rustup target add`
+is necessary but not sufficient because bundled SQLite is compiled through a C
+compiler.
 
 Additional maintainer options:
 

@@ -8,6 +8,7 @@ All notable changes to this project are documented in this file.
 - Added `--app-server-bin` for standalone Codex App Server executables.
 - Added Windows auto-detection for common Codex App bundled App Server locations.
 - Project activity token headers now show total/out-of-cache token pairs.
+- Documented the musl C compiler requirement for portable Linux builds.
 
 ## 0.3.4 - 2026-04-24
 

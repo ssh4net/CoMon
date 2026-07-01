@@ -114,6 +114,12 @@ pub(crate) const DEFAULT_ACTIVITY_PROJECT_LIMIT: usize = 5;
 pub(crate) const MIN_ACTIVITY_PROJECT_LIMIT: usize = 1;
 pub(crate) const MAX_ACTIVITY_PROJECT_LIMIT: usize = 50;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LimitsWake {
+    Poll,
+    Stop,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PersistedUiState {
     metric: UsageMetric,
@@ -337,18 +343,35 @@ async fn run_inner(
             }
             interval.tick().await;
             loop {
-                tokio::select! {
+                let wake = tokio::select! {
                     _ = shutdown_rx.changed() => {
-                        rpc.kill().await;
-                        break;
+                        LimitsWake::Stop
                     }
-                    _ = interval.tick() => {}
+                    _ = interval.tick() => {
+                        LimitsWake::Poll
+                    }
                     recv = limits_refresh_rx.recv() => {
                         if recv.is_none() {
-                            rpc.kill().await;
-                            break;
+                            LimitsWake::Stop
+                        } else {
+                            LimitsWake::Poll
                         }
                     }
+                    notification = rpc.recv_notification() => {
+                        match notification {
+                            Some(value)
+                                if crate::codex_rpc::is_account_rate_limits_updated_notification(&value) =>
+                            {
+                                LimitsWake::Poll
+                            }
+                            Some(_) => continue,
+                            None => LimitsWake::Stop,
+                        }
+                    }
+                };
+                if wake == LimitsWake::Stop {
+                    rpc.kill().await;
+                    break;
                 }
                 let res = rpc.read_account_rate_limits().await;
                 if evt_tx.send(AppEvent::LimitsUpdated(res)).await.is_err() {

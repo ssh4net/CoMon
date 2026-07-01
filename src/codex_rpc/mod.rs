@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 
 const MAX_RPC_LINE_BYTES: usize = 1024 * 1024;
@@ -33,10 +33,25 @@ pub struct CreditsSnapshot {
 }
 
 #[derive(Debug, Clone)]
-pub struct AccountRateLimits {
+pub struct RateLimitSnapshot {
+    pub limit_id: Option<String>,
+    pub limit_name: Option<String>,
+    pub plan_type: Option<String>,
     pub primary: Option<RateLimitWindow>,
     pub secondary: Option<RateLimitWindow>,
     pub credits: Option<CreditsSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AccountRateLimits {
+    pub limit_id: Option<String>,
+    pub limit_name: Option<String>,
+    pub plan_type: Option<String>,
+    pub primary: Option<RateLimitWindow>,
+    pub secondary: Option<RateLimitWindow>,
+    pub credits: Option<CreditsSnapshot>,
+    pub buckets: Vec<RateLimitSnapshot>,
+    pub reset_credits_available: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +123,7 @@ pub struct CodexRpc {
     child: Mutex<Child>,
     stdin: Mutex<ChildStdin>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Value>>>,
+    notifications: Mutex<mpsc::Receiver<Value>>,
     next_id: Mutex<u64>,
 }
 
@@ -134,10 +150,12 @@ impl CodexRpc {
             .take()
             .ok_or_else(|| anyhow!("missing stderr"))?;
 
+        let (notification_tx, notification_rx) = mpsc::channel(MAX_PENDING_REQUESTS);
         let rpc = Arc::new(Self {
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
             pending: Mutex::new(HashMap::new()),
+            notifications: Mutex::new(notification_rx),
             next_id: Mutex::new(1),
         });
 
@@ -186,7 +204,11 @@ impl CodexRpc {
                                         if let Some(tx) = rpc.pending.lock().await.remove(&id) {
                                             let _ = tx.send(value);
                                         }
+                                    } else if value.get("method").is_some() {
+                                        let _ = notification_tx.try_send(value);
                                     }
+                                } else if value.get("method").is_some() {
+                                    let _ = notification_tx.try_send(value);
                                 }
                             }
 
@@ -309,19 +331,21 @@ impl CodexRpc {
         }
 
         let result = value.get("result").cloned().unwrap_or(Value::Null);
-        let rate_limits = result
-            .get("rateLimits")
-            .or_else(|| result.get("rate_limits"))
-            .cloned()
-            .unwrap_or(Value::Null);
+        parse_account_rate_limits_result(&result)
+    }
 
-        parse_rate_limits(&rate_limits)
+    pub async fn recv_notification(&self) -> Option<Value> {
+        self.notifications.lock().await.recv().await
     }
 
     pub async fn kill(&self) {
         let mut child = self.child.lock().await;
         let _ = child.kill().await;
     }
+}
+
+pub fn is_account_rate_limits_updated_notification(value: &Value) -> bool {
+    value.get("method").and_then(|v| v.as_str()) == Some("account/rateLimits/updated")
 }
 
 fn non_empty_string(value: String) -> Option<String> {
@@ -536,11 +560,67 @@ fn find_app_server_recursive(
     None
 }
 
-fn parse_rate_limits(value: &Value) -> Result<AccountRateLimits> {
-    let obj = value
-        .as_object()
-        .ok_or_else(|| anyhow!("rate limits missing"))?;
+fn parse_account_rate_limits_result(result: &Value) -> Result<AccountRateLimits> {
+    let rate_limits = result
+        .get("rateLimits")
+        .or_else(|| result.get("rate_limits"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let mut limits = parse_rate_limits(&rate_limits)?;
 
+    limits.reset_credits_available = result
+        .get("rateLimitResetCredits")
+        .or_else(|| result.get("rate_limit_reset_credits"))
+        .and_then(|v| v.as_object())
+        .and_then(|v| {
+            v.get("availableCount")
+                .or_else(|| v.get("available_count"))
+                .and_then(as_i64_maybe_float)
+        });
+
+    if let Some(by_limit_id) = result
+        .get("rateLimitsByLimitId")
+        .or_else(|| result.get("rate_limits_by_limit_id"))
+        .and_then(|v| v.as_object())
+    {
+        let mut buckets = Vec::<RateLimitSnapshot>::with_capacity(by_limit_id.len());
+        for (key, value) in by_limit_id {
+            if let Some(mut snapshot) = parse_rate_limit_snapshot(value) {
+                if snapshot.limit_id.is_none() {
+                    snapshot.limit_id = Some(key.clone());
+                }
+                buckets.push(snapshot);
+            }
+        }
+        buckets.sort_by(|a, b| a.limit_id.cmp(&b.limit_id));
+        limits.buckets = buckets;
+    }
+
+    Ok(limits)
+}
+
+fn parse_rate_limits(value: &Value) -> Result<AccountRateLimits> {
+    let snapshot =
+        parse_rate_limit_snapshot(value).ok_or_else(|| anyhow!("rate limits missing"))?;
+
+    Ok(AccountRateLimits {
+        limit_id: snapshot.limit_id.clone(),
+        limit_name: snapshot.limit_name.clone(),
+        plan_type: snapshot.plan_type.clone(),
+        primary: snapshot.primary.clone(),
+        secondary: snapshot.secondary.clone(),
+        credits: snapshot.credits.clone(),
+        buckets: Vec::new(),
+        reset_credits_available: None,
+    })
+}
+
+fn parse_rate_limit_snapshot(value: &Value) -> Option<RateLimitSnapshot> {
+    let obj = value.as_object().filter(|_| !value.is_null())?;
+
+    let limit_id = read_string(obj.get("limitId").or_else(|| obj.get("limit_id")));
+    let limit_name = read_string(obj.get("limitName").or_else(|| obj.get("limit_name")));
+    let plan_type = read_string(obj.get("planType").or_else(|| obj.get("plan_type")));
     let primary = obj.get("primary").and_then(parse_window);
     let secondary = obj.get("secondary").and_then(parse_window);
 
@@ -567,7 +647,10 @@ fn parse_rate_limits(value: &Value) -> Result<AccountRateLimits> {
         }
     });
 
-    Ok(AccountRateLimits {
+    Some(RateLimitSnapshot {
+        limit_id,
+        limit_name,
+        plan_type,
         primary,
         secondary,
         credits,
@@ -583,6 +666,7 @@ fn parse_window(value: &Value) -> Option<RateLimitWindow> {
     let window_duration_mins = obj
         .get("windowDurationMins")
         .or_else(|| obj.get("window_duration_mins"))
+        .or_else(|| obj.get("window_minutes"))
         .and_then(as_f64);
     let resets_at = obj
         .get("resetsAt")
@@ -594,6 +678,11 @@ fn parse_window(value: &Value) -> Option<RateLimitWindow> {
         window_duration_mins,
         resets_at,
     })
+}
+
+fn read_string(value: Option<&Value>) -> Option<String> {
+    let value = value?.as_str()?.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn as_f64(value: &Value) -> Option<f64> {
@@ -618,12 +707,16 @@ mod tests {
     #[test]
     fn parse_rate_limits_accepts_expected_shapes() {
         let v = json!({
+            "limitId": "codex",
+            "planType": "prolite",
             "primary": { "usedPercent": 0, "windowDurationMins": 300, "resetsAt": 1770118764 },
-            "secondary": { "used_percent": 1.0, "window_duration_mins": "10080", "resets_at": "1770684472" },
+            "secondary": { "used_percent": 1.0, "window_minutes": "10080", "resets_at": "1770684472" },
             "credits": { "hasCredits": true, "unlimited": false, "balance": 900.735 },
         });
 
         let limits = parse_rate_limits(&v).expect("parse_rate_limits");
+        assert_eq!(limits.limit_id.as_deref(), Some("codex"));
+        assert_eq!(limits.plan_type.as_deref(), Some("prolite"));
         let p = limits.primary.expect("primary");
         assert_eq!(p.used_percent, Some(0.0));
         assert_eq!(p.window_duration_mins, Some(300.0));
@@ -638,6 +731,48 @@ mod tests {
         assert!(c.has_credits);
         assert!(!c.unlimited);
         assert_eq!(c.balance.as_deref(), Some("900.735"));
+    }
+
+    #[test]
+    fn parse_account_rate_limits_result_accepts_multi_bucket_response() {
+        let v = json!({
+            "rateLimitResetCredits": { "availableCount": 2 },
+            "rateLimits": {
+                "limitId": "codex",
+                "primary": { "usedPercent": 10, "windowDurationMins": 300 },
+                "secondary": { "usedPercent": 20, "windowDurationMins": 10080 }
+            },
+            "rateLimitsByLimitId": {
+                "codex_extra": {
+                    "limitName": "GPT-5.3-Codex-Spark",
+                    "primary": { "usedPercent": 30, "windowDurationMins": 300 }
+                },
+                "codex": {
+                    "primary": { "usedPercent": 10, "windowDurationMins": 300 }
+                }
+            }
+        });
+
+        let limits =
+            parse_account_rate_limits_result(&v).expect("parse_account_rate_limits_result");
+        assert_eq!(limits.limit_id.as_deref(), Some("codex"));
+        assert_eq!(limits.reset_credits_available, Some(2));
+        assert_eq!(limits.buckets.len(), 2);
+        assert_eq!(limits.buckets[0].limit_id.as_deref(), Some("codex"));
+        assert_eq!(limits.buckets[1].limit_id.as_deref(), Some("codex_extra"));
+        assert_eq!(
+            limits.buckets[1].limit_name.as_deref(),
+            Some("GPT-5.3-Codex-Spark")
+        );
+    }
+
+    #[test]
+    fn recognizes_account_rate_limits_updated_notification() {
+        let v = json!({
+            "method": "account/rateLimits/updated",
+            "params": { "rateLimits": { "primary": { "usedPercent": 3 } } }
+        });
+        assert!(is_account_rate_limits_updated_notification(&v));
     }
 
     #[test]

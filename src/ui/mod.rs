@@ -769,21 +769,23 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let today = snapshot.and_then(|s| s.days.last());
 
     // LIMITS card (live from Codex app-server).
-    let (limits_value, limits_caption1, limits_caption2): (String, Option<String>, Option<String>) =
-        if !state.limits_enabled {
-            let msg = state
-                .limits_error
-                .as_deref()
-                .or(state.limits_notice.as_deref())
-                .unwrap_or("Limits unavailable.");
-            ("Unavailable".to_string(), Some(msg.to_string()), None)
-        } else if let Some(l) = state.limits.as_ref() {
-            let (l1, l2) = format_limits_compact_lines(l);
-            let l3 = format_credits_compact_line(l).unwrap_or_else(|| "Credits:  --".to_string());
-            (l1, Some(l2), Some(l3))
-        } else {
-            ("Loading...".to_string(), None, None)
-        };
+    let (limits_value, limits_caption1, limits_caption2, limits_caption3): (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = if !state.limits_enabled {
+        let msg = state
+            .limits_error
+            .as_deref()
+            .or(state.limits_notice.as_deref())
+            .unwrap_or("Limits unavailable.");
+        ("Unavailable".to_string(), Some(msg.to_string()), None, None)
+    } else if let Some(l) = state.limits.as_ref() {
+        format_limits_compact_card_lines(l)
+    } else {
+        ("Loading...".to_string(), None, None, None)
+    };
 
     // TODAY card always shows Tokens / Runs / Time.
     let today_value = today
@@ -858,11 +860,12 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                         ])
                         .split(row1);
                     frame.render_widget(
-                        card(
+                        card4(
                             "LIMITS",
                             &limits_value,
                             limits_caption1.as_deref(),
                             limits_caption2.as_deref(),
+                            limits_caption3.as_deref(),
                         ),
                         cards[0],
                     );
@@ -910,11 +913,12 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                         ])
                         .split(row1);
                     frame.render_widget(
-                        card(
+                        card4(
                             "LIMITS",
                             &limits_value,
                             limits_caption1.as_deref(),
                             limits_caption2.as_deref(),
+                            limits_caption3.as_deref(),
                         ),
                         top[0],
                     );
@@ -1010,11 +1014,12 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                         ])
                         .split(row1);
                     frame.render_widget(
-                        card(
+                        card4(
                             "LIMITS",
                             &limits_value,
                             limits_caption1.as_deref(),
                             limits_caption2.as_deref(),
+                            limits_caption3.as_deref(),
                         ),
                         cards[0],
                     );
@@ -1059,11 +1064,12 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                         ])
                         .split(row1);
                     frame.render_widget(
-                        card(
+                        card4(
                             "LIMITS",
                             &limits_value,
                             limits_caption1.as_deref(),
                             limits_caption2.as_deref(),
+                            limits_caption3.as_deref(),
                         ),
                         top[0],
                     );
@@ -1186,11 +1192,12 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                         ])
                         .split(row1);
                     frame.render_widget(
-                        card(
+                        card4(
                             "LIMITS",
                             &limits_value,
                             limits_caption1.as_deref(),
                             limits_caption2.as_deref(),
+                            limits_caption3.as_deref(),
                         ),
                         cards[0],
                     );
@@ -1233,11 +1240,12 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                         ])
                         .split(row1);
                     frame.render_widget(
-                        card(
+                        card4(
                             "LIMITS",
                             &limits_value,
                             limits_caption1.as_deref(),
                             limits_caption2.as_deref(),
+                            limits_caption3.as_deref(),
                         ),
                         top[0],
                     );
@@ -1936,6 +1944,20 @@ fn card(
     caption1: Option<&str>,
     caption2: Option<&str>,
 ) -> Paragraph<'static> {
+    card_with_captions(title, value, &[caption1, caption2])
+}
+
+fn card4(
+    title: &str,
+    value: &str,
+    caption1: Option<&str>,
+    caption2: Option<&str>,
+    caption3: Option<&str>,
+) -> Paragraph<'static> {
+    card_with_captions(title, value, &[caption1, caption2, caption3])
+}
+
+fn card_with_captions(title: &str, value: &str, captions: &[Option<&str>]) -> Paragraph<'static> {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
@@ -1955,15 +1977,7 @@ fn card(
         value.to_string(),
         Style::default().add_modifier(Modifier::BOLD),
     )));
-    if let Some(caption) = caption1 {
-        if !caption.trim().is_empty() {
-            lines.push(Line::from(Span::styled(
-                caption.to_string(),
-                Style::default().fg(Color::Gray),
-            )));
-        }
-    }
-    if let Some(caption) = caption2 {
+    for caption in captions.iter().flatten() {
         if !caption.trim().is_empty() {
             lines.push(Line::from(Span::styled(
                 caption.to_string(),
@@ -2049,6 +2063,50 @@ fn format_limits_compact_lines(l: &crate::codex_rpc::AccountRateLimits) -> (Stri
     let l1 = format_limit_compact_line(&primary_label, l.primary.as_ref());
     let l2 = format_limit_compact_line("Weekly:", l.secondary.as_ref());
     (l1, l2)
+}
+
+fn format_limits_compact_card_lines(
+    l: &crate::codex_rpc::AccountRateLimits,
+) -> (String, Option<String>, Option<String>, Option<String>) {
+    let (primary, secondary) = format_limits_compact_lines(l);
+    let credits = format_credits_compact_line(l).unwrap_or_else(|| "Credits:  --".to_string());
+
+    if let Some(extra) = format_extra_bucket_compact_line(l) {
+        (primary, Some(secondary), Some(extra), Some(credits))
+    } else {
+        (primary, Some(secondary), Some(credits), None)
+    }
+}
+
+fn format_extra_bucket_compact_line(l: &crate::codex_rpc::AccountRateLimits) -> Option<String> {
+    let active_id = l.limit_id.as_deref();
+    let active_name = l.limit_name.as_deref();
+    let bucket = l.buckets.iter().find(|bucket| {
+        let same_id = active_id.is_some() && bucket.limit_id.as_deref() == active_id;
+        let same_name = active_id.is_none()
+            && active_name.is_some()
+            && bucket.limit_name.as_deref() == active_name;
+        !same_id && !same_name
+    })?;
+    let window = bucket.primary.as_ref().or(bucket.secondary.as_ref())?;
+    let label = compact_bucket_label(bucket);
+    Some(format_limit_compact_line(&label, Some(window)))
+}
+
+fn compact_bucket_label(bucket: &crate::codex_rpc::RateLimitSnapshot) -> String {
+    let raw = bucket
+        .limit_name
+        .as_deref()
+        .or(bucket.limit_id.as_deref())
+        .unwrap_or("Other")
+        .trim();
+    let raw = raw.strip_prefix("GPT-").unwrap_or(raw);
+    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        return "Other:".to_string();
+    }
+    format!("{}:", truncate_middle(cleaned, 9))
 }
 
 fn format_credits_compact_line(l: &crate::codex_rpc::AccountRateLimits) -> Option<String> {

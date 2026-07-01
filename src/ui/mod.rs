@@ -246,9 +246,9 @@ fn render_usage(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
 fn usage_cards_height(width: u16) -> u16 {
     if width >= 150 {
-        7
+        8
     } else {
-        15
+        17
     }
 }
 

@@ -2052,30 +2052,86 @@ fn format_limit_compact_line(
     format!("{label}{pct}{resets}")
 }
 
-fn format_limits_compact_lines(l: &crate::codex_rpc::AccountRateLimits) -> (String, String) {
-    let primary_label = l
-        .primary
-        .as_ref()
+fn format_rolling_limit_lines(
+    primary: Option<&crate::codex_rpc::RateLimitWindow>,
+    secondary: Option<&crate::codex_rpc::RateLimitWindow>,
+) -> (String, String) {
+    let primary_label = primary
         .and_then(|w| w.window_duration_mins)
         .and_then(format_window_label)
         .map(|w| format!("{w} limit:"))
         .unwrap_or_else(|| "5h limit:".to_string());
-    let l1 = format_limit_compact_line(&primary_label, l.primary.as_ref());
-    let l2 = format_limit_compact_line("Weekly:", l.secondary.as_ref());
+    let l1 = format_limit_compact_line(&primary_label, primary);
+    let l2 = format_limit_compact_line("Weekly:", secondary);
     (l1, l2)
 }
 
 fn format_limits_compact_card_lines(
     l: &crate::codex_rpc::AccountRateLimits,
 ) -> (String, Option<String>, Option<String>, Option<String>) {
-    let (primary, secondary) = format_limits_compact_lines(l);
-    let credits = format_credits_compact_line(l).unwrap_or_else(|| "Credits:  --".to_string());
+    let (rolling_primary, rolling_secondary) = rolling_windows_for_limits(l);
+    let (primary, secondary) = format_rolling_limit_lines(rolling_primary, rolling_secondary);
+    if let Some((monthly, used)) = format_individual_limit_compact_lines(l) {
+        return (monthly, Some(used), Some(primary), Some(secondary));
+    }
 
     if let Some(extra) = format_extra_bucket_compact_line(l) {
+        let credits = format_credits_compact_line(l).unwrap_or_else(|| "Credits:  --".to_string());
         (primary, Some(secondary), Some(extra), Some(credits))
     } else {
+        let credits = format_credits_compact_line(l).unwrap_or_else(|| "Credits:  --".to_string());
         (primary, Some(secondary), Some(credits), None)
     }
+}
+
+fn rolling_windows_for_limits(
+    l: &crate::codex_rpc::AccountRateLimits,
+) -> (
+    Option<&crate::codex_rpc::RateLimitWindow>,
+    Option<&crate::codex_rpc::RateLimitWindow>,
+) {
+    if l.primary.is_some() || l.secondary.is_some() {
+        return (l.primary.as_ref(), l.secondary.as_ref());
+    }
+    l.buckets
+        .iter()
+        .find(|bucket| bucket.primary.is_some() || bucket.secondary.is_some())
+        .map(|bucket| (bucket.primary.as_ref(), bucket.secondary.as_ref()))
+        .unwrap_or((None, None))
+}
+
+fn format_individual_limit_compact_lines(
+    l: &crate::codex_rpc::AccountRateLimits,
+) -> Option<(String, String)> {
+    let individual_limit = l.individual_limit.as_ref().or_else(|| {
+        l.buckets
+            .iter()
+            .find_map(|bucket| bucket.individual_limit.as_ref())
+    })?;
+
+    const LABEL_W: usize = 10;
+    let remaining = individual_limit
+        .remaining_percent
+        .filter(|v| v.is_finite())
+        .map(|v| format!("{}%", v.round() as i64))
+        .unwrap_or_else(|| "--%".to_string());
+    let resets = resets_label(individual_limit.resets_at)
+        .map(|s| format!(" ({s})"))
+        .unwrap_or_default();
+    let monthly = format!("{:<LABEL_W$}{remaining}{resets}", "Monthly:");
+
+    let used = individual_limit
+        .used
+        .as_deref()
+        .map(format_credit_amount)
+        .unwrap_or_else(|| "--".to_string());
+    let limit = individual_limit
+        .limit
+        .as_deref()
+        .map(format_credit_amount)
+        .unwrap_or_else(|| "--".to_string());
+    let used_line = format!("{:<LABEL_W$}{used}/{limit} used", "Credits:");
+    Some((monthly, used_line))
 }
 
 fn format_extra_bucket_compact_line(l: &crate::codex_rpc::AccountRateLimits) -> Option<String> {
@@ -2107,6 +2163,15 @@ fn compact_bucket_label(bucket: &crate::codex_rpc::RateLimitSnapshot) -> String 
         return "Other:".to_string();
     }
     format!("{}:", truncate_middle(cleaned, 9))
+}
+
+fn format_credit_amount(raw: &str) -> String {
+    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
+    let cleaned = cleaned.trim();
+    let number = cleaned.parse::<f64>().ok().filter(|v| v.is_finite());
+    number
+        .map(|v| format_count(v.round() as i64))
+        .unwrap_or_else(|| truncate_middle(cleaned, 12))
 }
 
 fn format_credits_compact_line(l: &crate::codex_rpc::AccountRateLimits) -> Option<String> {
@@ -2253,6 +2318,48 @@ mod tests {
         assert_eq!(truncate_middle("hello", 1), "...");
         assert_eq!(truncate_middle("hello", 2), "...");
         assert_eq!(truncate_middle("hello", 3), "...");
+    }
+
+    #[test]
+    fn limits_card_uses_monthly_and_named_rolling_bucket() {
+        let limits = crate::codex_rpc::AccountRateLimits {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            plan_type: Some("enterprise".to_string()),
+            individual_limit: Some(crate::codex_rpc::SpendControlLimitSnapshot {
+                limit: Some("60000".to_string()),
+                remaining_percent: Some(99.0),
+                resets_at: None,
+                used: Some("564".to_string()),
+            }),
+            primary: None,
+            secondary: None,
+            credits: None,
+            buckets: vec![crate::codex_rpc::RateLimitSnapshot {
+                limit_id: Some("codex_bengalfox".to_string()),
+                limit_name: Some("GPT-5.3-Codex-Spark-Preview".to_string()),
+                plan_type: Some("enterprise".to_string()),
+                individual_limit: None,
+                primary: Some(crate::codex_rpc::RateLimitWindow {
+                    used_percent: Some(0.0),
+                    window_duration_mins: Some(300.0),
+                    resets_at: None,
+                }),
+                secondary: Some(crate::codex_rpc::RateLimitWindow {
+                    used_percent: Some(0.0),
+                    window_duration_mins: Some(10080.0),
+                    resets_at: None,
+                }),
+                credits: None,
+            }],
+            reset_credits_available: None,
+        };
+
+        let (value, caption1, caption2, caption3) = format_limits_compact_card_lines(&limits);
+        assert_eq!(value, "Monthly:  99%");
+        assert_eq!(caption1.as_deref(), Some("Credits:  564/60,000 used"));
+        assert_eq!(caption2.as_deref(), Some("5h limit: 100%"));
+        assert_eq!(caption3.as_deref(), Some("Weekly:   100%"));
     }
 
     #[test]

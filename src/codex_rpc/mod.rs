@@ -33,10 +33,19 @@ pub struct CreditsSnapshot {
 }
 
 #[derive(Debug, Clone)]
+pub struct SpendControlLimitSnapshot {
+    pub limit: Option<String>,
+    pub remaining_percent: Option<f64>,
+    pub resets_at: Option<i64>,
+    pub used: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct RateLimitSnapshot {
     pub limit_id: Option<String>,
     pub limit_name: Option<String>,
     pub plan_type: Option<String>,
+    pub individual_limit: Option<SpendControlLimitSnapshot>,
     pub primary: Option<RateLimitWindow>,
     pub secondary: Option<RateLimitWindow>,
     pub credits: Option<CreditsSnapshot>,
@@ -47,6 +56,7 @@ pub struct AccountRateLimits {
     pub limit_id: Option<String>,
     pub limit_name: Option<String>,
     pub plan_type: Option<String>,
+    pub individual_limit: Option<SpendControlLimitSnapshot>,
     pub primary: Option<RateLimitWindow>,
     pub secondary: Option<RateLimitWindow>,
     pub credits: Option<CreditsSnapshot>,
@@ -607,6 +617,7 @@ fn parse_rate_limits(value: &Value) -> Result<AccountRateLimits> {
         limit_id: snapshot.limit_id.clone(),
         limit_name: snapshot.limit_name.clone(),
         plan_type: snapshot.plan_type.clone(),
+        individual_limit: snapshot.individual_limit.clone(),
         primary: snapshot.primary.clone(),
         secondary: snapshot.secondary.clone(),
         credits: snapshot.credits.clone(),
@@ -621,6 +632,10 @@ fn parse_rate_limit_snapshot(value: &Value) -> Option<RateLimitSnapshot> {
     let limit_id = read_string(obj.get("limitId").or_else(|| obj.get("limit_id")));
     let limit_name = read_string(obj.get("limitName").or_else(|| obj.get("limit_name")));
     let plan_type = read_string(obj.get("planType").or_else(|| obj.get("plan_type")));
+    let individual_limit = obj
+        .get("individualLimit")
+        .or_else(|| obj.get("individual_limit"))
+        .and_then(parse_individual_limit);
     let primary = obj.get("primary").and_then(parse_window);
     let secondary = obj.get("secondary").and_then(parse_window);
 
@@ -651,9 +666,26 @@ fn parse_rate_limit_snapshot(value: &Value) -> Option<RateLimitSnapshot> {
         limit_id,
         limit_name,
         plan_type,
+        individual_limit,
         primary,
         secondary,
         credits,
+    })
+}
+
+fn parse_individual_limit(value: &Value) -> Option<SpendControlLimitSnapshot> {
+    let obj = value.as_object()?;
+    Some(SpendControlLimitSnapshot {
+        limit: read_scalar_string(obj.get("limit")),
+        remaining_percent: obj
+            .get("remainingPercent")
+            .or_else(|| obj.get("remaining_percent"))
+            .and_then(as_f64),
+        resets_at: obj
+            .get("resetsAt")
+            .or_else(|| obj.get("resets_at"))
+            .and_then(as_i64_maybe_float),
+        used: read_scalar_string(obj.get("used")),
     })
 }
 
@@ -683,6 +715,16 @@ fn parse_window(value: &Value) -> Option<RateLimitWindow> {
 fn read_string(value: Option<&Value>) -> Option<String> {
     let value = value?.as_str()?.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+fn read_scalar_string(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    value
+        .as_str()
+        .map(|s| s.trim().to_string())
+        .or_else(|| value.as_i64().map(|n| n.to_string()))
+        .or_else(|| value.as_f64().map(|n| n.to_string()))
+        .filter(|s| !s.is_empty())
 }
 
 fn as_f64(value: &Value) -> Option<f64> {
@@ -739,16 +781,26 @@ mod tests {
             "rateLimitResetCredits": { "availableCount": 2 },
             "rateLimits": {
                 "limitId": "codex",
-                "primary": { "usedPercent": 10, "windowDurationMins": 300 },
-                "secondary": { "usedPercent": 20, "windowDurationMins": 10080 }
+                "individualLimit": {
+                    "limit": "60000",
+                    "remainingPercent": 99,
+                    "resetsAt": 1785523200,
+                    "used": "564"
+                }
             },
             "rateLimitsByLimitId": {
                 "codex_extra": {
                     "limitName": "GPT-5.3-Codex-Spark",
-                    "primary": { "usedPercent": 30, "windowDurationMins": 300 }
+                    "primary": { "usedPercent": 30, "windowDurationMins": 300 },
+                    "secondary": { "usedPercent": 40, "windowDurationMins": 10080 }
                 },
                 "codex": {
-                    "primary": { "usedPercent": 10, "windowDurationMins": 300 }
+                    "individualLimit": {
+                        "limit": "60000",
+                        "remainingPercent": 99,
+                        "resetsAt": 1785523200,
+                        "used": "564"
+                    }
                 }
             }
         });
@@ -756,6 +808,11 @@ mod tests {
         let limits =
             parse_account_rate_limits_result(&v).expect("parse_account_rate_limits_result");
         assert_eq!(limits.limit_id.as_deref(), Some("codex"));
+        let individual_limit = limits.individual_limit.expect("individual limit");
+        assert_eq!(individual_limit.limit.as_deref(), Some("60000"));
+        assert_eq!(individual_limit.remaining_percent, Some(99.0));
+        assert_eq!(individual_limit.resets_at, Some(1785523200));
+        assert_eq!(individual_limit.used.as_deref(), Some("564"));
         assert_eq!(limits.reset_credits_available, Some(2));
         assert_eq!(limits.buckets.len(), 2);
         assert_eq!(limits.buckets[0].limit_id.as_deref(), Some("codex"));

@@ -307,20 +307,29 @@ fn render_usage(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let cards_height = usage_cards_height(state, area.width);
     let reset_summary = reset_summary_text(state);
     let controls_height = usage_controls_height(reset_summary.as_deref(), area.width);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(controls_height),
-            Constraint::Length(cards_height),
-            Constraint::Min(8),
-            Constraint::Length(3),
-        ])
-        .split(area);
+    let chunks = usage_layout(area, controls_height, cards_height);
 
     render_usage_controls(frame, chunks[0], state, reset_summary.as_deref());
     render_usage_cards(frame, chunks[1], state);
     render_usage_chart(frame, chunks[2], state);
     render_top_models(frame, chunks[3], state);
+}
+
+fn usage_layout(area: Rect, controls_height: u16, cards_height: u16) -> [Rect; 4] {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(controls_height),
+            Constraint::Length(cards_height),
+            // Cards must keep their measured height. `Min` has higher priority than `Length`
+            // in ratatui, so a short terminal would otherwise collapse the cards to borders in
+            // order to preserve the chart's minimum height. Let the chart consume the remaining
+            // space and degrade first instead.
+            Constraint::Fill(1),
+            Constraint::Length(3),
+        ])
+        .split(area);
+    [chunks[0], chunks[1], chunks[2], chunks[3]]
 }
 
 fn render_activity(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -3021,6 +3030,17 @@ mod tests {
         let expected = tall.required_height(width);
 
         assert_eq!(card_row_height(&[short, tall], width), expected);
+    }
+
+    #[test]
+    fn short_usage_layout_preserves_measured_card_height() {
+        let area = Rect::new(0, 0, 140, 18);
+        let chunks = usage_layout(area, 2, 12);
+
+        assert_eq!(chunks[0].height, 2);
+        assert_eq!(chunks[1].height, 12);
+        assert_eq!(chunks[2].height, 1);
+        assert_eq!(chunks[3].height, 3);
     }
 
     #[test]

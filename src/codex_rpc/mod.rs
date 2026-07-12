@@ -32,6 +32,20 @@ pub struct CreditsSnapshot {
     pub balance: Option<String>,
 }
 
+/// Detail rows are retained for the planned reset-details screen. The compact summary currently
+/// consumes only `expires_at`.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct RateLimitResetCredit {
+    pub id: Option<String>,
+    pub reset_type: Option<String>,
+    pub status: Option<String>,
+    pub granted_at: Option<i64>,
+    pub expires_at: Option<i64>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SpendControlLimitSnapshot {
     pub limit: Option<String>,
@@ -44,7 +58,6 @@ pub struct SpendControlLimitSnapshot {
 pub struct RateLimitSnapshot {
     pub limit_id: Option<String>,
     pub limit_name: Option<String>,
-    pub plan_type: Option<String>,
     pub individual_limit: Option<SpendControlLimitSnapshot>,
     pub primary: Option<RateLimitWindow>,
     pub secondary: Option<RateLimitWindow>,
@@ -55,13 +68,14 @@ pub struct RateLimitSnapshot {
 pub struct AccountRateLimits {
     pub limit_id: Option<String>,
     pub limit_name: Option<String>,
-    pub plan_type: Option<String>,
     pub individual_limit: Option<SpendControlLimitSnapshot>,
     pub primary: Option<RateLimitWindow>,
     pub secondary: Option<RateLimitWindow>,
     pub credits: Option<CreditsSnapshot>,
     pub buckets: Vec<RateLimitSnapshot>,
     pub reset_credits_available: Option<i64>,
+    /// `None` means the backend did not return the optional credit detail rows.
+    pub reset_credits: Option<Vec<RateLimitResetCredit>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -588,6 +602,19 @@ fn parse_account_rate_limits_result(result: &Value) -> Result<AccountRateLimits>
                 .and_then(as_i64_maybe_float)
         });
 
+    limits.reset_credits = result
+        .get("rateLimitResetCredits")
+        .or_else(|| result.get("rate_limit_reset_credits"))
+        .and_then(|v| v.as_object())
+        .and_then(|v| v.get("credits"))
+        .and_then(|v| v.as_array())
+        .map(|credits| {
+            credits
+                .iter()
+                .filter_map(parse_rate_limit_reset_credit)
+                .collect()
+        });
+
     if let Some(by_limit_id) = result
         .get("rateLimitsByLimitId")
         .or_else(|| result.get("rate_limits_by_limit_id"))
@@ -616,13 +643,32 @@ fn parse_rate_limits(value: &Value) -> Result<AccountRateLimits> {
     Ok(AccountRateLimits {
         limit_id: snapshot.limit_id.clone(),
         limit_name: snapshot.limit_name.clone(),
-        plan_type: snapshot.plan_type.clone(),
         individual_limit: snapshot.individual_limit.clone(),
         primary: snapshot.primary.clone(),
         secondary: snapshot.secondary.clone(),
         credits: snapshot.credits.clone(),
         buckets: Vec::new(),
         reset_credits_available: None,
+        reset_credits: None,
+    })
+}
+
+fn parse_rate_limit_reset_credit(value: &Value) -> Option<RateLimitResetCredit> {
+    let obj = value.as_object()?;
+    Some(RateLimitResetCredit {
+        id: read_string(obj.get("id")),
+        reset_type: read_string(obj.get("resetType").or_else(|| obj.get("reset_type"))),
+        status: read_string(obj.get("status")),
+        granted_at: obj
+            .get("grantedAt")
+            .or_else(|| obj.get("granted_at"))
+            .and_then(as_i64_maybe_float),
+        expires_at: obj
+            .get("expiresAt")
+            .or_else(|| obj.get("expires_at"))
+            .and_then(as_i64_maybe_float),
+        title: read_string(obj.get("title")),
+        description: read_string(obj.get("description")),
     })
 }
 
@@ -631,7 +677,6 @@ fn parse_rate_limit_snapshot(value: &Value) -> Option<RateLimitSnapshot> {
 
     let limit_id = read_string(obj.get("limitId").or_else(|| obj.get("limit_id")));
     let limit_name = read_string(obj.get("limitName").or_else(|| obj.get("limit_name")));
-    let plan_type = read_string(obj.get("planType").or_else(|| obj.get("plan_type")));
     let individual_limit = obj
         .get("individualLimit")
         .or_else(|| obj.get("individual_limit"))
@@ -665,7 +710,6 @@ fn parse_rate_limit_snapshot(value: &Value) -> Option<RateLimitSnapshot> {
     Some(RateLimitSnapshot {
         limit_id,
         limit_name,
-        plan_type,
         individual_limit,
         primary,
         secondary,
@@ -750,7 +794,6 @@ mod tests {
     fn parse_rate_limits_accepts_expected_shapes() {
         let v = json!({
             "limitId": "codex",
-            "planType": "prolite",
             "primary": { "usedPercent": 0, "windowDurationMins": 300, "resetsAt": 1770118764 },
             "secondary": { "used_percent": 1.0, "window_minutes": "10080", "resets_at": "1770684472" },
             "credits": { "hasCredits": true, "unlimited": false, "balance": 900.735 },
@@ -758,7 +801,6 @@ mod tests {
 
         let limits = parse_rate_limits(&v).expect("parse_rate_limits");
         assert_eq!(limits.limit_id.as_deref(), Some("codex"));
-        assert_eq!(limits.plan_type.as_deref(), Some("prolite"));
         let p = limits.primary.expect("primary");
         assert_eq!(p.used_percent, Some(0.0));
         assert_eq!(p.window_duration_mins, Some(300.0));
@@ -778,7 +820,18 @@ mod tests {
     #[test]
     fn parse_account_rate_limits_result_accepts_multi_bucket_response() {
         let v = json!({
-            "rateLimitResetCredits": { "availableCount": 2 },
+            "rateLimitResetCredits": {
+                "availableCount": 2,
+                "credits": [{
+                    "id": "credit-1",
+                    "resetType": "codexRateLimits",
+                    "status": "available",
+                    "grantedAt": 1781742782,
+                    "expiresAt": 1784334782,
+                    "title": "Full reset (Weekly + 5 hr)",
+                    "description": "Restores rolling limits"
+                }]
+            },
             "rateLimits": {
                 "limitId": "codex",
                 "individualLimit": {
@@ -814,6 +867,21 @@ mod tests {
         assert_eq!(individual_limit.resets_at, Some(1785523200));
         assert_eq!(individual_limit.used.as_deref(), Some("564"));
         assert_eq!(limits.reset_credits_available, Some(2));
+        let credit = limits
+            .reset_credits
+            .as_deref()
+            .and_then(|credits| credits.first())
+            .expect("reset credit details");
+        assert_eq!(credit.id.as_deref(), Some("credit-1"));
+        assert_eq!(credit.reset_type.as_deref(), Some("codexRateLimits"));
+        assert_eq!(credit.status.as_deref(), Some("available"));
+        assert_eq!(credit.granted_at, Some(1781742782));
+        assert_eq!(credit.expires_at, Some(1784334782));
+        assert_eq!(credit.title.as_deref(), Some("Full reset (Weekly + 5 hr)"));
+        assert_eq!(
+            credit.description.as_deref(),
+            Some("Restores rolling limits")
+        );
         assert_eq!(limits.buckets.len(), 2);
         assert_eq!(limits.buckets[0].limit_id.as_deref(), Some("codex"));
         assert_eq!(limits.buckets[1].limit_id.as_deref(), Some("codex_extra"));

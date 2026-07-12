@@ -20,6 +20,7 @@ use ratatui::{
 };
 use std::io::{self, Stdout};
 use std::time::Instant;
+use unicode_width::UnicodeWidthStr;
 
 const ACTIVITY_PROJECT_HEIGHT: u16 = 9;
 const ACTIVITY_PROJECT_STRIDE: u16 = 10;
@@ -73,6 +74,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
     let title = match state.active_screen {
         ActiveScreen::Usage => " comon :: usage ",
         ActiveScreen::Activity => " comon :: activity ",
+        ActiveScreen::LimitResets => " comon :: limit resets ",
         ActiveScreen::Read => " comon :: session history ",
     };
 
@@ -95,12 +97,13 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
 
     match state.active_screen {
         ActiveScreen::Usage => {
+            let footer_height = footer_height(inner.width, state);
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(3),
                     Constraint::Min(0),
-                    Constraint::Length(1),
+                    Constraint::Length(footer_height),
                 ])
                 .split(inner);
 
@@ -116,17 +119,37 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
             }
         }
         ActiveScreen::Activity => {
+            let footer_height = footer_height(inner.width, state);
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(3),
                     Constraint::Min(0),
-                    Constraint::Length(1),
+                    Constraint::Length(footer_height),
                 ])
                 .split(inner);
 
             render_activity_header(frame, chunks[0], state);
             render_activity(frame, chunks[1], state);
+            render_footer(frame, chunks[2], state);
+
+            if state.show_help {
+                render_help_overlay(frame, area, state.active_screen);
+            }
+        }
+        ActiveScreen::LimitResets => {
+            let footer_height = footer_height(inner.width, state);
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(0),
+                    Constraint::Length(footer_height),
+                ])
+                .split(inner);
+
+            render_limit_resets_header(frame, chunks[0], state);
+            render_limit_resets(frame, chunks[1], state);
             render_footer(frame, chunks[2], state);
 
             if state.show_help {
@@ -196,83 +219,143 @@ fn render_activity_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(right, row[1]);
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let err = state
-        .usage_error
-        .as_deref()
-        .or(state.limits_error.as_deref())
-        .unwrap_or("");
-    let err_span = if err.is_empty() {
-        Span::raw("")
-    } else {
-        Span::styled(truncate_middle(err, 80), Style::default().fg(Color::Red))
-    };
+fn render_limit_resets_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(20), Constraint::Length(28)])
+        .split(area);
 
-    let usage_hint = match state.active_screen {
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "LIMIT_RESETS",
+            Style::default().add_modifier(Modifier::BOLD),
+        ))),
+        row[0],
+    );
+
+    let updated = state
+        .limits_updated_label()
+        .unwrap_or_else(|| "Updated --".to_string());
+    let right = Paragraph::new(Line::from(vec![
+        Span::raw(updated),
+        Span::raw("  "),
+        Span::styled("[r/F5]", Style::default().fg(Color::Gray)),
+        Span::raw("  "),
+        Span::styled("[s/F2]", Style::default().fg(Color::Gray)),
+    ]))
+    .alignment(Alignment::Right);
+    frame.render_widget(right, row[1]);
+}
+
+fn footer_hint(screen: ActiveScreen) -> &'static str {
+    match screen {
         ActiveScreen::Usage => {
             "Usage: Statistic [tab] (tokens/time/runs), Timeframe [w] (week/month), Layout [f] (horizontal/vertical), Refresh [r/F5], Switch [s/F2], Help [?], Quit [q]"
         }
         ActiveScreen::Activity => {
             "Activity: Statistic [tab] (tokens/time/runs), Projects [+/-], Refresh [r/F5], Switch [s/F2], Help [?], Quit [q]"
         }
+        ActiveScreen::LimitResets => {
+            "Limit resets: Refresh [r/F5], Switch [s/F2], Help [?], Quit [q]"
+        }
         ActiveScreen::Read => "",
-    };
+    }
+}
+
+fn footer_error(state: &AppState) -> String {
+    let err = state
+        .usage_error
+        .as_deref()
+        .or(state.limits_error.as_deref())
+        .unwrap_or("");
+    if err.is_empty() {
+        String::new()
+    } else {
+        truncate_middle(err, 80)
+    }
+}
+
+fn footer_text(state: &AppState) -> String {
+    let hint = footer_hint(state.active_screen);
+    let err = footer_error(state);
+    if err.is_empty() {
+        hint.to_string()
+    } else {
+        format!("{hint}  {err}")
+    }
+}
+
+fn footer_height(width: u16, state: &AppState) -> u16 {
+    wrapped_line_count(&footer_text(state), width).max(1)
+}
+
+fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let err = footer_error(state);
     let line = Line::from(vec![
-        Span::styled(usage_hint, Style::default().fg(Color::Gray)),
-        Span::raw("  "),
-        err_span,
+        Span::styled(
+            footer_hint(state.active_screen),
+            Style::default().fg(Color::Gray),
+        ),
+        Span::raw(if err.is_empty() { "" } else { "  " }),
+        Span::styled(err, Style::default().fg(Color::Red)),
     ]);
 
     frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), area);
 }
 
 fn render_usage(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let cards_height = usage_cards_height(area.width);
+    let cards_height = usage_cards_height(state, area.width);
+    let reset_summary = reset_summary_text(state);
+    let controls_height = usage_controls_height(reset_summary.as_deref(), area.width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(controls_height),
             Constraint::Length(cards_height),
             Constraint::Min(8),
             Constraint::Length(3),
         ])
         .split(area);
 
-    render_usage_controls(frame, chunks[0], state);
+    render_usage_controls(frame, chunks[0], state, reset_summary.as_deref());
     render_usage_cards(frame, chunks[1], state);
     render_usage_chart(frame, chunks[2], state);
     render_top_models(frame, chunks[3], state);
 }
 
-fn usage_cards_height(width: u16) -> u16 {
-    if width >= 150 {
-        8
-    } else {
-        17
-    }
-}
-
 fn render_activity(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let cards_height = usage_cards_height(area.width);
+    let cards_height = usage_cards_height(state, area.width);
+    let reset_summary = reset_summary_text(state);
+    let controls_height = usage_controls_height(reset_summary.as_deref(), area.width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(controls_height),
             Constraint::Length(cards_height),
             Constraint::Min(1),
         ])
         .split(area);
 
-    render_activity_controls(frame, chunks[0], state);
+    render_activity_controls(frame, chunks[0], state, reset_summary.as_deref());
     render_usage_cards(frame, chunks[1], state);
     render_activity_heatmaps(frame, chunks[2], state);
 }
 
-fn render_activity_controls(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+fn render_activity_controls(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &AppState,
+    reset_summary: Option<&str>,
+) {
+    let reset_height = reset_summary_height(reset_summary, area.width);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(reset_height)])
+        .split(area);
     let row = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(20), Constraint::Min(0)])
-        .split(area);
+        .split(chunks[0]);
 
     let workspace_label = state
         .workspace_path
@@ -308,6 +391,10 @@ fn render_activity_controls(frame: &mut Frame<'_>, area: Rect, state: &AppState)
     ]))
     .alignment(Alignment::Right);
     frame.render_widget(right, row[1]);
+
+    if let Some(text) = reset_summary {
+        render_reset_summary(frame, chunks[1], text);
+    }
 }
 
 fn render_activity_heatmaps(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -701,11 +788,21 @@ fn write_text(
     }
 }
 
-fn render_usage_controls(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+fn render_usage_controls(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &AppState,
+    reset_summary: Option<&str>,
+) {
+    let reset_height = reset_summary_height(reset_summary, area.width);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(reset_height)])
+        .split(area);
     let row = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(20), Constraint::Min(0)])
-        .split(area);
+        .split(chunks[0]);
 
     let workspace_label = state
         .workspace_path
@@ -749,15 +846,327 @@ fn render_usage_controls(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     ]))
     .alignment(Alignment::Right);
     frame.render_widget(right, row[1]);
+
+    if let Some(text) = reset_summary {
+        render_reset_summary(frame, chunks[1], text);
+    }
+}
+
+#[derive(Debug)]
+struct CardSpec {
+    lines: Vec<String>,
+}
+
+impl CardSpec {
+    fn new(value: String, captions: Vec<String>) -> Self {
+        let mut lines = Vec::with_capacity(1 + captions.len());
+        lines.push(value);
+        for caption in captions {
+            if !caption.trim().is_empty() {
+                lines.push(caption);
+            }
+        }
+        Self { lines }
+    }
+
+    fn required_height(&self, card_width: u16) -> u16 {
+        const CARD_VERTICAL_CHROME: u16 = 3;
+        const CARD_BOTTOM_SPACER: u16 = 1;
+        const CARD_MIN_HEIGHT: u16 = 6;
+        let content_width = card_width.saturating_sub(5).max(1);
+        let mut lines = 0_u16;
+        for line in &self.lines {
+            lines = lines.saturating_add(wrapped_line_count(line, content_width));
+        }
+        CARD_VERTICAL_CHROME
+            .saturating_add(CARD_BOTTOM_SPACER)
+            .saturating_add(lines)
+            .max(CARD_MIN_HEIGHT)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UsageCardLayout {
+    columns: usize,
+    min_card_width: u16,
+}
+
+fn usage_card_layout(width: u16) -> UsageCardLayout {
+    if width >= 180 {
+        // The final two cards use 16% of the row, so use that width for safe measurement.
+        UsageCardLayout {
+            columns: 6,
+            min_card_width: width.saturating_mul(16) / 100,
+        }
+    } else {
+        // The smaller 3-card rows use 34% / 33% / 33%; measure against the narrowest card.
+        UsageCardLayout {
+            columns: 3,
+            min_card_width: width.saturating_mul(33) / 100,
+        }
+    }
+}
+
+fn uses_compact_limit_lines(card_width: u16) -> bool {
+    // Full reset labels need about 33 cells after the card's border and horizontal padding.
+    card_width < 38
+}
+
+fn limits_card_content(state: &AppState, compact: bool) -> (String, Vec<String>) {
+    let (value, caption1, caption2, caption3) = if !state.limits_enabled {
+        let msg = state
+            .limits_error
+            .as_deref()
+            .or(state.limits_notice.as_deref())
+            .unwrap_or("Limits unavailable.");
+        ("Unavailable".to_string(), Some(msg.to_string()), None, None)
+    } else if let Some(limits) = state.limits.as_ref() {
+        format_limits_compact_card_lines(limits, compact)
+    } else {
+        ("Loading...".to_string(), None, None, None)
+    };
+
+    let captions = [caption1, caption2, caption3]
+        .into_iter()
+        .flatten()
+        .collect();
+    (value, captions)
+}
+
+fn usage_card_specs(state: &AppState, card_width: u16) -> Vec<CardSpec> {
+    let snapshot = state.usage.as_ref();
+    let totals = snapshot.map(|snapshot| snapshot.totals_view(state.metric));
+    let today = snapshot.and_then(|snapshot| snapshot.days.last());
+    let (limits_value, limits_captions) =
+        limits_card_content(state, uses_compact_limit_lines(card_width));
+
+    let today_value = today
+        .map(|day| format!("{} tokens", format_count(day.total_tokens)))
+        .unwrap_or_else(|| "--".to_string());
+    let today_captions = vec![
+        today
+            .map(|day| format!("Runs {}", format_count(day.agent_runs)))
+            .unwrap_or_default(),
+        today
+            .map(|day| format!("Time {}", format_duration_words(day.agent_time_ms)))
+            .unwrap_or_default(),
+    ];
+
+    let last7_runs = snapshot
+        .map(|snapshot| {
+            snapshot
+                .last7_days()
+                .iter()
+                .map(|day| day.agent_runs)
+                .sum::<i64>()
+        })
+        .map(|runs| format!("Runs {}", format_count(runs)));
+    let last30_runs = snapshot
+        .map(|snapshot| snapshot.days.iter().map(|day| day.agent_runs).sum::<i64>())
+        .map(|runs| format!("Runs {}", format_count(runs)));
+
+    let mut cards = Vec::with_capacity(6);
+    cards.push(CardSpec::new(limits_value, limits_captions));
+    cards.push(CardSpec::new(today_value, today_captions));
+
+    match state.metric {
+        UsageMetric::Tokens => {
+            let last7 = totals
+                .as_ref()
+                .map(|totals| totals.last7_primary_label.clone())
+                .unwrap_or_else(|| "--".to_string());
+            let avg = totals
+                .as_ref()
+                .map(|totals| totals.avg_primary_label.clone())
+                .unwrap_or_else(|| "--".to_string());
+            let last30 = totals
+                .as_ref()
+                .map(|totals| totals.last30_primary_label.clone())
+                .unwrap_or_else(|| "--".to_string());
+            let cache = totals
+                .as_ref()
+                .map(|totals| totals.cache_label.clone())
+                .unwrap_or_else(|| "--".to_string());
+            let peak = totals
+                .as_ref()
+                .map(|totals| totals.peak_day_label.clone())
+                .unwrap_or_else(|| "--".to_string());
+            let peak_sub = totals
+                .as_ref()
+                .map(|totals| totals.peak_sub_label.clone())
+                .unwrap_or_default();
+            let total = totals
+                .as_ref()
+                .map(|totals| totals.total_label.clone())
+                .unwrap_or_else(|| "--".to_string());
+
+            cards.push(CardSpec::new(
+                last7,
+                vec![
+                    format!("Avg {avg} / day"),
+                    last7_runs.clone().unwrap_or_default(),
+                ],
+            ));
+            cards.push(CardSpec::new(
+                last30,
+                vec![format!("Total {total}"), last30_runs.unwrap_or_default()],
+            ));
+            cards.push(CardSpec::new(
+                cache,
+                vec!["Last 7 days".to_string(), last7_runs.unwrap_or_default()],
+            ));
+            cards.push(CardSpec::new(peak, vec![peak_sub]));
+        }
+        UsageMetric::Time => {
+            let last7 = totals
+                .as_ref()
+                .map(|totals| totals.last7_primary_label.clone())
+                .unwrap_or_else(|| "--".to_string());
+            let avg = totals
+                .as_ref()
+                .map(|totals| totals.avg_primary_label.clone())
+                .unwrap_or_else(|| "--".to_string());
+            let last30 = totals
+                .as_ref()
+                .map(|totals| totals.last30_primary_label.clone())
+                .unwrap_or_else(|| "--".to_string());
+            let runs = totals
+                .as_ref()
+                .map(|totals| totals.runs_label.clone())
+                .unwrap_or_else(|| "--".to_string());
+            let peak = totals
+                .as_ref()
+                .map(|totals| totals.peak_day_label.clone())
+                .unwrap_or_else(|| "--".to_string());
+            let peak_sub = totals
+                .as_ref()
+                .map(|totals| totals.peak_sub_label.clone())
+                .unwrap_or_default();
+            let total = totals
+                .as_ref()
+                .map(|totals| totals.total_label.clone())
+                .unwrap_or_else(|| "--".to_string());
+
+            cards.push(CardSpec::new(
+                last7,
+                vec![format!("Avg {avg} / day"), last7_runs.unwrap_or_default()],
+            ));
+            cards.push(CardSpec::new(
+                last30,
+                vec![format!("Total {total}"), last30_runs.unwrap_or_default()],
+            ));
+            cards.push(CardSpec::new(runs, vec!["Last 7 days".to_string()]));
+            cards.push(CardSpec::new(peak, vec![peak_sub]));
+        }
+        UsageMetric::Runs => {
+            let last7 = totals
+                .as_ref()
+                .map(|totals| totals.last7_primary_label.clone())
+                .unwrap_or_else(|| "--".to_string());
+            let avg = totals
+                .as_ref()
+                .map(|totals| totals.avg_primary_label.clone())
+                .unwrap_or_else(|| "--".to_string());
+            let last30 = totals
+                .as_ref()
+                .map(|totals| totals.last30_primary_label.clone())
+                .unwrap_or_else(|| "--".to_string());
+            let peak = totals
+                .as_ref()
+                .map(|totals| totals.peak_day_label.clone())
+                .unwrap_or_else(|| "--".to_string());
+            let peak_sub = totals
+                .as_ref()
+                .map(|totals| totals.peak_sub_label.clone())
+                .unwrap_or_default();
+            let avg30 = snapshot
+                .filter(|snapshot| !snapshot.days.is_empty())
+                .map(|snapshot| {
+                    let total_runs = snapshot.days.iter().map(|day| day.agent_runs).sum::<i64>();
+                    format_count((total_runs as f64 / snapshot.days.len() as f64).round() as i64)
+                })
+                .unwrap_or_else(|| "--".to_string());
+            let tokens7 = snapshot
+                .map(|snapshot| {
+                    format!(
+                        "Tokens {}",
+                        format_tokens_compact(snapshot.totals.last7_days_tokens)
+                    )
+                })
+                .unwrap_or_else(|| "--".to_string());
+            let tokens30 = snapshot
+                .map(|snapshot| {
+                    format!(
+                        "Tokens {}",
+                        format_tokens_compact(snapshot.totals.last30_days_tokens)
+                    )
+                })
+                .unwrap_or_else(|| "--".to_string());
+            let time7 = snapshot
+                .map(|snapshot| {
+                    let total_ms = snapshot
+                        .last7_days()
+                        .iter()
+                        .map(|day| day.agent_time_ms)
+                        .sum::<i64>();
+                    format_duration_compact(total_ms)
+                })
+                .unwrap_or_else(|| "--".to_string());
+
+            cards.push(CardSpec::new(
+                last7,
+                vec![format!("Avg {avg} / day"), tokens7],
+            ));
+            cards.push(CardSpec::new(
+                last30,
+                vec![format!("Avg {avg30} / day"), tokens30],
+            ));
+            cards.push(CardSpec::new(time7, vec!["Last 7 days".to_string()]));
+            cards.push(CardSpec::new(peak, vec![peak_sub]));
+        }
+    }
+
+    cards
+}
+
+fn usage_card_row_heights(state: &AppState, width: u16) -> Vec<u16> {
+    let layout = usage_card_layout(width);
+    let card_width = layout.min_card_width.max(1);
+    let cards = usage_card_specs(state, card_width);
+    let mut row_heights = Vec::with_capacity(cards.len().div_ceil(layout.columns));
+    for row in cards.chunks(layout.columns) {
+        row_heights.push(card_row_height(row, card_width));
+    }
+    row_heights
+}
+
+fn card_row_height(cards: &[CardSpec], card_width: u16) -> u16 {
+    let mut height = 0_u16;
+    for card in cards {
+        height = height.max(card.required_height(card_width));
+    }
+    height
+}
+
+fn usage_cards_height(state: &AppState, width: u16) -> u16 {
+    let mut total = 0_u16;
+    for height in usage_card_row_heights(state, width) {
+        total = total.saturating_add(height);
+    }
+    total
 }
 
 fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    // With an extra LIMITS card, we prefer 2 rows unless the layout is wide enough.
-    let two_rows = area.width < 180 && area.height >= 12;
+    let card_layout = usage_card_layout(area.width);
+    let row_heights = usage_card_row_heights(state, area.width);
+    let two_rows = row_heights.len() > 1;
     let (row1, row2) = if two_rows {
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .constraints([
+                Constraint::Length(row_heights[0]),
+                Constraint::Length(row_heights[1]),
+            ])
             .split(area);
         (Some(rows[0]), Some(rows[1]))
     } else {
@@ -782,7 +1191,7 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             .unwrap_or("Limits unavailable.");
         ("Unavailable".to_string(), Some(msg.to_string()), None, None)
     } else if let Some(l) = state.limits.as_ref() {
-        format_limits_compact_card_lines(l)
+        format_limits_compact_card_lines(l, uses_compact_limit_lines(card_layout.min_card_width))
     } else {
         ("Loading...".to_string(), None, None, None)
     };
@@ -1862,6 +2271,13 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
             Line::from("  ?    - toggle help"),
             Line::from("  q/Esc - quit"),
         ]),
+        ActiveScreen::LimitResets => Text::from(vec![
+            Line::from("Keys:"),
+            Line::from("  r/F5 - refresh reset credits"),
+            Line::from("  s/F2 - switch screen"),
+            Line::from("  ?    - toggle help"),
+            Line::from("  q/Esc - quit"),
+        ]),
         ActiveScreen::Read => Text::from(vec![Line::from("Keys:"), Line::from("  q/Esc - quit")]),
     };
     frame.render_widget(
@@ -1985,11 +2401,249 @@ fn card_with_captions(title: &str, value: &str, captions: &[Option<&str>]) -> Pa
             )));
         }
     }
+    lines.push(Line::from(""));
 
     Paragraph::new(Text::from(lines))
         .block(block)
         .alignment(Alignment::Left)
         .wrap(Wrap { trim: true })
+}
+
+fn wrapped_line_count(text: &str, width: u16) -> u16 {
+    let width = usize::from(width.max(1));
+    let mut total = 0_u16;
+
+    for logical_line in text.split('\n') {
+        let mut line_width = 0_usize;
+        let mut line_count = 0_u16;
+        for word in logical_line.split_whitespace() {
+            let word_width = UnicodeWidthStr::width(word);
+            if line_width == 0 {
+                if word_width > width {
+                    line_count = line_count.saturating_add(word_width.div_ceil(width) as u16);
+                } else {
+                    line_width = word_width;
+                }
+                continue;
+            }
+
+            if word_width > width || line_width.saturating_add(1 + word_width) > width {
+                line_count = line_count.saturating_add(1);
+                if word_width > width {
+                    line_count = line_count.saturating_add(word_width.div_ceil(width) as u16);
+                    line_width = 0;
+                } else {
+                    line_width = word_width;
+                }
+            } else {
+                line_width = line_width.saturating_add(1 + word_width);
+            }
+        }
+
+        if line_width > 0 || line_count == 0 {
+            line_count = line_count.saturating_add(1);
+        }
+        total = total.saturating_add(line_count);
+    }
+
+    total.max(1)
+}
+
+fn reset_credit_expiration_label(expires_at: i64) -> Option<String> {
+    let ms = crate::codex_rpc::normalize_epoch_millis(expires_at);
+    let dt = Local.timestamp_millis_opt(ms).single()?;
+    Some(format!(
+        "{} {}, {}",
+        dt.day(),
+        dt.format("%b"),
+        dt.format("%H:%M")
+    ))
+}
+
+fn reset_summary_text(state: &AppState) -> Option<String> {
+    reset_summary_for_limits(state.limits.as_ref()?)
+}
+
+fn reset_summary_for_limits(limits: &crate::codex_rpc::AccountRateLimits) -> Option<String> {
+    let available = limits.reset_credits_available?;
+    let mut text = format!("Resets: {available} available");
+    let earliest_expiry = limits
+        .reset_credits
+        .as_deref()
+        .and_then(|credits| credits.iter().filter_map(|credit| credit.expires_at).min());
+    if let Some(expiry) = earliest_expiry.and_then(reset_credit_expiration_label) {
+        text.push_str(" | earliest expires ");
+        text.push_str(&expiry);
+    }
+    Some(text)
+}
+
+fn reset_summary_display_text(text: &str) -> String {
+    format!("LIMIT RESETS  {text}")
+}
+
+fn reset_summary_height(summary: Option<&str>, width: u16) -> u16 {
+    summary
+        .map(reset_summary_display_text)
+        .map(|text| wrapped_line_count(&text, width).saturating_add(1))
+        .unwrap_or(0)
+}
+
+fn usage_controls_height(summary: Option<&str>, width: u16) -> u16 {
+    1_u16.saturating_add(reset_summary_height(summary, width))
+}
+
+fn render_reset_summary(frame: &mut Frame<'_>, area: Rect, text: &str) {
+    let line = Line::from(vec![
+        Span::styled(" LIMIT RESETS ", Style::default().fg(Color::Gray)),
+        Span::styled(text.to_string(), Style::default().fg(Color::Cyan)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![line, Line::from("")])).wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_limit_resets(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let summary = reset_summary_text(state);
+    let summary_height = reset_summary_height(summary.as_deref(), area.width);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(summary_height), Constraint::Min(0)])
+        .split(area);
+
+    if let Some(text) = summary.as_deref() {
+        render_reset_summary(frame, chunks[0], text);
+    }
+    render_limit_reset_details(frame, chunks[1], state);
+}
+
+fn reset_credit_date_time_label(timestamp: i64) -> Option<String> {
+    let ms = crate::codex_rpc::normalize_epoch_millis(timestamp);
+    let dt = Local.timestamp_millis_opt(ms).single()?;
+    if dt.date_naive() == Local::now().date_naive() {
+        Some(format!("today {}", dt.format("%H:%M")))
+    } else {
+        Some(format!(
+            "{} {}, {}",
+            dt.day(),
+            dt.format("%b"),
+            dt.format("%H:%M")
+        ))
+    }
+}
+
+fn render_limit_reset_details(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .padding(Padding {
+            left: 2,
+            right: 1,
+            top: 1,
+            bottom: 0,
+        })
+        .title(Span::styled(
+            " Available reset credits ",
+            Style::default().fg(Color::Gray),
+        ));
+
+    let text = if !state.limits_enabled {
+        let message = state
+            .limits_error
+            .as_deref()
+            .or(state.limits_notice.as_deref())
+            .unwrap_or("Limits unavailable.");
+        Text::from(Line::from(Span::styled(
+            message.to_string(),
+            Style::default().fg(Color::Gray),
+        )))
+    } else {
+        match state.limits.as_ref() {
+            None => Text::from(Line::from(Span::styled(
+                "Loading reset credits...",
+                Style::default().fg(Color::Gray),
+            ))),
+            Some(limits) => match limits.reset_credits.as_deref() {
+                None => Text::from(vec![
+                    Line::from("Codex returned the reset-credit count but no individual details."),
+                    Line::from(Span::styled(
+                        "Refresh later to check whether expiration dates become available.",
+                        Style::default().fg(Color::Gray),
+                    )),
+                ]),
+                Some(credits) if credits.is_empty() => Text::from(Line::from(Span::styled(
+                    "No reset credits are currently available.",
+                    Style::default().fg(Color::Gray),
+                ))),
+                Some(credits) => reset_credit_details_text(credits),
+            },
+        }
+    };
+
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(block)
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn reset_credit_details_text(credits: &[crate::codex_rpc::RateLimitResetCredit]) -> Text<'static> {
+    let mut lines = Vec::with_capacity(credits.len().saturating_mul(4));
+    for (index, credit) in credits.iter().enumerate() {
+        if index > 0 {
+            lines.push(Line::from(""));
+        }
+        let title = credit
+            .title
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("Reset credit {}", index + 1));
+        lines.push(Line::from(Span::styled(
+            title,
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+
+        let status = credit.status.as_deref().unwrap_or("Unknown");
+        let expires = credit
+            .expires_at
+            .and_then(reset_credit_date_time_label)
+            .map(|value| format!("expires {value}"))
+            .unwrap_or_else(|| "expiration unavailable".to_string());
+        let granted = credit
+            .granted_at
+            .and_then(reset_credit_date_time_label)
+            .map(|value| format!("granted {value}"));
+        let reset_type = credit.reset_type.as_deref();
+        let mut metadata = format!("{status} | {expires}");
+        if let Some(granted) = granted {
+            metadata.push_str(" | ");
+            metadata.push_str(&granted);
+        }
+        if let Some(reset_type) = reset_type {
+            metadata.push_str(" | ");
+            metadata.push_str(reset_type);
+        }
+        lines.push(Line::from(Span::styled(
+            metadata,
+            Style::default().fg(Color::Cyan),
+        )));
+
+        if let Some(description) = credit
+            .description
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            lines.push(Line::from(Span::styled(
+                description.to_string(),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+    }
+    Text::from(lines)
 }
 
 fn format_window_label(window_duration_mins: f64) -> Option<String> {
@@ -2033,9 +2687,22 @@ fn resets_label(resets_at: Option<i64>) -> Option<String> {
     }
 }
 
+fn reset_compact_label(resets_at: Option<i64>) -> Option<String> {
+    let raw = resets_at?;
+    let ms = crate::codex_rpc::normalize_epoch_millis(raw);
+    let dt = Local.timestamp_millis_opt(ms).single()?;
+    let today = Local::now().date_naive();
+    if dt.date_naive() == today {
+        Some(dt.format("%H:%M").to_string())
+    } else {
+        Some(format!("{} {}", dt.day(), dt.format("%b")))
+    }
+}
+
 fn format_limit_compact_line(
     label_with_colon: &str,
     window: Option<&crate::codex_rpc::RateLimitWindow>,
+    compact: bool,
 ) -> String {
     // Match requested alignment:
     // 5h limit: 100% (resets 20:43)
@@ -2046,6 +2713,16 @@ fn format_limit_compact_line(
         return format!("{label}--");
     };
     let pct = percent_left_value(w.used_percent);
+    if compact {
+        let label = label_with_colon
+            .trim_end_matches(':')
+            .strip_suffix(" limit")
+            .unwrap_or(label_with_colon.trim_end_matches(':'));
+        let reset = reset_compact_label(w.resets_at)
+            .map(|value| format!(" | {value}"))
+            .unwrap_or_default();
+        return format!("{label}: {pct}{reset}");
+    }
     let resets = resets_label(w.resets_at)
         .map(|s| format!(" ({s})"))
         .unwrap_or_default();
@@ -2055,27 +2732,30 @@ fn format_limit_compact_line(
 fn format_rolling_limit_lines(
     primary: Option<&crate::codex_rpc::RateLimitWindow>,
     secondary: Option<&crate::codex_rpc::RateLimitWindow>,
+    compact: bool,
 ) -> (String, String) {
     let primary_label = primary
         .and_then(|w| w.window_duration_mins)
         .and_then(format_window_label)
         .map(|w| format!("{w} limit:"))
         .unwrap_or_else(|| "5h limit:".to_string());
-    let l1 = format_limit_compact_line(&primary_label, primary);
-    let l2 = format_limit_compact_line("Weekly:", secondary);
+    let l1 = format_limit_compact_line(&primary_label, primary, compact);
+    let l2 = format_limit_compact_line(if compact { "7d:" } else { "Weekly:" }, secondary, compact);
     (l1, l2)
 }
 
 fn format_limits_compact_card_lines(
     l: &crate::codex_rpc::AccountRateLimits,
+    compact: bool,
 ) -> (String, Option<String>, Option<String>, Option<String>) {
     let (rolling_primary, rolling_secondary) = rolling_windows_for_limits(l);
-    let (primary, secondary) = format_rolling_limit_lines(rolling_primary, rolling_secondary);
-    if let Some((monthly, used)) = format_individual_limit_compact_lines(l) {
+    let (primary, secondary) =
+        format_rolling_limit_lines(rolling_primary, rolling_secondary, compact);
+    if let Some((monthly, used)) = format_individual_limit_compact_lines(l, compact) {
         return (monthly, Some(used), Some(primary), Some(secondary));
     }
 
-    if let Some(extra) = format_extra_bucket_compact_line(l) {
+    if let Some(extra) = format_extra_bucket_compact_line(l, compact) {
         let credits = format_credits_compact_line(l).unwrap_or_else(|| "Credits:  --".to_string());
         (primary, Some(secondary), Some(extra), Some(credits))
     } else {
@@ -2102,6 +2782,7 @@ fn rolling_windows_for_limits(
 
 fn format_individual_limit_compact_lines(
     l: &crate::codex_rpc::AccountRateLimits,
+    compact: bool,
 ) -> Option<(String, String)> {
     let individual_limit = l.individual_limit.as_ref().or_else(|| {
         l.buckets
@@ -2115,9 +2796,15 @@ fn format_individual_limit_compact_lines(
         .filter(|v| v.is_finite())
         .map(|v| format!("{}%", v.round() as i64))
         .unwrap_or_else(|| "--%".to_string());
-    let resets = resets_label(individual_limit.resets_at)
-        .map(|s| format!(" ({s})"))
-        .unwrap_or_default();
+    let resets = if compact {
+        reset_compact_label(individual_limit.resets_at)
+            .map(|value| format!(" | {value}"))
+            .unwrap_or_default()
+    } else {
+        resets_label(individual_limit.resets_at)
+            .map(|value| format!(" ({value})"))
+            .unwrap_or_default()
+    };
     let monthly = format!("{:<LABEL_W$}{remaining}{resets}", "Monthly:");
 
     let used = individual_limit
@@ -2134,7 +2821,10 @@ fn format_individual_limit_compact_lines(
     Some((monthly, used_line))
 }
 
-fn format_extra_bucket_compact_line(l: &crate::codex_rpc::AccountRateLimits) -> Option<String> {
+fn format_extra_bucket_compact_line(
+    l: &crate::codex_rpc::AccountRateLimits,
+    compact: bool,
+) -> Option<String> {
     let active_id = l.limit_id.as_deref();
     let active_name = l.limit_name.as_deref();
     let bucket = l.buckets.iter().find(|bucket| {
@@ -2146,7 +2836,7 @@ fn format_extra_bucket_compact_line(l: &crate::codex_rpc::AccountRateLimits) -> 
     })?;
     let window = bucket.primary.as_ref().or(bucket.secondary.as_ref())?;
     let label = compact_bucket_label(bucket);
-    Some(format_limit_compact_line(&label, Some(window)))
+    Some(format_limit_compact_line(&label, Some(window), compact))
 }
 
 fn compact_bucket_label(bucket: &crate::codex_rpc::RateLimitSnapshot) -> String {
@@ -2321,11 +3011,88 @@ mod tests {
     }
 
     #[test]
+    fn card_row_uses_the_tallest_measured_card() {
+        let short = CardSpec::new("42".to_string(), vec!["One line".to_string()]);
+        let tall = CardSpec::new(
+            "Weekly limit".to_string(),
+            vec!["Resets: 3 available | earliest expires 21 Jul".to_string()],
+        );
+        let width = 20;
+        let expected = tall.required_height(width);
+
+        assert_eq!(card_row_height(&[short, tall], width), expected);
+    }
+
+    #[test]
+    fn card_format_density_uses_the_actual_card_width() {
+        let six_columns = usage_card_layout(180);
+        assert_eq!(six_columns.columns, 6);
+        assert_eq!(six_columns.min_card_width, 28);
+        assert!(uses_compact_limit_lines(six_columns.min_card_width));
+
+        let three_columns = usage_card_layout(179);
+        assert_eq!(three_columns.columns, 3);
+        assert_eq!(three_columns.min_card_width, 59);
+        assert!(!uses_compact_limit_lines(three_columns.min_card_width));
+    }
+
+    #[test]
+    fn wrapped_line_count_matches_word_wrapping_and_long_words() {
+        assert_eq!(wrapped_line_count("one two three", 7), 2);
+        assert_eq!(wrapped_line_count("abcdefghijk", 10), 2);
+        assert!(wrapped_line_count(footer_hint(ActiveScreen::Usage), 48) > 1);
+    }
+
+    #[test]
+    fn reset_summary_uses_earliest_returned_expiration() {
+        let limits = crate::codex_rpc::AccountRateLimits {
+            limit_id: None,
+            limit_name: None,
+            individual_limit: None,
+            primary: None,
+            secondary: None,
+            credits: None,
+            buckets: Vec::new(),
+            reset_credits_available: Some(3),
+            reset_credits: Some(vec![
+                crate::codex_rpc::RateLimitResetCredit {
+                    id: Some("later".to_string()),
+                    reset_type: Some("codexRateLimits".to_string()),
+                    status: Some("available".to_string()),
+                    granted_at: None,
+                    expires_at: Some(1_784_434_782),
+                    title: None,
+                    description: None,
+                },
+                crate::codex_rpc::RateLimitResetCredit {
+                    id: Some("earlier".to_string()),
+                    reset_type: Some("codexRateLimits".to_string()),
+                    status: Some("available".to_string()),
+                    granted_at: None,
+                    expires_at: Some(1_784_334_782),
+                    title: None,
+                    description: None,
+                },
+            ]),
+        };
+
+        let summary = reset_summary_for_limits(&limits).expect("reset summary");
+        assert!(summary.starts_with("Resets: 3 available | earliest expires "));
+        assert!(summary.contains(", "));
+    }
+
+    #[test]
+    fn reset_summary_height_accounts_for_its_label() {
+        let summary = "Resets: 3 available | earliest expires 18 Jul";
+        assert!(reset_summary_height(Some(summary), 24) > wrapped_line_count(summary, 24));
+        assert_eq!(usage_controls_height(None, 80), 1);
+    }
+
+    #[test]
     fn limits_card_uses_monthly_and_named_rolling_bucket() {
         let limits = crate::codex_rpc::AccountRateLimits {
             limit_id: Some("codex".to_string()),
             limit_name: None,
-            plan_type: Some("enterprise".to_string()),
             individual_limit: Some(crate::codex_rpc::SpendControlLimitSnapshot {
                 limit: Some("60000".to_string()),
                 remaining_percent: Some(99.0),
@@ -2338,7 +3105,6 @@ mod tests {
             buckets: vec![crate::codex_rpc::RateLimitSnapshot {
                 limit_id: Some("codex_bengalfox".to_string()),
                 limit_name: Some("GPT-5.3-Codex-Spark-Preview".to_string()),
-                plan_type: Some("enterprise".to_string()),
                 individual_limit: None,
                 primary: Some(crate::codex_rpc::RateLimitWindow {
                     used_percent: Some(0.0),
@@ -2353,13 +3119,20 @@ mod tests {
                 credits: None,
             }],
             reset_credits_available: None,
+            reset_credits: None,
         };
 
-        let (value, caption1, caption2, caption3) = format_limits_compact_card_lines(&limits);
+        let (value, caption1, caption2, caption3) =
+            format_limits_compact_card_lines(&limits, false);
         assert_eq!(value, "Monthly:  99%");
         assert_eq!(caption1.as_deref(), Some("Credits:  564/60,000 used"));
         assert_eq!(caption2.as_deref(), Some("5h limit: 100%"));
         assert_eq!(caption3.as_deref(), Some("Weekly:   100%"));
+
+        let (_, _, compact_primary, compact_secondary) =
+            format_limits_compact_card_lines(&limits, true);
+        assert_eq!(compact_primary.as_deref(), Some("5h: 100%"));
+        assert_eq!(compact_secondary.as_deref(), Some("7d: 100%"));
     }
 
     #[test]

@@ -64,6 +64,7 @@ enum AppEvent {
 pub(crate) enum ActiveScreen {
     Usage,
     Activity,
+    LimitResets,
     Read,
 }
 
@@ -80,6 +81,21 @@ enum ActivityCommand {
     IncreaseProjects,
     DecreaseProjects,
     ToggleHelp,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LimitResetCommand {
+    RefreshLimits,
+    ToggleHelp,
+}
+
+fn next_active_screen(screen: ActiveScreen) -> ActiveScreen {
+    match screen {
+        ActiveScreen::Usage => ActiveScreen::Activity,
+        ActiveScreen::Activity => ActiveScreen::LimitResets,
+        ActiveScreen::LimitResets => ActiveScreen::Read,
+        ActiveScreen::Read => ActiveScreen::Usage,
+    }
 }
 
 #[derive(Debug)]
@@ -557,11 +573,7 @@ fn handle_input_event(
             (KeyCode::Char('q'), _) => return Ok(InputOutcome::Quit),
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(InputOutcome::Quit),
             (KeyCode::Char('s'), _) | (KeyCode::Char('S'), _) | (KeyCode::F(2), _) => {
-                state.active_screen = match state.active_screen {
-                    ActiveScreen::Usage => ActiveScreen::Activity,
-                    ActiveScreen::Activity => ActiveScreen::Read,
-                    ActiveScreen::Read => ActiveScreen::Usage,
-                };
+                state.active_screen = next_active_screen(state.active_screen);
                 return Ok(InputOutcome::Continue(true));
             }
             (KeyCode::Char('r'), _) | (KeyCode::F(5), _)
@@ -595,6 +607,13 @@ fn handle_input_event(
             };
             let dirty =
                 handle_activity_command(state, command, usage_refresh_tx, limits_refresh_tx);
+            Ok(InputOutcome::Continue(dirty))
+        }
+        ActiveScreen::LimitResets => {
+            let Some(command) = map_event_to_limit_reset_cmd(event) else {
+                return Ok(InputOutcome::Continue(false));
+            };
+            let dirty = handle_limit_reset_command(state, command, limits_refresh_tx);
             Ok(InputOutcome::Continue(dirty))
         }
         ActiveScreen::Read => Ok(InputOutcome::Continue(read::tui::handle_event(
@@ -643,6 +662,24 @@ fn map_event_to_activity_cmd(event: Event) -> Option<ActivityCommand> {
                     Some(ActivityCommand::DecreaseProjects)
                 }
                 (KeyCode::Char('?'), _) => Some(ActivityCommand::ToggleHelp),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn map_event_to_limit_reset_cmd(event: Event) -> Option<LimitResetCommand> {
+    match event {
+        Event::Key(key) => {
+            if key.kind != KeyEventKind::Press {
+                return None;
+            }
+            match (key.code, key.modifiers) {
+                (KeyCode::Char('r'), _) | (KeyCode::F(5), _) => {
+                    Some(LimitResetCommand::RefreshLimits)
+                }
+                (KeyCode::Char('?'), _) => Some(LimitResetCommand::ToggleHelp),
                 _ => None,
             }
         }
@@ -741,6 +778,23 @@ fn handle_activity_command(
         }
         ActivityCommand::RefreshAll => {
             let _ = usage_refresh_tx.try_send(());
+            let _ = limits_refresh_tx.try_send(());
+            true
+        }
+    }
+}
+
+fn handle_limit_reset_command(
+    state: &mut AppState,
+    cmd: LimitResetCommand,
+    limits_refresh_tx: &mpsc::Sender<()>,
+) -> bool {
+    match cmd {
+        LimitResetCommand::ToggleHelp => {
+            state.show_help = !state.show_help;
+            true
+        }
+        LimitResetCommand::RefreshLimits => {
             let _ = limits_refresh_tx.try_send(());
             true
         }
@@ -986,6 +1040,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    #[test]
+    fn screen_cycle_includes_limit_resets() {
+        assert_eq!(
+            next_active_screen(ActiveScreen::Usage),
+            ActiveScreen::Activity
+        );
+        assert_eq!(
+            next_active_screen(ActiveScreen::Activity),
+            ActiveScreen::LimitResets
+        );
+        assert_eq!(
+            next_active_screen(ActiveScreen::LimitResets),
+            ActiveScreen::Read
+        );
+        assert_eq!(next_active_screen(ActiveScreen::Read), ActiveScreen::Usage);
     }
 
     #[test]

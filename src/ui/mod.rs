@@ -2739,38 +2739,88 @@ fn format_limit_compact_line(
 }
 
 fn format_rolling_limit_lines(
-    primary: Option<&crate::codex_rpc::RateLimitWindow>,
-    secondary: Option<&crate::codex_rpc::RateLimitWindow>,
+    short_window: Option<&crate::codex_rpc::RateLimitWindow>,
+    weekly_window: Option<&crate::codex_rpc::RateLimitWindow>,
     compact: bool,
 ) -> (String, String) {
-    let primary_label = primary
+    let short_label = short_window
         .and_then(|w| w.window_duration_mins)
         .and_then(format_window_label)
         .map(|w| format!("{w} limit:"))
         .unwrap_or_else(|| "5h limit:".to_string());
-    let l1 = format_limit_compact_line(&primary_label, primary, compact);
-    let l2 = format_limit_compact_line(if compact { "7d:" } else { "Weekly:" }, secondary, compact);
-    (l1, l2)
+    let weekly_label = if compact { "7d:" } else { "Weekly:" };
+
+    // The newer response can expose the seven-day window as `primary` with no
+    // short window. Keep the populated weekly limit in the card's value slot.
+    if short_window.is_none() && weekly_window.is_some() {
+        let weekly = format_limit_compact_line(weekly_label, weekly_window, compact);
+        let short = format_limit_compact_line(&short_label, short_window, compact);
+        return (weekly, short);
+    }
+
+    let short = format_limit_compact_line(&short_label, short_window, compact);
+    let weekly = format_limit_compact_line(weekly_label, weekly_window, compact);
+    (short, weekly)
 }
 
 fn format_limits_compact_card_lines(
     l: &crate::codex_rpc::AccountRateLimits,
     compact: bool,
 ) -> (String, Option<String>, Option<String>, Option<String>) {
-    let (rolling_primary, rolling_secondary) = rolling_windows_for_limits(l);
-    let (primary, secondary) =
-        format_rolling_limit_lines(rolling_primary, rolling_secondary, compact);
+    let (short_window, weekly_window) = rolling_windows_for_limits(l);
+    let (rolling_first, rolling_second) =
+        format_rolling_limit_lines(short_window, weekly_window, compact);
     if let Some((monthly, used)) = format_individual_limit_compact_lines(l, compact) {
-        return (monthly, Some(used), Some(primary), Some(secondary));
+        return (
+            monthly,
+            Some(used),
+            Some(rolling_first),
+            Some(rolling_second),
+        );
     }
 
     if let Some(extra) = format_extra_bucket_compact_line(l, compact) {
         let credits = format_credits_compact_line(l).unwrap_or_else(|| "Credits:  --".to_string());
-        (primary, Some(secondary), Some(extra), Some(credits))
+        (
+            rolling_first,
+            Some(rolling_second),
+            Some(extra),
+            Some(credits),
+        )
     } else {
         let credits = format_credits_compact_line(l).unwrap_or_else(|| "Credits:  --".to_string());
-        (primary, Some(secondary), Some(credits), None)
+        (rolling_first, Some(rolling_second), Some(credits), None)
     }
+}
+
+const WEEKLY_WINDOW_MINUTES: f64 = 6.0 * 24.0 * 60.0;
+
+fn is_weekly_rolling_window(window: &crate::codex_rpc::RateLimitWindow) -> bool {
+    window
+        .window_duration_mins
+        .is_some_and(|minutes| minutes.is_finite() && minutes >= WEEKLY_WINDOW_MINUTES)
+}
+
+fn classify_rolling_windows<'a>(
+    primary: Option<&'a crate::codex_rpc::RateLimitWindow>,
+    secondary: Option<&'a crate::codex_rpc::RateLimitWindow>,
+) -> (
+    Option<&'a crate::codex_rpc::RateLimitWindow>,
+    Option<&'a crate::codex_rpc::RateLimitWindow>,
+) {
+    let primary_is_weekly = primary.is_some_and(is_weekly_rolling_window);
+    let secondary_is_weekly = secondary.is_some_and(is_weekly_rolling_window);
+
+    if primary_is_weekly {
+        return (secondary.filter(|_| !secondary_is_weekly), primary);
+    }
+    if secondary_is_weekly {
+        return (primary.filter(|_| !primary_is_weekly), secondary);
+    }
+
+    // Older responses use primary/secondary position to mean short/weekly and
+    // do not always include a usable duration. Preserve that shape unchanged.
+    (primary, secondary)
 }
 
 fn rolling_windows_for_limits(
@@ -2780,12 +2830,12 @@ fn rolling_windows_for_limits(
     Option<&crate::codex_rpc::RateLimitWindow>,
 ) {
     if l.primary.is_some() || l.secondary.is_some() {
-        return (l.primary.as_ref(), l.secondary.as_ref());
+        return classify_rolling_windows(l.primary.as_ref(), l.secondary.as_ref());
     }
     l.buckets
         .iter()
         .find(|bucket| bucket.primary.is_some() || bucket.secondary.is_some())
-        .map(|bucket| (bucket.primary.as_ref(), bucket.secondary.as_ref()))
+        .map(|bucket| classify_rolling_windows(bucket.primary.as_ref(), bucket.secondary.as_ref()))
         .unwrap_or((None, None))
 }
 
@@ -3153,6 +3203,41 @@ mod tests {
             format_limits_compact_card_lines(&limits, true);
         assert_eq!(compact_primary.as_deref(), Some("5h: 100%"));
         assert_eq!(compact_secondary.as_deref(), Some("7d: 100%"));
+    }
+
+    #[test]
+    fn limits_card_treats_weekly_primary_as_weekly() {
+        let limits = crate::codex_rpc::AccountRateLimits {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            individual_limit: None,
+            primary: Some(crate::codex_rpc::RateLimitWindow {
+                used_percent: Some(4.0),
+                window_duration_mins: Some(10080.0),
+                resets_at: None,
+            }),
+            secondary: None,
+            credits: None,
+            buckets: Vec::new(),
+            reset_credits_available: None,
+            reset_credits: None,
+        };
+
+        let (short_window, weekly_window) = rolling_windows_for_limits(&limits);
+        assert!(short_window.is_none());
+        assert_eq!(
+            weekly_window.and_then(|window| window.window_duration_mins),
+            Some(10080.0)
+        );
+
+        let (value, caption1, _, _) = format_limits_compact_card_lines(&limits, false);
+        assert_eq!(value, "Weekly:   96%");
+        assert_eq!(caption1.as_deref(), Some("5h limit: --"));
+
+        let (compact_value, compact_caption1, _, _) =
+            format_limits_compact_card_lines(&limits, true);
+        assert_eq!(compact_value, "7d: 96%");
+        assert_eq!(compact_caption1.as_deref(), Some("5h limit: --"));
     }
 
     #[test]

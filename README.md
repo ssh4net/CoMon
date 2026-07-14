@@ -1,5 +1,4 @@
-<img width="1649" height="862" alt="SOuJoN2ooX" src="https://github.com/user-attachments/assets/a6c27de1-d345-4dc7-a7b6-68c296a3e9f4" />
-
+<img width="1298" height="1050" alt="WindowsTerminal_dhfDXW9bI6" src="https://github.com/user-attachments/assets/15d36486-3406-4680-90c1-18d1d1d918db" />
 # comon
 
 Single-binary, cross-platform TUI for:
@@ -10,10 +9,10 @@ Single-binary, cross-platform TUI for:
 
 See `CHANGELOG.md` for release history.
 
-<img width="1647" height="861" alt="Dkh7CxLgx7" src="https://github.com/user-attachments/assets/edec765d-0924-493b-8c10-cb32bca867a9" />
-
-<img width="2088" height="952" alt="WindowsTerminal_nrizljNtk5" src="https://github.com/user-attachments/assets/cf2ac2e7-3a94-48cd-9d3b-1a4a98016f45" />
-<img width="2088" height="952" alt="WindowsTerminal_HjIAOZQKWE" src="https://github.com/user-attachments/assets/4e3eed0a-d3aa-4ae5-bc4e-c6e5400bc1dd" />
+<img width="1298" height="1050" alt="WindowsTerminal_HTSsSPVKmE" src="https://github.com/user-attachments/assets/96719893-3cfc-4d3d-8d44-06721df8e14c" />
+<img width="1298" height="1050" alt="WindowsTerminal_qoqii76JKv" src="https://github.com/user-attachments/assets/15828746-2591-4871-a84c-f1d70e83ac5a" />
+<img width="1298" height="1050" alt="WindowsTerminal_qoqii76JKv" src="https://github.com/user-attachments/assets/748b0ba4-4c1a-4383-8f02-cb1abddacebb" />
+<img width="1298" height="1050" alt="WindowsTerminal_yiKe3HUtMO" src="https://github.com/user-attachments/assets/7a1c4ff5-3401-4f97-92f5-acacb3eb7b5b" />
 
 
 ## Requirements

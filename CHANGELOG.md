@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+- Added a persisted `n` shortcut to cycle display formatting through Classic, System Compact, and System Full for numbers, dates, times, and calendar labels.
+- Clarified token pair charts with the `TOKENS (TOTAL / NON-CACHED)` heading.
+- Added compact `K/M/B/T` notation for large dashboard token values in System Compact mode, including values inside vertical chart bars. System Full keeps those values expanded, while Classic output remains unchanged.
+
 ## 0.3.6 - 2026-06-05
 
 - Added `--live-limits auto|on|off` so app-only installs can run without a live-limits spawn error.

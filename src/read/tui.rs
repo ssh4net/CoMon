@@ -1,8 +1,10 @@
+use crate::locale::{DisplayFormatter, DisplayStyle};
 use crate::read::scan::{
     load_session_detail, truncate_single_line, Catalog, ProjectRecord, SessionDetail,
     SessionSummary,
 };
 use anyhow::Result;
+use chrono::{DateTime, Local};
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -321,7 +323,12 @@ fn click_session_row(state: &mut BrowserState, row: u16) -> bool {
     true
 }
 
-pub(crate) fn render(frame: &mut Frame<'_>, area: Rect, state: &mut BrowserState) {
+pub(crate) fn render(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut BrowserState,
+    formatter: DisplayFormatter<'_>,
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -331,15 +338,20 @@ pub(crate) fn render(frame: &mut Frame<'_>, area: Rect, state: &mut BrowserState
         ])
         .split(area);
 
-    render_header(frame, chunks[0], state);
+    render_header(frame, chunks[0], state, formatter);
     state.layout = match state.view {
-        ViewMode::Projects => render_projects_view(frame, chunks[1], state),
-        ViewMode::Sessions => render_sessions_view(frame, chunks[1], state),
+        ViewMode::Projects => render_projects_view(frame, chunks[1], state, formatter),
+        ViewMode::Sessions => render_sessions_view(frame, chunks[1], state, formatter),
     };
-    render_footer(frame, chunks[2], state);
+    render_footer(frame, chunks[2], state, formatter);
 }
 
-fn render_header(frame: &mut Frame<'_>, area: Rect, state: &BrowserState) {
+fn render_header(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &BrowserState,
+    formatter: DisplayFormatter<'_>,
+) {
     let row = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(32), Constraint::Length(30)])
@@ -359,9 +371,9 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &BrowserState) {
 
     let summary = format!(
         "{} projects  {} files  {} skipped",
-        state.catalog.projects.len(),
-        state.catalog.files_scanned,
-        state.catalog.files_skipped
+        formatter.format_usize(state.catalog.projects.len()),
+        formatter.format_usize(state.catalog.files_scanned),
+        formatter.format_usize(state.catalog.files_skipped)
     );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -372,7 +384,12 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &BrowserState) {
     );
 }
 
-fn render_projects_view(frame: &mut Frame<'_>, area: Rect, state: &mut BrowserState) -> UiLayout {
+fn render_projects_view(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut BrowserState,
+    formatter: DisplayFormatter<'_>,
+) -> UiLayout {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
@@ -401,7 +418,7 @@ fn render_projects_view(frame: &mut Frame<'_>, area: Rect, state: &mut BrowserSt
         .highlight_symbol(">> ");
     frame.render_stateful_widget(list, columns[0], &mut state.project_state);
 
-    let detail_text = render_project_detail(state.selected_project());
+    let detail_text = render_project_detail(state.selected_project(), formatter);
     frame.render_widget(
         Paragraph::new(detail_text)
             .block(
@@ -419,7 +436,12 @@ fn render_projects_view(frame: &mut Frame<'_>, area: Rect, state: &mut BrowserSt
     }
 }
 
-fn render_sessions_view(frame: &mut Frame<'_>, area: Rect, state: &mut BrowserState) -> UiLayout {
+fn render_sessions_view(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut BrowserState,
+    formatter: DisplayFormatter<'_>,
+) -> UiLayout {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
@@ -434,7 +456,7 @@ fn render_sessions_view(frame: &mut Frame<'_>, area: Rect, state: &mut BrowserSt
                 .map(|session| {
                     let label = format!(
                         "{}  {}",
-                        session.started_at_label,
+                        session_started_label(session, formatter),
                         truncate_single_line(&session.title, 64)
                     );
                     ListItem::new(Line::from(label))
@@ -458,8 +480,11 @@ fn render_sessions_view(frame: &mut Frame<'_>, area: Rect, state: &mut BrowserSt
         .highlight_symbol(">> ");
     frame.render_stateful_widget(list, columns[0], &mut state.session_state);
 
-    let detail_text =
-        render_session_detail(state.selected_session(), state.selected_session_detail());
+    let detail_text = render_session_detail(
+        state.selected_session(),
+        state.selected_session_detail(),
+        formatter,
+    );
     frame.render_widget(
         Paragraph::new(detail_text)
             .block(
@@ -477,7 +502,10 @@ fn render_sessions_view(frame: &mut Frame<'_>, area: Rect, state: &mut BrowserSt
     }
 }
 
-fn render_project_detail(project: Option<&ProjectRecord>) -> Text<'static> {
+fn render_project_detail(
+    project: Option<&ProjectRecord>,
+    formatter: DisplayFormatter<'_>,
+) -> Text<'static> {
     let Some(project) = project else {
         return Text::from("No projects found.");
     };
@@ -485,7 +513,7 @@ fn render_project_detail(project: Option<&ProjectRecord>) -> Text<'static> {
     let latest = project
         .sessions
         .first()
-        .map(|session| session.started_at_label.clone())
+        .map(|session| session_started_label(session, formatter))
         .unwrap_or_else(|| "--".to_string());
 
     let mut lines = vec![
@@ -500,7 +528,7 @@ fn render_project_detail(project: Option<&ProjectRecord>) -> Text<'static> {
         Line::from(vec![
             Span::styled("SESSIONS", Style::default().fg(Color::Gray)),
             Span::raw("  "),
-            Span::raw(project.sessions.len().to_string()),
+            Span::raw(formatter.format_usize(project.sessions.len())),
         ]),
         Line::from(vec![
             Span::styled("LATEST", Style::default().fg(Color::Gray)),
@@ -519,7 +547,7 @@ fn render_project_detail(project: Option<&ProjectRecord>) -> Text<'static> {
     for session in project.sessions.iter().take(10) {
         lines.push(Line::from(format!(
             "{}  {}",
-            session.started_at_label,
+            session_started_label(session, formatter),
             truncate_single_line(&session.title, 72)
         )));
     }
@@ -530,6 +558,7 @@ fn render_project_detail(project: Option<&ProjectRecord>) -> Text<'static> {
 fn render_session_detail(
     session: Option<&SessionSummary>,
     detail: Option<&SessionDetail>,
+    formatter: DisplayFormatter<'_>,
 ) -> Text<'static> {
     let Some(session) = session else {
         return Text::from("No sessions in this project.");
@@ -547,7 +576,7 @@ fn render_session_detail(
         Line::from(vec![
             Span::styled("STARTED", Style::default().fg(Color::Gray)),
             Span::raw("  "),
-            Span::raw(session.started_at_label.clone()),
+            Span::raw(session_started_label(session, formatter)),
         ]),
         Line::from(vec![
             Span::styled("SESSION", Style::default().fg(Color::Gray)),
@@ -620,32 +649,32 @@ fn render_session_detail(
             ),
             Span::raw(format!(
                 "  users={} assistant={} calls={} outputs={} images={}",
-                detail.all_user_turns.len(),
-                detail.assistant_messages,
-                detail.tool_calls,
-                detail.tool_outputs,
-                detail.input_images
+                formatter.format_usize(detail.all_user_turns.len()),
+                formatter.format_usize(detail.assistant_messages),
+                formatter.format_usize(detail.tool_calls),
+                formatter.format_usize(detail.tool_outputs),
+                formatter.format_usize(detail.input_images)
             )),
         ]));
         if let Some(total_tokens) = detail.total_tokens {
             lines.push(Line::from(vec![
                 Span::styled("TOKENS", Style::default().fg(Color::Gray)),
                 Span::raw("  "),
-                Span::raw(total_tokens.to_string()),
+                Span::raw(formatter.format_count(total_tokens)),
             ]));
         }
         if let Some(input_tokens) = detail.input_tokens {
             lines.push(Line::from(vec![
                 Span::styled("INPUT", Style::default().fg(Color::Gray)),
                 Span::raw("  "),
-                Span::raw(input_tokens.to_string()),
+                Span::raw(formatter.format_count(input_tokens)),
             ]));
         }
         if let Some(output_tokens) = detail.output_tokens {
             lines.push(Line::from(vec![
                 Span::styled("OUTPUT", Style::default().fg(Color::Gray)),
                 Span::raw("  "),
-                Span::raw(output_tokens.to_string()),
+                Span::raw(formatter.format_count(output_tokens)),
             ]));
         }
         if detail.reasoning_encrypted {
@@ -679,7 +708,26 @@ fn render_session_detail(
     Text::from(lines)
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &BrowserState) {
+fn session_started_label(session: &SessionSummary, formatter: DisplayFormatter<'_>) -> String {
+    if formatter.style() == DisplayStyle::Classic {
+        return session.started_at_label.clone();
+    }
+    let Some(raw) = session.started_at_raw.as_deref() else {
+        return session.started_at_label.clone();
+    };
+    let Some(parsed) = DateTime::parse_from_rfc3339(raw).ok() else {
+        return session.started_at_label.clone();
+    };
+    let local = parsed.with_timezone(&Local);
+    formatter.format_session_datetime(local.naive_local())
+}
+
+fn render_footer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &BrowserState,
+    formatter: DisplayFormatter<'_>,
+) {
     let base = match state.view {
         ViewMode::Projects => {
             "Projects: up/down, mouse wheel, enter/right open, s/F2 switch, r/F5 rescan, q quit"
@@ -693,11 +741,18 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &BrowserState) {
         .as_deref()
         .map(|text| truncate_single_line(text, 100))
         .unwrap_or_default();
+    let style = format!("style [n]: {}", formatter.style_label());
     let line = if error.is_empty() {
-        Line::from(vec![Span::styled(base, Style::default().fg(Color::Gray))])
+        Line::from(vec![
+            Span::styled(base, Style::default().fg(Color::Gray)),
+            Span::raw("  "),
+            Span::styled(style, Style::default().fg(Color::Gray)),
+        ])
     } else {
         Line::from(vec![
             Span::styled(base, Style::default().fg(Color::Gray)),
+            Span::raw("  "),
+            Span::styled(style, Style::default().fg(Color::Gray)),
             Span::raw("  "),
             Span::styled(error, Style::default().fg(Color::Red)),
         ])

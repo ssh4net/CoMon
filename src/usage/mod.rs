@@ -1,3 +1,4 @@
+use crate::locale::{DisplayFormatter, DisplayStyle};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Utc, Weekday};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -62,7 +63,7 @@ pub enum ChartRange {
     Month,
 }
 
-pub fn format_compact_kmb(value: u64, max_width: u16) -> String {
+pub fn format_compact_kmb(value: u64, max_width: u16, formatter: DisplayFormatter<'_>) -> String {
     // Examples (depending on width):
     //  1234 -> 1.23K / 1.2K / 1K
     //  12_345_678 -> 12.35M / 12.3M / 12M
@@ -71,7 +72,7 @@ pub fn format_compact_kmb(value: u64, max_width: u16) -> String {
         return String::new();
     }
     if value < 1000 {
-        let s = value.to_string();
+        let s = formatter.format_u64(value);
         return if s.len() <= max_width as usize {
             s
         } else {
@@ -94,7 +95,7 @@ pub fn format_compact_kmb(value: u64, max_width: u16) -> String {
     // In dense layouts, force integer suffixes (e.g. 27M instead of 27.4M).
     // Heuristic: if the label width is <= 5 cells, decimals tend to hurt readability.
     if max_width <= 5 {
-        let s = format_compact_scaled(scaled, suffix, 0);
+        let s = format_compact_scaled(scaled, suffix, 0, formatter);
         return if s.len() <= max_width as usize {
             s
         } else {
@@ -105,14 +106,14 @@ pub fn format_compact_kmb(value: u64, max_width: u16) -> String {
 
     // Prefer 2 decimals, then reduce precision if it doesn't fit.
     for decimals in [2usize, 1usize, 0usize] {
-        let s = format_compact_scaled(scaled, suffix, decimals);
+        let s = format_compact_scaled(scaled, suffix, decimals, formatter);
         if s.len() <= max_width as usize {
             return s;
         }
     }
 
     // Final fallback: "1K/M/B/T"
-    let s = format!("{:.0}{suffix}", scaled.max(0.0).round());
+    let s = formatter.localize_decimal(&format!("{:.0}{suffix}", scaled.max(0.0).round()));
     if s.len() <= max_width as usize {
         return s;
     }
@@ -121,7 +122,12 @@ pub fn format_compact_kmb(value: u64, max_width: u16) -> String {
     s[..max_width as usize].to_string()
 }
 
-fn format_compact_scaled(value: f64, suffix: &str, decimals: usize) -> String {
+fn format_compact_scaled(
+    value: f64,
+    suffix: &str,
+    decimals: usize,
+    formatter: DisplayFormatter<'_>,
+) -> String {
     // Format with fixed decimals, then trim trailing zeros and a trailing dot.
     let mut s = format!("{:.*}", decimals, value.max(0.0));
     if decimals > 0 {
@@ -133,7 +139,7 @@ fn format_compact_scaled(value: f64, suffix: &str, decimals: usize) -> String {
         }
     }
     s.push_str(suffix);
-    s
+    formatter.localize_decimal(&s)
 }
 
 #[derive(Debug, Clone)]
@@ -147,30 +153,19 @@ pub struct UsageDay {
 }
 
 impl UsageDay {
-    pub fn short_label(&self) -> String {
-        // Expect YYYY-MM-DD
-        if self.day.len() == 10 {
-            let month = &self.day[5..7];
-            let day = &self.day[8..10];
-            let month_name = match month {
-                "01" => "Jan",
-                "02" => "Feb",
-                "03" => "Mar",
-                "04" => "Apr",
-                "05" => "May",
-                "06" => "Jun",
-                "07" => "Jul",
-                "08" => "Aug",
-                "09" => "Sep",
-                "10" => "Oct",
-                "11" => "Nov",
-                "12" => "Dec",
-                _ => month,
-            };
-            return format!("{month_name} {day}");
-        }
-        self.day.clone()
+    pub fn short_label(&self, formatter: DisplayFormatter<'_>) -> String {
+        format_day_short(&self.day, formatter)
     }
+}
+
+fn format_day_short(day: &str, formatter: DisplayFormatter<'_>) -> String {
+    // Expect YYYY-MM-DD
+    if day.len() == 10 {
+        if let Ok(date) = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d") {
+            return formatter.format_short_date(date);
+        }
+    }
+    day.to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -250,7 +245,11 @@ impl LocalUsageSnapshot {
             .collect()
     }
 
-    pub fn totals_view(&self, metric: UsageMetric) -> UsageTotalsView {
+    pub fn totals_view(
+        &self,
+        metric: UsageMetric,
+        formatter: DisplayFormatter<'_>,
+    ) -> UsageTotalsView {
         let last7 = self.last7_days();
         let last7_agent_ms: i64 = last7.iter().map(|d| d.agent_time_ms).sum();
         let last30_agent_ms: i64 = self.days.iter().map(|d| d.agent_time_ms).sum();
@@ -265,10 +264,10 @@ impl LocalUsageSnapshot {
                     .max_by_key(|d| d.total_tokens)
                     .filter(|d| d.total_tokens > 0);
                 let peak_day = peak
-                    .map(|d| d.short_label())
+                    .map(|d| d.short_label(formatter))
                     .unwrap_or_else(|| "--".to_string());
                 let peak_tokens = peak.map(|d| d.total_tokens).unwrap_or(0);
-                let sub = format!("{} tokens", format_tokens_compact(peak_tokens));
+                let sub = format!("{} tokens", format_tokens_compact(peak_tokens, formatter));
                 (peak_day, peak_tokens, sub)
             }
             UsageMetric::Time => {
@@ -278,7 +277,7 @@ impl LocalUsageSnapshot {
                     .max_by_key(|d| d.agent_time_ms)
                     .filter(|d| d.agent_time_ms > 0);
                 let peak_day = peak
-                    .map(|d| d.short_label())
+                    .map(|d| d.short_label(formatter))
                     .unwrap_or_else(|| "--".to_string());
                 let peak_ms = peak.map(|d| d.agent_time_ms).unwrap_or(0);
                 let sub = format!("{} agent time", format_duration_compact(peak_ms));
@@ -291,10 +290,10 @@ impl LocalUsageSnapshot {
                     .max_by_key(|d| d.agent_runs)
                     .filter(|d| d.agent_runs > 0);
                 let peak_day = peak
-                    .map(|d| d.short_label())
+                    .map(|d| d.short_label(formatter))
                     .unwrap_or_else(|| "--".to_string());
                 let peak_runs = peak.map(|d| d.agent_runs).unwrap_or(0);
-                let sub = format!("{} runs", format_count(peak_runs));
+                let sub = format!("{} runs", format_count(peak_runs, formatter));
                 (peak_day, peak_runs, sub)
             }
         };
@@ -303,20 +302,31 @@ impl LocalUsageSnapshot {
             UsageMetric::Tokens => UsageTotalsView {
                 last7_primary_label: format!(
                     "{} tokens",
-                    format_tokens_compact(self.totals.last7_days_tokens)
+                    format_tokens_compact(self.totals.last7_days_tokens, formatter)
                 ),
                 last30_primary_label: format!(
                     "{} tokens",
-                    format_tokens_compact(self.totals.last30_days_tokens)
+                    format_tokens_compact(self.totals.last30_days_tokens, formatter)
                 ),
-                avg_primary_label: format_tokens_compact(self.totals.average_daily_tokens),
-                cache_label: format!("{:.1}%", self.totals.cache_hit_rate_percent),
-                total_label: format_count(self.totals.last30_days_tokens),
-                runs_label: format!("{} runs", format_count(last7_runs)),
-                peak_day_label: self.totals.peak_day.as_deref().unwrap_or("--").to_string(),
+                avg_primary_label: format_tokens_compact(
+                    self.totals.average_daily_tokens,
+                    formatter,
+                ),
+                cache_label: format!(
+                    "{}%",
+                    formatter.format_one_decimal(self.totals.cache_hit_rate_percent)
+                ),
+                total_label: format_tokens_overview(self.totals.last30_days_tokens, formatter),
+                runs_label: format!("{} runs", format_count(last7_runs, formatter)),
+                peak_day_label: self
+                    .totals
+                    .peak_day
+                    .as_deref()
+                    .map(|day| format_day_short(day, formatter))
+                    .unwrap_or(peak_day),
                 peak_sub_label: format!(
                     "{} tokens",
-                    format_tokens_compact(self.totals.peak_day_tokens)
+                    format_tokens_compact(self.totals.peak_day_tokens, formatter)
                 ),
             },
             UsageMetric::Time => {
@@ -331,7 +341,7 @@ impl LocalUsageSnapshot {
                     avg_primary_label: format_duration_compact(avg_ms),
                     cache_label: "--".to_string(),
                     total_label: format_duration(last30_agent_ms),
-                    runs_label: format!("{} runs", format_count(last7_runs)),
+                    runs_label: format!("{} runs", format_count(last7_runs, formatter)),
                     peak_day_label: peak_day,
                     peak_sub_label: peak_sub,
                 }
@@ -343,12 +353,12 @@ impl LocalUsageSnapshot {
                     (last7_runs as f64 / last7.len() as f64).round() as i64
                 };
                 UsageTotalsView {
-                    last7_primary_label: format!("{} runs", format_count(last7_runs)),
-                    last30_primary_label: format!("{} runs", format_count(last30_runs)),
-                    avg_primary_label: format_count(avg_7),
+                    last7_primary_label: format!("{} runs", format_count(last7_runs, formatter)),
+                    last30_primary_label: format!("{} runs", format_count(last30_runs, formatter)),
+                    avg_primary_label: format_count(avg_7, formatter),
                     cache_label: "--".to_string(),
-                    total_label: format_count(last30_runs),
-                    runs_label: format!("{} runs", format_count(last7_runs)),
+                    total_label: format_count(last30_runs, formatter),
+                    runs_label: format!("{} runs", format_count(last7_runs, formatter)),
                     peak_day_label: peak_day,
                     peak_sub_label: peak_sub,
                 }
@@ -2384,25 +2394,21 @@ fn days_since_week_start(day: Weekday, first_weekday: Weekday) -> i64 {
     (7 + day - first) % 7
 }
 
-pub fn format_count(value: i64) -> String {
-    let mut n = value.max(0) as u64;
-    if n < 1000 {
-        return n.to_string();
-    }
-    let mut parts: Vec<String> = Vec::new();
-    while n >= 1000 {
-        parts.push(format!("{:03}", n % 1000));
-        n /= 1000;
-    }
-    parts.push(n.to_string());
-    parts.reverse();
-    parts.join(",")
+pub fn format_count(value: i64, formatter: DisplayFormatter<'_>) -> String {
+    formatter.format_count(value)
 }
 
-pub fn format_tokens_compact(value: i64) -> String {
+pub fn format_tokens_overview(value: i64, formatter: DisplayFormatter<'_>) -> String {
+    match formatter.style() {
+        DisplayStyle::Classic | DisplayStyle::SystemFull => format_count(value, formatter),
+        DisplayStyle::SystemCompact => format_tokens_compact(value, formatter),
+    }
+}
+
+pub fn format_tokens_compact(value: i64, formatter: DisplayFormatter<'_>) -> String {
     let v = value.max(0) as u64;
     if v < 1000 {
-        return v.to_string();
+        return formatter.format_u64(v);
     }
 
     let (div, suffix) = if v >= 1_000_000_000_000 {
@@ -2415,7 +2421,7 @@ pub fn format_tokens_compact(value: i64) -> String {
         (1_000f64, "K")
     };
     let scaled = (v as f64) / div;
-    format_compact_scaled(scaled, suffix, 2)
+    format_compact_scaled(scaled, suffix, 2, formatter)
 }
 
 pub fn format_duration_compact(ms: i64) -> String {

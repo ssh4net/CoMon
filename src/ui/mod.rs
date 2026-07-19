@@ -1,7 +1,8 @@
 use crate::app::{ActiveScreen, AppState, ChartOrientation};
+use crate::locale::{DisplayFormatter, DisplayStyle};
 use crate::usage::{
-    format_compact_kmb, format_count, format_duration_compact, format_tokens_compact, ChartRange,
-    ProjectActivity, UsageMetric, ACTIVITY_TIMELINE_WEEKS,
+    format_compact_kmb, format_count, format_duration_compact, format_tokens_compact,
+    format_tokens_overview, ChartRange, ProjectActivity, UsageMetric, ACTIVITY_TIMELINE_WEEKS,
 };
 use anyhow::Result;
 use chrono::{Datelike, Local, NaiveDate, TimeZone, Weekday};
@@ -157,7 +158,9 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
             }
         }
         ActiveScreen::Read => {
-            crate::read::tui::render(frame, inner, &mut state.read_browser);
+            let system_locale = state.system_locale.clone();
+            let formatter = DisplayFormatter::new(state.display_style, &system_locale);
+            crate::read::tui::render(frame, inner, &mut state.read_browser, formatter);
         }
     }
 }
@@ -277,11 +280,12 @@ fn footer_error(state: &AppState) -> String {
 
 fn footer_text(state: &AppState) -> String {
     let hint = footer_hint(state.active_screen);
+    let style = format!("Style [n]: {}", state.formatter().style_label());
     let err = footer_error(state);
     if err.is_empty() {
-        hint.to_string()
+        format!("{hint}  {style}")
     } else {
-        format!("{hint}  {err}")
+        format!("{hint}  {style}  {err}")
     }
 }
 
@@ -291,11 +295,14 @@ fn footer_height(width: u16, state: &AppState) -> u16 {
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let err = footer_error(state);
+    let style = format!("Style [n]: {}", state.formatter().style_label());
     let line = Line::from(vec![
         Span::styled(
             footer_hint(state.active_screen),
             Style::default().fg(Color::Gray),
         ),
+        Span::raw("  "),
+        Span::styled(style, Style::default().fg(Color::Gray)),
         Span::raw(if err.is_empty() { "" } else { "  " }),
         Span::styled(err, Style::default().fg(Color::Red)),
     ]);
@@ -307,20 +314,29 @@ fn render_usage(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let cards_height = usage_cards_height(state, area.width);
     let reset_summary = reset_summary_text(state);
     let controls_height = usage_controls_height(reset_summary.as_deref(), area.width);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(controls_height),
-            Constraint::Length(cards_height),
-            Constraint::Min(8),
-            Constraint::Length(3),
-        ])
-        .split(area);
+    let chunks = usage_layout(area, controls_height, cards_height);
 
     render_usage_controls(frame, chunks[0], state, reset_summary.as_deref());
     render_usage_cards(frame, chunks[1], state);
     render_usage_chart(frame, chunks[2], state);
     render_top_models(frame, chunks[3], state);
+}
+
+fn usage_layout(area: Rect, controls_height: u16, cards_height: u16) -> [Rect; 4] {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(controls_height),
+            Constraint::Length(cards_height),
+            // Cards must keep their measured height. `Min` has higher priority than `Length`
+            // in ratatui, so a short terminal would otherwise collapse the cards to borders in
+            // order to preserve the chart's minimum height. Let the chart consume the remaining
+            // space and degrade first instead.
+            Constraint::Fill(1),
+            Constraint::Length(3),
+        ])
+        .split(area);
+    [chunks[0], chunks[1], chunks[2], chunks[3]]
 }
 
 fn render_activity(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -466,6 +482,7 @@ fn render_activity_heatmaps(frame: &mut Frame<'_>, area: Rect, state: &AppState)
             project,
             state.metric,
             snapshot.activity_first_weekday,
+            state.formatter(),
         );
         y = y.saturating_add(ACTIVITY_PROJECT_STRIDE);
         if y >= inner.y.saturating_add(inner.height) {
@@ -491,6 +508,7 @@ fn render_project_activity_heatmap(
     project: &ProjectActivity,
     metric: UsageMetric,
     first_weekday: Weekday,
+    formatter: DisplayFormatter<'_>,
 ) {
     if area.height < ACTIVITY_PROJECT_HEIGHT || area.width <= ACTIVITY_WEEKDAY_LABEL_WIDTH {
         return;
@@ -509,7 +527,7 @@ fn render_project_activity_heatmap(
     let week_offset = weeks_total.saturating_sub(weeks_visible);
     let grid_x = area.x.saturating_add(ACTIVITY_WEEKDAY_LABEL_WIDTH);
 
-    let header = format_activity_project_header(project, metric, area.width as usize);
+    let header = format_activity_project_header(project, metric, area.width as usize, formatter);
     let buf = frame.buffer_mut();
     write_text(
         buf,
@@ -525,9 +543,9 @@ fn render_project_activity_heatmap(
         project,
         week_offset,
         weeks_visible,
-        grid_x,
+        (grid_x, area.y + 1),
         cell_width,
-        area.y + 1,
+        formatter,
     );
 
     let max_value = project
@@ -546,7 +564,7 @@ fn render_project_activity_heatmap(
             area.x,
             y,
             ACTIVITY_WEEKDAY_LABEL_WIDTH,
-            activity_weekday_label(first_weekday, row),
+            &activity_weekday_label(first_weekday, row, formatter),
             Style::default().fg(Color::Gray),
         );
         for week in 0..weeks_visible {
@@ -567,15 +585,18 @@ fn render_activity_month_labels(
     project: &ProjectActivity,
     week_offset: usize,
     weeks_visible: usize,
-    grid_x: u16,
+    origin: (u16, u16),
     cell_width: u16,
-    y: u16,
+    formatter: DisplayFormatter<'_>,
 ) {
+    let (grid_x, y) = origin;
     let mut next_free_x = grid_x;
     let grid_end = grid_x.saturating_add((weeks_visible as u16).saturating_mul(cell_width));
     for week in 0..weeks_visible {
         let absolute_week = week_offset + week;
-        let Some(label) = activity_month_label_for_week(project, absolute_week, week == 0) else {
+        let Some(label) =
+            activity_month_label_for_week(project, absolute_week, week == 0, formatter)
+        else {
             continue;
         };
         let x = grid_x.saturating_add((week as u16).saturating_mul(cell_width));
@@ -587,11 +608,13 @@ fn render_activity_month_labels(
             buf,
             x,
             y,
-            (label.len() as u16).min(available),
-            label,
+            (UnicodeWidthStr::width(label.as_str()) as u16).min(available),
+            &label,
             Style::default().fg(Color::Gray),
         );
-        next_free_x = x.saturating_add(label.len() as u16).saturating_add(1);
+        next_free_x = x
+            .saturating_add(UnicodeWidthStr::width(label.as_str()) as u16)
+            .saturating_add(1);
     }
 }
 
@@ -599,18 +622,19 @@ fn activity_month_label_for_week(
     project: &ProjectActivity,
     week: usize,
     force: bool,
-) -> Option<&'static str> {
+    formatter: DisplayFormatter<'_>,
+) -> Option<String> {
     let start = week.saturating_mul(7);
     let end = start.saturating_add(7).min(project.days.len());
     let days = project.days.get(start..end)?;
     if force {
         let date = parse_activity_date(&days.first()?.day)?;
-        return Some(month_abbrev(date.month()));
+        return Some(formatter.abbreviated_month(date.month()));
     }
     for day in days {
         let date = parse_activity_date(&day.day)?;
         if date.day() == 1 {
-            return Some(month_abbrev(date.month()));
+            return Some(formatter.abbreviated_month(date.month()));
         }
     }
     None
@@ -620,28 +644,11 @@ fn parse_activity_date(day: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(day, "%Y-%m-%d").ok()
 }
 
-fn month_abbrev(month: u32) -> &'static str {
-    match month {
-        1 => "Jan",
-        2 => "Feb",
-        3 => "Mar",
-        4 => "Apr",
-        5 => "May",
-        6 => "Jun",
-        7 => "Jul",
-        8 => "Aug",
-        9 => "Sep",
-        10 => "Oct",
-        11 => "Nov",
-        12 => "Dec",
-        _ => "",
-    }
-}
-
 fn format_activity_project_header(
     project: &ProjectActivity,
     metric: UsageMetric,
     max_width: usize,
+    formatter: DisplayFormatter<'_>,
 ) -> String {
     let name = activity_project_name(&project.display_path);
     let active_days = project
@@ -649,14 +656,17 @@ fn format_activity_project_header(
         .iter()
         .filter(|day| activity_day_value(day, metric) > 0)
         .count();
-    let total = activity_metric_total_label(project, metric);
+    let total = activity_metric_total_label(project, metric, formatter);
     let last = project
         .last_activity_day
         .as_deref()
-        .map(format_activity_date_short)
+        .map(|day| format_activity_date_short(day, formatter))
         .unwrap_or_else(|| "--".to_string());
     truncate_middle(
-        &format!("[{name}]  {active_days} days  {total}  last {last}"),
+        &format!(
+            "[{name}]  {} days  {total}  last {last}",
+            formatter.format_usize(active_days)
+        ),
         max_width,
     )
 }
@@ -671,24 +681,34 @@ fn activity_project_name(path: &str) -> String {
         .to_string()
 }
 
-fn activity_metric_total_label(project: &ProjectActivity, metric: UsageMetric) -> String {
+fn activity_metric_total_label(
+    project: &ProjectActivity,
+    metric: UsageMetric,
+    formatter: DisplayFormatter<'_>,
+) -> String {
     match metric {
         UsageMetric::Tokens => {
             let total = project.total_tokens.max(0) as u64;
             let out_of_cache = (project.total_tokens - project.cached_input_tokens).max(0) as u64;
-            let pair = format_horizontal_value(total, Some(out_of_cache), UsageMetric::Tokens, 20);
+            let pair = format_horizontal_value(
+                total,
+                Some(out_of_cache),
+                UsageMetric::Tokens,
+                20,
+                formatter,
+            );
             format!("{pair} tokens")
         }
         UsageMetric::Time => format_duration_compact(project.agent_time_ms),
-        UsageMetric::Runs => format!("{} runs", format_count(project.agent_runs)),
+        UsageMetric::Runs => format!("{} runs", format_count(project.agent_runs, formatter)),
     }
 }
 
-fn format_activity_date_short(day: &str) -> String {
+fn format_activity_date_short(day: &str, formatter: DisplayFormatter<'_>) -> String {
     let Some(date) = parse_activity_date(day) else {
         return day.to_string();
     };
-    format!("{} {}", month_abbrev(date.month()), date.day())
+    formatter.format_short_date(date)
 }
 
 fn activity_day_value(day: &crate::usage::UsageDay, metric: UsageMetric) -> i64 {
@@ -715,17 +735,20 @@ fn activity_day_cell_width(grid_width: u16, weeks_total: usize) -> u16 {
     }
 }
 
-fn activity_weekday_label(first_weekday: Weekday, row: usize) -> &'static str {
+fn activity_weekday_label(
+    first_weekday: Weekday,
+    row: usize,
+    formatter: DisplayFormatter<'_>,
+) -> String {
     let monday_row = activity_weekday_row(first_weekday, Weekday::Mon);
     if row < monday_row || !(row - monday_row).is_multiple_of(2) {
-        return "";
+        return String::new();
     }
     match activity_weekday_for_row(first_weekday, row) {
-        Weekday::Mon => "Mon",
-        Weekday::Wed => "Wed",
-        Weekday::Fri => "Fri",
-        Weekday::Sun => "Sun",
-        _ => "",
+        day @ (Weekday::Mon | Weekday::Wed | Weekday::Fri | Weekday::Sun) => {
+            formatter.abbreviated_weekday(day)
+        }
+        _ => String::new(),
     }
 }
 
@@ -913,6 +936,7 @@ fn uses_compact_limit_lines(card_width: u16) -> bool {
 }
 
 fn limits_card_content(state: &AppState, compact: bool) -> (String, Vec<String>) {
+    let formatter = state.formatter();
     let (value, caption1, caption2, caption3) = if !state.limits_enabled {
         let msg = state
             .limits_error
@@ -921,7 +945,7 @@ fn limits_card_content(state: &AppState, compact: bool) -> (String, Vec<String>)
             .unwrap_or("Limits unavailable.");
         ("Unavailable".to_string(), Some(msg.to_string()), None, None)
     } else if let Some(limits) = state.limits.as_ref() {
-        format_limits_compact_card_lines(limits, compact)
+        format_limits_compact_card_lines(limits, compact, formatter)
     } else {
         ("Loading...".to_string(), None, None, None)
     };
@@ -934,18 +958,24 @@ fn limits_card_content(state: &AppState, compact: bool) -> (String, Vec<String>)
 }
 
 fn usage_card_specs(state: &AppState, card_width: u16) -> Vec<CardSpec> {
+    let formatter = state.formatter();
     let snapshot = state.usage.as_ref();
-    let totals = snapshot.map(|snapshot| snapshot.totals_view(state.metric));
+    let totals = snapshot.map(|snapshot| snapshot.totals_view(state.metric, formatter));
     let today = snapshot.and_then(|snapshot| snapshot.days.last());
     let (limits_value, limits_captions) =
         limits_card_content(state, uses_compact_limit_lines(card_width));
 
     let today_value = today
-        .map(|day| format!("{} tokens", format_count(day.total_tokens)))
+        .map(|day| {
+            format!(
+                "{} tokens",
+                format_tokens_overview(day.total_tokens, formatter)
+            )
+        })
         .unwrap_or_else(|| "--".to_string());
     let today_captions = vec![
         today
-            .map(|day| format!("Runs {}", format_count(day.agent_runs)))
+            .map(|day| format!("Runs {}", format_count(day.agent_runs, formatter)))
             .unwrap_or_default(),
         today
             .map(|day| format!("Time {}", format_duration_words(day.agent_time_ms)))
@@ -960,10 +990,10 @@ fn usage_card_specs(state: &AppState, card_width: u16) -> Vec<CardSpec> {
                 .map(|day| day.agent_runs)
                 .sum::<i64>()
         })
-        .map(|runs| format!("Runs {}", format_count(runs)));
+        .map(|runs| format!("Runs {}", format_count(runs, formatter)));
     let last30_runs = snapshot
         .map(|snapshot| snapshot.days.iter().map(|day| day.agent_runs).sum::<i64>())
-        .map(|runs| format!("Runs {}", format_count(runs)));
+        .map(|runs| format!("Runs {}", format_count(runs, formatter)));
 
     let mut cards = Vec::with_capacity(6);
     cards.push(CardSpec::new(limits_value, limits_captions));
@@ -1083,14 +1113,17 @@ fn usage_card_specs(state: &AppState, card_width: u16) -> Vec<CardSpec> {
                 .filter(|snapshot| !snapshot.days.is_empty())
                 .map(|snapshot| {
                     let total_runs = snapshot.days.iter().map(|day| day.agent_runs).sum::<i64>();
-                    format_count((total_runs as f64 / snapshot.days.len() as f64).round() as i64)
+                    format_count(
+                        (total_runs as f64 / snapshot.days.len() as f64).round() as i64,
+                        formatter,
+                    )
                 })
                 .unwrap_or_else(|| "--".to_string());
             let tokens7 = snapshot
                 .map(|snapshot| {
                     format!(
                         "Tokens {}",
-                        format_tokens_compact(snapshot.totals.last7_days_tokens)
+                        format_tokens_compact(snapshot.totals.last7_days_tokens, formatter)
                     )
                 })
                 .unwrap_or_else(|| "--".to_string());
@@ -1098,7 +1131,7 @@ fn usage_card_specs(state: &AppState, card_width: u16) -> Vec<CardSpec> {
                 .map(|snapshot| {
                     format!(
                         "Tokens {}",
-                        format_tokens_compact(snapshot.totals.last30_days_tokens)
+                        format_tokens_compact(snapshot.totals.last30_days_tokens, formatter)
                     )
                 })
                 .unwrap_or_else(|| "--".to_string());
@@ -1157,6 +1190,7 @@ fn usage_cards_height(state: &AppState, width: u16) -> u16 {
 }
 
 fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let formatter = state.formatter();
     let card_layout = usage_card_layout(area.width);
     let row_heights = usage_card_row_heights(state, area.width);
     let two_rows = row_heights.len() > 1;
@@ -1174,7 +1208,7 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     };
 
     let snapshot = state.usage.as_ref();
-    let totals = snapshot.map(|s| s.totals_view(state.metric));
+    let totals = snapshot.map(|s| s.totals_view(state.metric, formatter));
     let today = snapshot.and_then(|s| s.days.last());
 
     // LIMITS card (live from Codex app-server).
@@ -1191,17 +1225,26 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             .unwrap_or("Limits unavailable.");
         ("Unavailable".to_string(), Some(msg.to_string()), None, None)
     } else if let Some(l) = state.limits.as_ref() {
-        format_limits_compact_card_lines(l, uses_compact_limit_lines(card_layout.min_card_width))
+        format_limits_compact_card_lines(
+            l,
+            uses_compact_limit_lines(card_layout.min_card_width),
+            formatter,
+        )
     } else {
         ("Loading...".to_string(), None, None, None)
     };
 
     // TODAY card always shows Tokens / Runs / Time.
     let today_value = today
-        .map(|d| format!("{} tokens", format_count(d.total_tokens)))
+        .map(|d| {
+            format!(
+                "{} tokens",
+                format_tokens_overview(d.total_tokens, formatter)
+            )
+        })
         .unwrap_or_else(|| "--".to_string());
     let today_caption1 = today
-        .map(|d| format!("Runs {}", format_count(d.agent_runs)))
+        .map(|d| format!("Runs {}", format_count(d.agent_runs, formatter)))
         .unwrap_or_default();
     let today_caption2 = today
         .map(|d| format!("Time {}", format_duration_words(d.agent_time_ms)))
@@ -1214,12 +1257,12 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         .map(|s| s.days.iter().map(|d| d.agent_runs).sum::<i64>())
         .unwrap_or(0);
     let last7_runs_caption = if snapshot.is_some() {
-        Some(format!("Runs {}", format_count(last7_runs_sum)))
+        Some(format!("Runs {}", format_count(last7_runs_sum, formatter)))
     } else {
         None
     };
     let last30_runs_caption = if snapshot.is_some() {
-        Some(format!("Runs {}", format_count(last30_runs_sum)))
+        Some(format!("Runs {}", format_count(last30_runs_sum, formatter)))
     } else {
         None
     };
@@ -1559,7 +1602,7 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                 })
                 .unwrap_or(0);
             let avg30_label = if snapshot.is_some() {
-                format_count(avg30)
+                format_count(avg30, formatter)
             } else {
                 "--".into()
             };
@@ -1568,7 +1611,7 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                 .map(|s| {
                     format!(
                         "Tokens {}",
-                        format_tokens_compact(s.totals.last7_days_tokens)
+                        format_tokens_compact(s.totals.last7_days_tokens, formatter)
                     )
                 })
                 .unwrap_or_else(|| "--".into());
@@ -1576,7 +1619,7 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                 .map(|s| {
                     format!(
                         "Tokens {}",
-                        format_tokens_compact(s.totals.last30_days_tokens)
+                        format_tokens_compact(s.totals.last30_days_tokens, formatter)
                     )
                 })
                 .unwrap_or_else(|| "--".into());
@@ -1705,16 +1748,13 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
 fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     // Note: We draw bars manually to control label placement and padding.
+    let formatter = state.formatter();
 
     let range_label = match state.range {
         ChartRange::Week => "Last 7 days",
         ChartRange::Month => "Last 30 days",
     };
-    let metric_label = match state.metric {
-        UsageMetric::Tokens => "TOKENS",
-        UsageMetric::Time => "TIME",
-        UsageMetric::Runs => "RUNS",
-    };
+    let metric_label = usage_chart_metric_label(state.metric);
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
@@ -1765,15 +1805,15 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let mut token_out_of_cache_values: Vec<u64> = Vec::with_capacity(days.len());
     for day in &days {
         let label = match state.orientation {
-            ChartOrientation::Horizontal => format_day_label_weekday_mmdd(&day.day),
+            ChartOrientation::Horizontal => format_day_label_weekday_mmdd(&day.day, formatter),
             ChartOrientation::Vertical => match state.range {
-                ChartRange::Week => day.short_label(),
+                ChartRange::Week => day.short_label(formatter),
                 ChartRange::Month => {
                     // Prefer compact day-of-month labels for dense charts.
                     if day.day.len() == 10 {
                         day.day[8..10].to_string()
                     } else {
-                        day.short_label()
+                        day.short_label(formatter)
                     }
                 }
             },
@@ -1858,21 +1898,14 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                 if bars_area.height >= 3 && filled_h >= 2 {
                     let text_y = bottom_y.saturating_sub(1); // 1-line bottom space
                     let text = match state.metric {
-                        UsageMetric::Tokens => {
-                            let raw = value.to_string();
-                            if raw.len() <= w as usize {
-                                raw
-                            } else {
-                                format_compact_kmb(*value, w)
-                            }
-                        }
+                        UsageMetric::Tokens => format_vertical_token_value(*value, w, formatter),
                         UsageMetric::Time => {
                             let raw = format_minutes_hhmm(*value);
                             if raw.len() <= w as usize {
                                 raw
                             } else if w >= 4 {
                                 // fallback: compact minutes
-                                format_compact_kmb(*value, w)
+                                format_compact_kmb(*value, w, formatter)
                             } else {
                                 String::new()
                             }
@@ -1882,7 +1915,7 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                             if raw.len() <= w as usize {
                                 raw
                             } else {
-                                format_compact_kmb(*value, w)
+                                format_compact_kmb(*value, w, formatter)
                             }
                         }
                     };
@@ -1976,7 +2009,13 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                         UsageMetric::Tokens => Some(visible_out_of_cache[idx]),
                         _ => None,
                     };
-                    let s = format_horizontal_value(*v, out_of_cache, state.metric, u16::MAX);
+                    let s = format_horizontal_value(
+                        *v,
+                        out_of_cache,
+                        state.metric,
+                        u16::MAX,
+                        formatter,
+                    );
                     max_len = max_len.max(s.len());
                 }
                 (max_len as u16).clamp(6, 32)
@@ -2078,8 +2117,13 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                     UsageMetric::Tokens => Some(visible_out_of_cache[idx]),
                     _ => None,
                 };
-                let value_text =
-                    format_horizontal_value(*value, out_of_cache, state.metric, value_max_width);
+                let value_text = format_horizontal_value(
+                    *value,
+                    out_of_cache,
+                    state.metric,
+                    value_max_width,
+                    formatter,
+                );
                 let value_text = truncate_middle(&value_text, value_max_width as usize);
                 // Right-align numeric values within the dedicated value column.
                 let start_x = value_area
@@ -2100,23 +2144,39 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     }
 }
 
-fn format_day_label_weekday_mmdd(day: &str) -> String {
+fn usage_chart_metric_label(metric: UsageMetric) -> &'static str {
+    match metric {
+        UsageMetric::Tokens => "TOKENS (TOTAL / NON-CACHED)",
+        UsageMetric::Time => "TIME",
+        UsageMetric::Runs => "RUNS",
+    }
+}
+
+fn format_vertical_token_value(
+    value: u64,
+    max_width: u16,
+    formatter: DisplayFormatter<'_>,
+) -> String {
+    let preferred = match formatter.style() {
+        DisplayStyle::Classic => value.to_string(),
+        DisplayStyle::SystemCompact => format_tokens_compact(value as i64, formatter),
+        DisplayStyle::SystemFull => formatter.format_u64(value),
+    };
+    if preferred.len() <= max_width as usize || formatter.style() == DisplayStyle::SystemFull {
+        preferred
+    } else {
+        format_compact_kmb(value, max_width, formatter)
+    }
+}
+
+fn format_day_label_weekday_mmdd(day: &str, formatter: DisplayFormatter<'_>) -> String {
     // Input: YYYY-MM-DD
     // Output: Mon 02/02
     let parsed = NaiveDate::parse_from_str(day, "%Y-%m-%d").ok();
     let Some(date) = parsed else {
         return day.to_string();
     };
-    let weekday = match date.weekday().number_from_monday() {
-        1 => "Mon",
-        2 => "Tue",
-        3 => "Wed",
-        4 => "Thu",
-        5 => "Fri",
-        6 => "Sat",
-        _ => "Sun",
-    };
-    format!("{weekday} {:02}/{:02}", date.month(), date.day())
+    formatter.format_chart_day(date)
 }
 
 fn format_horizontal_value(
@@ -2124,6 +2184,7 @@ fn format_horizontal_value(
     out_of_cache_tokens: Option<u64>,
     metric: UsageMetric,
     max_width: u16,
+    formatter: DisplayFormatter<'_>,
 ) -> String {
     if max_width == 0 {
         return String::new();
@@ -2131,21 +2192,16 @@ fn format_horizontal_value(
 
     if metric == UsageMetric::Tokens {
         if let Some(out_of_cache) = out_of_cache_tokens {
-            let full = format!(
-                "{} / {}",
-                format_count(value as i64),
-                format_count(out_of_cache as i64)
-            );
-            if full.len() <= max_width as usize {
-                return full;
-            }
-
             let compact = format!(
                 "{} / {}",
-                format_tokens_compact(value as i64),
-                format_tokens_compact(out_of_cache as i64)
+                format_tokens_overview(value as i64, formatter),
+                format_tokens_overview(out_of_cache as i64, formatter)
             );
             if compact.len() <= max_width as usize {
+                return compact;
+            }
+
+            if formatter.style() == DisplayStyle::SystemFull {
                 return compact;
             }
 
@@ -2156,19 +2212,22 @@ fn format_horizontal_value(
                 let right_w = pair_width.saturating_sub(left_w);
                 return format!(
                     "{} / {}",
-                    format_compact_kmb(value, left_w),
-                    format_compact_kmb(out_of_cache, right_w),
+                    format_compact_kmb(value, left_w, formatter),
+                    format_compact_kmb(out_of_cache, right_w, formatter),
                 );
             }
         }
     }
 
     let full = match metric {
-        UsageMetric::Tokens => format_count(value as i64),
+        UsageMetric::Tokens => format_tokens_overview(value as i64, formatter),
         UsageMetric::Time => format_minutes_hhmm(value),
-        UsageMetric::Runs => format_count(value as i64),
+        UsageMetric::Runs => format_count(value as i64, formatter),
     };
     if full.len() <= max_width as usize {
+        return full;
+    }
+    if metric == UsageMetric::Tokens && formatter.style() == DisplayStyle::SystemFull {
         return full;
     }
 
@@ -2176,7 +2235,7 @@ fn format_horizontal_value(
     // (No suffix for horizontal values; the chart header indicates the unit.)
 
     // Final fallback: compact only.
-    format_compact_kmb(value, max_width)
+    format_compact_kmb(value, max_width, formatter)
 }
 
 fn format_duration_words(ms: i64) -> String {
@@ -2207,6 +2266,7 @@ fn format_minutes_hhmm(total_minutes: u64) -> String {
 }
 
 fn render_top_models(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let formatter = state.formatter();
     let snapshot = state.usage.as_ref();
     let models = snapshot.map(|s| s.top_models.clone()).unwrap_or_default();
 
@@ -2222,7 +2282,11 @@ fn render_top_models(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                 spans.push(Span::raw(" "));
             }
             spans.push(Span::styled(
-                format!("{} {:.1}%", truncate_middle(&m.model, 18), m.share_percent),
+                format!(
+                    "{} {}%",
+                    truncate_middle(&m.model, 18),
+                    formatter.format_one_decimal(m.share_percent)
+                ),
                 Style::default().add_modifier(Modifier::BOLD),
             ));
         }
@@ -2256,6 +2320,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
             Line::from("  Tab  - toggle statistic (Tokens/Time/Runs)"),
             Line::from("  w    - toggle timeframe (Week/Month)"),
             Line::from("  f    - toggle layout (Horz/Vert)"),
+            Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
             Line::from("  r/F5 - refresh usage + limits"),
             Line::from("  s/F2 - switch screen"),
             Line::from("  ?    - toggle help"),
@@ -2266,6 +2331,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
             Line::from("  Tab  - toggle statistic (Tokens/Time/Runs)"),
             Line::from("  +/=  - show more projects"),
             Line::from("  -    - show fewer projects"),
+            Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
             Line::from("  r/F5 - refresh usage + limits"),
             Line::from("  s/F2 - switch screen"),
             Line::from("  ?    - toggle help"),
@@ -2274,11 +2340,16 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
         ActiveScreen::LimitResets => Text::from(vec![
             Line::from("Keys:"),
             Line::from("  r/F5 - refresh reset credits"),
+            Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
             Line::from("  s/F2 - switch screen"),
             Line::from("  ?    - toggle help"),
             Line::from("  q/Esc - quit"),
         ]),
-        ActiveScreen::Read => Text::from(vec![Line::from("Keys:"), Line::from("  q/Esc - quit")]),
+        ActiveScreen::Read => Text::from(vec![
+            Line::from("Keys:"),
+            Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
+            Line::from("  q/Esc - quit"),
+        ]),
     };
     frame.render_widget(
         Paragraph::new(text)
@@ -2449,29 +2520,32 @@ fn wrapped_line_count(text: &str, width: u16) -> u16 {
     total.max(1)
 }
 
-fn reset_credit_expiration_label(expires_at: i64) -> Option<String> {
+fn reset_credit_expiration_label(
+    expires_at: i64,
+    formatter: DisplayFormatter<'_>,
+) -> Option<String> {
     let ms = crate::codex_rpc::normalize_epoch_millis(expires_at);
     let dt = Local.timestamp_millis_opt(ms).single()?;
-    Some(format!(
-        "{} {}, {}",
-        dt.day(),
-        dt.format("%b"),
-        dt.format("%H:%M")
-    ))
+    Some(formatter.format_reset_datetime(dt.naive_local()))
 }
 
 fn reset_summary_text(state: &AppState) -> Option<String> {
-    reset_summary_for_limits(state.limits.as_ref()?)
+    reset_summary_for_limits(state.limits.as_ref()?, state.formatter())
 }
 
-fn reset_summary_for_limits(limits: &crate::codex_rpc::AccountRateLimits) -> Option<String> {
+fn reset_summary_for_limits(
+    limits: &crate::codex_rpc::AccountRateLimits,
+    formatter: DisplayFormatter<'_>,
+) -> Option<String> {
     let available = limits.reset_credits_available?;
-    let mut text = format!("Resets: {available} available");
+    let mut text = format!("Resets: {} available", formatter.format_count(available));
     let earliest_expiry = limits
         .reset_credits
         .as_deref()
         .and_then(|credits| credits.iter().filter_map(|credit| credit.expires_at).min());
-    if let Some(expiry) = earliest_expiry.and_then(reset_credit_expiration_label) {
+    if let Some(expiry) =
+        earliest_expiry.and_then(|expires_at| reset_credit_expiration_label(expires_at, formatter))
+    {
         text.push_str(" | earliest expires ");
         text.push_str(&expiry);
     }
@@ -2518,18 +2592,13 @@ fn render_limit_resets(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     render_limit_reset_details(frame, chunks[1], state);
 }
 
-fn reset_credit_date_time_label(timestamp: i64) -> Option<String> {
+fn reset_credit_date_time_label(timestamp: i64, formatter: DisplayFormatter<'_>) -> Option<String> {
     let ms = crate::codex_rpc::normalize_epoch_millis(timestamp);
     let dt = Local.timestamp_millis_opt(ms).single()?;
     if dt.date_naive() == Local::now().date_naive() {
-        Some(format!("today {}", dt.format("%H:%M")))
+        Some(format!("today {}", formatter.format_time(dt.naive_local())))
     } else {
-        Some(format!(
-            "{} {}, {}",
-            dt.day(),
-            dt.format("%b"),
-            dt.format("%H:%M")
-        ))
+        Some(formatter.format_reset_datetime(dt.naive_local()))
     }
 }
 
@@ -2576,7 +2645,7 @@ fn render_limit_reset_details(frame: &mut Frame<'_>, area: Rect, state: &AppStat
                     "No reset credits are currently available.",
                     Style::default().fg(Color::Gray),
                 ))),
-                Some(credits) => reset_credit_details_text(credits),
+                Some(credits) => reset_credit_details_text(credits, state.formatter()),
             },
         }
     };
@@ -2590,7 +2659,10 @@ fn render_limit_reset_details(frame: &mut Frame<'_>, area: Rect, state: &AppStat
     );
 }
 
-fn reset_credit_details_text(credits: &[crate::codex_rpc::RateLimitResetCredit]) -> Text<'static> {
+fn reset_credit_details_text(
+    credits: &[crate::codex_rpc::RateLimitResetCredit],
+    formatter: DisplayFormatter<'_>,
+) -> Text<'static> {
     let mut lines = Vec::with_capacity(credits.len().saturating_mul(4));
     for (index, credit) in credits.iter().enumerate() {
         if index > 0 {
@@ -2610,12 +2682,12 @@ fn reset_credit_details_text(credits: &[crate::codex_rpc::RateLimitResetCredit])
         let status = credit.status.as_deref().unwrap_or("Unknown");
         let expires = credit
             .expires_at
-            .and_then(reset_credit_date_time_label)
+            .and_then(|timestamp| reset_credit_date_time_label(timestamp, formatter))
             .map(|value| format!("expires {value}"))
             .unwrap_or_else(|| "expiration unavailable".to_string());
         let granted = credit
             .granted_at
-            .and_then(reset_credit_date_time_label)
+            .and_then(|timestamp| reset_credit_date_time_label(timestamp, formatter))
             .map(|value| format!("granted {value}"));
         let reset_type = credit.reset_type.as_deref();
         let mut metadata = format!("{status} | {expires}");
@@ -2672,30 +2744,32 @@ fn percent_left_value(used_percent: Option<f64>) -> String {
     format!("{}%", left.round() as i64)
 }
 
-fn resets_label(resets_at: Option<i64>) -> Option<String> {
+fn resets_label(resets_at: Option<i64>, formatter: DisplayFormatter<'_>) -> Option<String> {
     let raw = resets_at?;
     let ms = crate::codex_rpc::normalize_epoch_millis(raw);
     let dt = Local.timestamp_millis_opt(ms).single()?;
     let today = Local::now().date_naive();
     let day = dt.date_naive();
-    let time = dt.format("%H:%M").to_string();
+    let time = formatter.format_time(dt.naive_local());
     if day == today {
         Some(format!("resets {time}"))
     } else {
-        let month = dt.format("%b").to_string();
-        Some(format!("resets {time}, {} {month}", day.day()))
+        Some(format!(
+            "resets {time}, {}",
+            formatter.format_reset_date(day)
+        ))
     }
 }
 
-fn reset_compact_label(resets_at: Option<i64>) -> Option<String> {
+fn reset_compact_label(resets_at: Option<i64>, formatter: DisplayFormatter<'_>) -> Option<String> {
     let raw = resets_at?;
     let ms = crate::codex_rpc::normalize_epoch_millis(raw);
     let dt = Local.timestamp_millis_opt(ms).single()?;
     let today = Local::now().date_naive();
     if dt.date_naive() == today {
-        Some(dt.format("%H:%M").to_string())
+        Some(formatter.format_time(dt.naive_local()))
     } else {
-        Some(format!("{} {}", dt.day(), dt.format("%b")))
+        Some(formatter.format_reset_date(dt.date_naive()))
     }
 }
 
@@ -2703,6 +2777,7 @@ fn format_limit_compact_line(
     label_with_colon: &str,
     window: Option<&crate::codex_rpc::RateLimitWindow>,
     compact: bool,
+    formatter: DisplayFormatter<'_>,
 ) -> String {
     // Match requested alignment:
     // 5h limit: 100% (resets 20:43)
@@ -2718,12 +2793,12 @@ fn format_limit_compact_line(
             .trim_end_matches(':')
             .strip_suffix(" limit")
             .unwrap_or(label_with_colon.trim_end_matches(':'));
-        let reset = reset_compact_label(w.resets_at)
+        let reset = reset_compact_label(w.resets_at, formatter)
             .map(|value| format!(" | {value}"))
             .unwrap_or_default();
         return format!("{label}: {pct}{reset}");
     }
-    let resets = resets_label(w.resets_at)
+    let resets = resets_label(w.resets_at, formatter)
         .map(|s| format!(" ({s})"))
         .unwrap_or_default();
     format!("{label}{pct}{resets}")
@@ -2733,33 +2808,42 @@ fn format_rolling_limit_lines(
     primary: Option<&crate::codex_rpc::RateLimitWindow>,
     secondary: Option<&crate::codex_rpc::RateLimitWindow>,
     compact: bool,
+    formatter: DisplayFormatter<'_>,
 ) -> (String, String) {
     let primary_label = primary
         .and_then(|w| w.window_duration_mins)
         .and_then(format_window_label)
         .map(|w| format!("{w} limit:"))
         .unwrap_or_else(|| "5h limit:".to_string());
-    let l1 = format_limit_compact_line(&primary_label, primary, compact);
-    let l2 = format_limit_compact_line(if compact { "7d:" } else { "Weekly:" }, secondary, compact);
+    let l1 = format_limit_compact_line(&primary_label, primary, compact, formatter);
+    let l2 = format_limit_compact_line(
+        if compact { "7d:" } else { "Weekly:" },
+        secondary,
+        compact,
+        formatter,
+    );
     (l1, l2)
 }
 
 fn format_limits_compact_card_lines(
     l: &crate::codex_rpc::AccountRateLimits,
     compact: bool,
+    formatter: DisplayFormatter<'_>,
 ) -> (String, Option<String>, Option<String>, Option<String>) {
     let (rolling_primary, rolling_secondary) = rolling_windows_for_limits(l);
     let (primary, secondary) =
-        format_rolling_limit_lines(rolling_primary, rolling_secondary, compact);
-    if let Some((monthly, used)) = format_individual_limit_compact_lines(l, compact) {
+        format_rolling_limit_lines(rolling_primary, rolling_secondary, compact, formatter);
+    if let Some((monthly, used)) = format_individual_limit_compact_lines(l, compact, formatter) {
         return (monthly, Some(used), Some(primary), Some(secondary));
     }
 
-    if let Some(extra) = format_extra_bucket_compact_line(l, compact) {
-        let credits = format_credits_compact_line(l).unwrap_or_else(|| "Credits:  --".to_string());
+    if let Some(extra) = format_extra_bucket_compact_line(l, compact, formatter) {
+        let credits =
+            format_credits_compact_line(l, formatter).unwrap_or_else(|| "Credits:  --".to_string());
         (primary, Some(secondary), Some(extra), Some(credits))
     } else {
-        let credits = format_credits_compact_line(l).unwrap_or_else(|| "Credits:  --".to_string());
+        let credits =
+            format_credits_compact_line(l, formatter).unwrap_or_else(|| "Credits:  --".to_string());
         (primary, Some(secondary), Some(credits), None)
     }
 }
@@ -2783,6 +2867,7 @@ fn rolling_windows_for_limits(
 fn format_individual_limit_compact_lines(
     l: &crate::codex_rpc::AccountRateLimits,
     compact: bool,
+    formatter: DisplayFormatter<'_>,
 ) -> Option<(String, String)> {
     let individual_limit = l.individual_limit.as_ref().or_else(|| {
         l.buckets
@@ -2797,11 +2882,11 @@ fn format_individual_limit_compact_lines(
         .map(|v| format!("{}%", v.round() as i64))
         .unwrap_or_else(|| "--%".to_string());
     let resets = if compact {
-        reset_compact_label(individual_limit.resets_at)
+        reset_compact_label(individual_limit.resets_at, formatter)
             .map(|value| format!(" | {value}"))
             .unwrap_or_default()
     } else {
-        resets_label(individual_limit.resets_at)
+        resets_label(individual_limit.resets_at, formatter)
             .map(|value| format!(" ({value})"))
             .unwrap_or_default()
     };
@@ -2810,12 +2895,12 @@ fn format_individual_limit_compact_lines(
     let used = individual_limit
         .used
         .as_deref()
-        .map(format_credit_amount)
+        .map(|raw| format_credit_amount(raw, formatter))
         .unwrap_or_else(|| "--".to_string());
     let limit = individual_limit
         .limit
         .as_deref()
-        .map(format_credit_amount)
+        .map(|raw| format_credit_amount(raw, formatter))
         .unwrap_or_else(|| "--".to_string());
     let used_line = format!("{:<LABEL_W$}{used}/{limit} used", "Credits:");
     Some((monthly, used_line))
@@ -2824,6 +2909,7 @@ fn format_individual_limit_compact_lines(
 fn format_extra_bucket_compact_line(
     l: &crate::codex_rpc::AccountRateLimits,
     compact: bool,
+    formatter: DisplayFormatter<'_>,
 ) -> Option<String> {
     let active_id = l.limit_id.as_deref();
     let active_name = l.limit_name.as_deref();
@@ -2836,7 +2922,12 @@ fn format_extra_bucket_compact_line(
     })?;
     let window = bucket.primary.as_ref().or(bucket.secondary.as_ref())?;
     let label = compact_bucket_label(bucket);
-    Some(format_limit_compact_line(&label, Some(window), compact))
+    Some(format_limit_compact_line(
+        &label,
+        Some(window),
+        compact,
+        formatter,
+    ))
 }
 
 fn compact_bucket_label(bucket: &crate::codex_rpc::RateLimitSnapshot) -> String {
@@ -2855,16 +2946,19 @@ fn compact_bucket_label(bucket: &crate::codex_rpc::RateLimitSnapshot) -> String 
     format!("{}:", truncate_middle(cleaned, 9))
 }
 
-fn format_credit_amount(raw: &str) -> String {
+fn format_credit_amount(raw: &str, formatter: DisplayFormatter<'_>) -> String {
     let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
     let cleaned = cleaned.trim();
     let number = cleaned.parse::<f64>().ok().filter(|v| v.is_finite());
     number
-        .map(|v| format_count(v.round() as i64))
+        .map(|v| format_count(v.round() as i64, formatter))
         .unwrap_or_else(|| truncate_middle(cleaned, 12))
 }
 
-fn format_credits_compact_line(l: &crate::codex_rpc::AccountRateLimits) -> Option<String> {
+fn format_credits_compact_line(
+    l: &crate::codex_rpc::AccountRateLimits,
+    formatter: DisplayFormatter<'_>,
+) -> Option<String> {
     const LABEL_W: usize = 10;
     let credits = l.credits.as_ref()?;
     if !credits.has_credits {
@@ -2884,7 +2978,7 @@ fn format_credits_compact_line(l: &crate::codex_rpc::AccountRateLimits) -> Optio
     }
     let n = cleaned.parse::<f64>().ok().filter(|v| v.is_finite());
     let amount = n
-        .map(|v| format!("{} credits", v.round() as i64))
+        .map(|v| format!("{} credits", formatter.format_count(v.round() as i64)))
         .unwrap_or_else(|| format!("{cleaned} credits"));
     Some(format!("{:<LABEL_W$}{amount}", "Credits:"))
 }
@@ -2995,6 +3089,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn token_chart_header_explains_the_slash_pair() {
+        assert_eq!(
+            usage_chart_metric_label(UsageMetric::Tokens),
+            "TOKENS (TOTAL / NON-CACHED)"
+        );
+    }
+
+    #[test]
     fn truncate_middle_is_unicode_safe_and_strips_control_chars() {
         let input = "ab\x1b[31mcd\x1b[0m-zu\u{0308}rich";
         let out = truncate_middle(input, 10);
@@ -3024,6 +3126,17 @@ mod tests {
     }
 
     #[test]
+    fn short_usage_layout_preserves_measured_card_height() {
+        let area = Rect::new(0, 0, 140, 18);
+        let chunks = usage_layout(area, 2, 12);
+
+        assert_eq!(chunks[0].height, 2);
+        assert_eq!(chunks[1].height, 12);
+        assert_eq!(chunks[2].height, 1);
+        assert_eq!(chunks[3].height, 3);
+    }
+
+    #[test]
     fn card_format_density_uses_the_actual_card_width() {
         let six_columns = usage_card_layout(180);
         assert_eq!(six_columns.columns, 6);
@@ -3045,6 +3158,8 @@ mod tests {
 
     #[test]
     fn reset_summary_uses_earliest_returned_expiration() {
+        let system_locale = crate::locale::SystemLocale::default();
+        let formatter = DisplayFormatter::new(crate::locale::DisplayStyle::Classic, &system_locale);
         let limits = crate::codex_rpc::AccountRateLimits {
             limit_id: None,
             limit_name: None,
@@ -3076,7 +3191,7 @@ mod tests {
             ]),
         };
 
-        let summary = reset_summary_for_limits(&limits).expect("reset summary");
+        let summary = reset_summary_for_limits(&limits, formatter).expect("reset summary");
         assert!(summary.starts_with("Resets: 3 available | earliest expires "));
         assert!(summary.contains(", "));
     }
@@ -3090,6 +3205,8 @@ mod tests {
 
     #[test]
     fn limits_card_uses_monthly_and_named_rolling_bucket() {
+        let system_locale = crate::locale::SystemLocale::default();
+        let formatter = DisplayFormatter::new(crate::locale::DisplayStyle::Classic, &system_locale);
         let limits = crate::codex_rpc::AccountRateLimits {
             limit_id: Some("codex".to_string()),
             limit_name: None,
@@ -3123,34 +3240,119 @@ mod tests {
         };
 
         let (value, caption1, caption2, caption3) =
-            format_limits_compact_card_lines(&limits, false);
+            format_limits_compact_card_lines(&limits, false, formatter);
         assert_eq!(value, "Monthly:  99%");
         assert_eq!(caption1.as_deref(), Some("Credits:  564/60,000 used"));
         assert_eq!(caption2.as_deref(), Some("5h limit: 100%"));
         assert_eq!(caption3.as_deref(), Some("Weekly:   100%"));
 
         let (_, _, compact_primary, compact_secondary) =
-            format_limits_compact_card_lines(&limits, true);
+            format_limits_compact_card_lines(&limits, true, formatter);
         assert_eq!(compact_primary.as_deref(), Some("5h: 100%"));
         assert_eq!(compact_secondary.as_deref(), Some("7d: 100%"));
     }
 
     #[test]
-    fn horizontal_tokens_show_total_and_out_of_cache() {
-        let out =
-            format_horizontal_value(45_456_785, Some(1_756_241), UsageMetric::Tokens, u16::MAX);
+    fn classic_horizontal_tokens_keep_full_total_and_non_cached() {
+        let system_locale = crate::locale::SystemLocale::default();
+        let formatter = DisplayFormatter::new(crate::locale::DisplayStyle::Classic, &system_locale);
+        let out = format_horizontal_value(
+            45_456_785,
+            Some(1_756_241),
+            UsageMetric::Tokens,
+            u16::MAX,
+            formatter,
+        );
         assert_eq!(out, "45,456,785 / 1,756,241");
     }
 
     #[test]
+    fn system_horizontal_tokens_use_compact_total_and_non_cached() {
+        let system_locale = crate::locale::SystemLocale::default();
+        let formatter =
+            DisplayFormatter::new(crate::locale::DisplayStyle::SystemCompact, &system_locale);
+        let out = format_horizontal_value(
+            45_456_785,
+            Some(1_756_241),
+            UsageMetric::Tokens,
+            u16::MAX,
+            formatter,
+        );
+        assert_eq!(out, "45.46M / 1.76M");
+    }
+
+    #[test]
+    fn vertical_token_values_compact_only_in_system_mode() {
+        let system_locale = crate::locale::SystemLocale::default();
+        let classic = DisplayFormatter::new(crate::locale::DisplayStyle::Classic, &system_locale);
+        let system =
+            DisplayFormatter::new(crate::locale::DisplayStyle::SystemCompact, &system_locale);
+
+        assert_eq!(
+            format_vertical_token_value(45_456_785, 20, classic),
+            "45456785"
+        );
+        assert_eq!(
+            format_vertical_token_value(45_456_785, 20, system),
+            "45.46M"
+        );
+    }
+
+    #[test]
+    fn system_full_keeps_chart_token_values_expanded() {
+        let system_locale = crate::locale::SystemLocale::default();
+        let formatter =
+            DisplayFormatter::new(crate::locale::DisplayStyle::SystemFull, &system_locale);
+
+        assert_eq!(
+            format_horizontal_value(
+                45_456_785,
+                Some(1_756_241),
+                UsageMetric::Tokens,
+                u16::MAX,
+                formatter,
+            ),
+            "45456785 / 1756241"
+        );
+        assert_eq!(
+            format_vertical_token_value(45_456_785, 20, formatter),
+            "45456785"
+        );
+        assert_eq!(
+            format_horizontal_value(
+                45_456_785,
+                Some(1_756_241),
+                UsageMetric::Tokens,
+                8,
+                formatter,
+            ),
+            "45456785 / 1756241"
+        );
+        assert_eq!(
+            format_vertical_token_value(45_456_785, 4, formatter),
+            "45456785"
+        );
+    }
+
+    #[test]
     fn horizontal_tokens_pair_compacts_when_tight() {
-        let out = format_horizontal_value(45_456_785, Some(1_756_241), UsageMetric::Tokens, 10);
+        let system_locale = crate::locale::SystemLocale::default();
+        let formatter = DisplayFormatter::new(crate::locale::DisplayStyle::Classic, &system_locale);
+        let out = format_horizontal_value(
+            45_456_785,
+            Some(1_756_241),
+            UsageMetric::Tokens,
+            10,
+            formatter,
+        );
         assert!(out.contains(" / "));
         assert!(!out.is_empty());
     }
 
     #[test]
     fn project_activity_tokens_show_total_and_out_of_cache() {
+        let system_locale = crate::locale::SystemLocale::default();
+        let formatter = DisplayFormatter::new(crate::locale::DisplayStyle::Classic, &system_locale);
         let project = ProjectActivity {
             display_path: "/tmp/SFM".to_string(),
             days: Vec::new(),
@@ -3162,7 +3364,7 @@ mod tests {
         };
 
         assert_eq!(
-            activity_metric_total_label(&project, UsageMetric::Tokens),
+            activity_metric_total_label(&project, UsageMetric::Tokens, formatter),
             "250 / 100 tokens"
         );
     }
@@ -3189,11 +3391,13 @@ mod tests {
 
     #[test]
     fn activity_weekday_labels_follow_first_weekday() {
-        assert_eq!(activity_weekday_label(Weekday::Mon, 0), "Mon");
-        assert_eq!(activity_weekday_label(Weekday::Mon, 6), "Sun");
-        assert_eq!(activity_weekday_label(Weekday::Sun, 0), "");
-        assert_eq!(activity_weekday_label(Weekday::Sun, 1), "Mon");
-        assert_eq!(activity_weekday_label(Weekday::Sun, 6), "");
-        assert_eq!(activity_weekday_label(Weekday::Sat, 2), "Mon");
+        let system_locale = crate::locale::SystemLocale::default();
+        let formatter = DisplayFormatter::new(crate::locale::DisplayStyle::Classic, &system_locale);
+        assert_eq!(activity_weekday_label(Weekday::Mon, 0, formatter), "Mon");
+        assert_eq!(activity_weekday_label(Weekday::Mon, 6, formatter), "Sun");
+        assert_eq!(activity_weekday_label(Weekday::Sun, 0, formatter), "");
+        assert_eq!(activity_weekday_label(Weekday::Sun, 1, formatter), "Mon");
+        assert_eq!(activity_weekday_label(Weekday::Sun, 6, formatter), "");
+        assert_eq!(activity_weekday_label(Weekday::Sat, 2, formatter), "Mon");
     }
 }

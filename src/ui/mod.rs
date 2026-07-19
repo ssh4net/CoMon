@@ -353,7 +353,7 @@ fn usage_layout(area: Rect, controls_height: u16, cards_height: u16) -> [Rect; 4
 fn render_activity(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     let cards_height = usage_cards_height(state, area.width);
     let reset_summary = reset_summary_text(state);
-    let controls_height = usage_controls_height(reset_summary.as_deref(), area.width);
+    let controls_height = activity_controls_height(reset_summary.as_deref(), area.width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -847,27 +847,14 @@ fn render_usage_controls(
     let reset_height = reset_summary_height(reset_summary, area.width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(reset_height)])
+        .constraints([Constraint::Length(3), Constraint::Length(reset_height)])
         .split(area);
-    let row = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Min(0)])
-        .split(chunks[0]);
 
     let workspace_label = state
         .workspace_path
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "All workspaces".to_string());
-    let left = Paragraph::new(Line::from(vec![
-        Span::styled("WORKSPACE", Style::default().fg(Color::Gray)),
-        Span::raw("  "),
-        Span::styled(
-            truncate_middle(&workspace_label, 48),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-    ]));
-    frame.render_widget(left, row[0]);
 
     let tokens = pill("TOKENS", state.metric == UsageMetric::Tokens);
     let time = pill("TIME", state.metric == UsageMetric::Time);
@@ -876,6 +863,152 @@ fn render_usage_controls(
     let month = pill("MONTH", state.range == ChartRange::Month);
     let vert = pill("VERT", state.orientation == ChartOrientation::Vertical);
     let horz = pill("HORZ", state.orientation == ChartOrientation::Horizontal);
+
+    if let Some([view_area, graph_area, bars_area]) = usage_control_group_areas(chunks[0]) {
+        let workspace_area = Rect {
+            x: chunks[0].x,
+            y: chunks[0].y.saturating_add(1),
+            width: view_area.x.saturating_sub(chunks[0].x).saturating_sub(1),
+            height: 1,
+        };
+        render_workspace_label(frame, workspace_area, &workspace_label);
+
+        render_control_group(frame, view_area, "VIEW", vec![tokens, time, runs]);
+        render_control_group(frame, graph_area, "GRAPH", vec![week, month]);
+        render_control_group(frame, bars_area, "BARS", vec![vert, horz]);
+
+        register_group_targets(
+            state,
+            view_area,
+            &[
+                (
+                    " TOKENS ",
+                    Some(UiClickAction::SetMetric(UsageMetric::Tokens)),
+                ),
+                (" TIME ", Some(UiClickAction::SetMetric(UsageMetric::Time))),
+                (" RUNS ", Some(UiClickAction::SetMetric(UsageMetric::Runs))),
+            ],
+        );
+        register_group_targets(
+            state,
+            graph_area,
+            &[
+                (" WEEK ", Some(UiClickAction::SetRange(ChartRange::Week))),
+                (" MONTH ", Some(UiClickAction::SetRange(ChartRange::Month))),
+            ],
+        );
+        register_group_targets(
+            state,
+            bars_area,
+            &[
+                (
+                    " VERT ",
+                    Some(UiClickAction::SetOrientation(ChartOrientation::Vertical)),
+                ),
+                (
+                    " HORZ ",
+                    Some(UiClickAction::SetOrientation(ChartOrientation::Horizontal)),
+                ),
+            ],
+        );
+    } else {
+        render_flat_usage_controls(
+            frame,
+            chunks[0],
+            state,
+            &workspace_label,
+            vec![tokens, time, runs, week, month, vert, horz],
+        );
+    }
+
+    if let Some(text) = reset_summary {
+        render_reset_summary(frame, chunks[1], text);
+    }
+}
+
+fn render_workspace_label(frame: &mut Frame<'_>, area: Rect, workspace_label: &str) {
+    let left = Paragraph::new(Line::from(vec![
+        Span::styled("WORKSPACE", Style::default().fg(Color::Gray)),
+        Span::raw("  "),
+        Span::styled(
+            truncate_middle(workspace_label, 48),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    frame.render_widget(left, area);
+}
+
+fn render_control_group(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &'static str,
+    options: Vec<Span<'static>>,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(Color::Gray),
+        ));
+    frame.render_widget(Paragraph::new(Line::from(options)).block(block), area);
+}
+
+fn register_group_targets(
+    state: &mut AppState,
+    area: Rect,
+    segments: &[(&str, Option<UiClickAction>)],
+) {
+    let content = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: 1,
+    };
+    register_right_aligned_targets(state, content, segments);
+}
+
+fn usage_control_group_areas(area: Rect) -> Option<[Rect; 3]> {
+    const VIEW_WIDTH: u16 = 22;
+    const GRAPH_WIDTH: u16 = 15;
+    const BARS_WIDTH: u16 = 14;
+    const GAP: u16 = 1;
+    const TOTAL_WIDTH: u16 = VIEW_WIDTH + GRAPH_WIDTH + BARS_WIDTH + GAP * 2;
+
+    if area.width < TOTAL_WIDTH || area.height < 3 {
+        return None;
+    }
+
+    let start_x = area.x.saturating_add(area.width - TOTAL_WIDTH);
+    let view = Rect::new(start_x, area.y, VIEW_WIDTH, 3);
+    let graph = Rect::new(
+        start_x.saturating_add(VIEW_WIDTH + GAP),
+        area.y,
+        GRAPH_WIDTH,
+        3,
+    );
+    let bars = Rect::new(
+        graph.x.saturating_add(GRAPH_WIDTH + GAP),
+        area.y,
+        BARS_WIDTH,
+        3,
+    );
+    Some([view, graph, bars])
+}
+
+fn render_flat_usage_controls(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut AppState,
+    workspace_label: &str,
+    pills: Vec<Span<'static>>,
+) {
+    let center = Rect::new(area.x, area.y.saturating_add(1), area.width, 1);
+    let row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(20), Constraint::Min(0)])
+        .split(center);
+    render_workspace_label(frame, row[0], workspace_label);
 
     register_right_aligned_targets(
         state,
@@ -903,29 +1036,27 @@ fn render_usage_controls(
         ],
     );
 
-    let right = Paragraph::new(Line::from(vec![
+    let mut spans = vec![
         Span::styled("VIEW", Style::default().fg(Color::Gray)),
         Span::raw(" "),
-        tokens,
-        time,
-        runs,
+    ];
+    spans.extend(pills[0..3].iter().cloned());
+    spans.extend([
         Span::raw(" "),
         Span::styled("GRAPH", Style::default().fg(Color::Gray)),
         Span::raw(" "),
-        week,
-        month,
+    ]);
+    spans.extend(pills[3..5].iter().cloned());
+    spans.extend([
         Span::raw(" "),
         Span::styled("BARS", Style::default().fg(Color::Gray)),
         Span::raw(" "),
-        vert,
-        horz,
-    ]))
-    .alignment(Alignment::Right);
-    frame.render_widget(right, row[1]);
-
-    if let Some(text) = reset_summary {
-        render_reset_summary(frame, chunks[1], text);
-    }
+    ]);
+    spans.extend(pills[5..7].iter().cloned());
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).alignment(Alignment::Right),
+        row[1],
+    );
 }
 
 #[derive(Debug)]
@@ -2670,6 +2801,10 @@ fn reset_summary_height(summary: Option<&str>, width: u16) -> u16 {
 }
 
 fn usage_controls_height(summary: Option<&str>, width: u16) -> u16 {
+    3_u16.saturating_add(reset_summary_height(summary, width))
+}
+
+fn activity_controls_height(summary: Option<&str>, width: u16) -> u16 {
     1_u16.saturating_add(reset_summary_height(summary, width))
 }
 
@@ -3271,6 +3406,26 @@ mod tests {
     }
 
     #[test]
+    fn usage_control_groups_are_equal_height_and_right_aligned() {
+        let [view, graph, bars] =
+            usage_control_group_areas(Rect::new(10, 4, 80, 3)).expect("framed controls");
+
+        assert_eq!(view, Rect::new(37, 4, 22, 3));
+        assert_eq!(graph, Rect::new(60, 4, 15, 3));
+        assert_eq!(bars, Rect::new(76, 4, 14, 3));
+        assert_eq!(view.height, graph.height);
+        assert_eq!(graph.height, bars.height);
+        assert_eq!(view.x + view.width + 1, graph.x);
+        assert_eq!(graph.x + graph.width + 1, bars.x);
+    }
+
+    #[test]
+    fn usage_control_groups_fall_back_when_too_narrow() {
+        assert!(usage_control_group_areas(Rect::new(0, 0, 52, 3)).is_none());
+        assert!(usage_control_group_areas(Rect::new(0, 0, 53, 2)).is_none());
+    }
+
+    #[test]
     fn token_chart_header_explains_the_slash_pair() {
         assert_eq!(
             usage_chart_metric_label(UsageMetric::Tokens),
@@ -3382,7 +3537,8 @@ mod tests {
     fn reset_summary_height_accounts_for_its_label() {
         let summary = "Resets: 3 available | earliest expires 18 Jul";
         assert!(reset_summary_height(Some(summary), 24) > wrapped_line_count(summary, 24));
-        assert_eq!(usage_controls_height(None, 80), 1);
+        assert_eq!(usage_controls_height(None, 80), 3);
+        assert_eq!(activity_controls_height(None, 80), 1);
     }
 
     #[test]

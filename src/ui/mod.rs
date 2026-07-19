@@ -1,4 +1,4 @@
-use crate::app::{ActiveScreen, AppState, ChartOrientation};
+use crate::app::{ActiveScreen, AppState, ChartOrientation, UiClickAction, UiHitTarget};
 use crate::locale::{DisplayFormatter, DisplayStyle};
 use crate::usage::{
     format_compact_kmb, format_count, format_duration_compact, format_tokens_compact,
@@ -71,6 +71,7 @@ pub fn format_updated_label(updated_at: Instant) -> String {
 }
 
 pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
+    state.ui_hit_targets.clear();
     let area = frame.area();
     let title = match state.active_screen {
         ActiveScreen::Usage => " comon :: usage ",
@@ -158,6 +159,15 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
             }
         }
         ActiveScreen::Read => {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(0),
+                    Constraint::Length(2),
+                ])
+                .split(inner);
+            register_hit_target(state, chunks[2], UiClickAction::CycleDisplayStyle);
             let system_locale = state.system_locale.clone();
             let formatter = DisplayFormatter::new(state.display_style, &system_locale);
             crate::read::tui::render(frame, inner, &mut state.read_browser, formatter);
@@ -293,7 +303,7 @@ fn footer_height(width: u16, state: &AppState) -> u16 {
     wrapped_line_count(&footer_text(state), width).max(1)
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     let err = footer_error(state);
     let style = format!("Style [n]: {}", state.formatter().style_label());
     let line = Line::from(vec![
@@ -308,9 +318,10 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     ]);
 
     frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), area);
+    register_hit_target(state, area, UiClickAction::CycleDisplayStyle);
 }
 
-fn render_usage(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+fn render_usage(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     let cards_height = usage_cards_height(state, area.width);
     let reset_summary = reset_summary_text(state);
     let controls_height = usage_controls_height(reset_summary.as_deref(), area.width);
@@ -339,7 +350,7 @@ fn usage_layout(area: Rect, controls_height: u16, cards_height: u16) -> [Rect; 4
     [chunks[0], chunks[1], chunks[2], chunks[3]]
 }
 
-fn render_activity(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+fn render_activity(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     let cards_height = usage_cards_height(state, area.width);
     let reset_summary = reset_summary_text(state);
     let controls_height = usage_controls_height(reset_summary.as_deref(), area.width);
@@ -360,7 +371,7 @@ fn render_activity(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 fn render_activity_controls(
     frame: &mut Frame<'_>,
     area: Rect,
-    state: &AppState,
+    state: &mut AppState,
     reset_summary: Option<&str>,
 ) {
     let reset_height = reset_summary_height(reset_summary, area.width);
@@ -391,6 +402,22 @@ fn render_activity_controls(
     let tokens = pill("TOKENS", state.metric == UsageMetric::Tokens);
     let time = pill("TIME", state.metric == UsageMetric::Time);
     let runs = pill("RUNS", state.metric == UsageMetric::Runs);
+    let project_limit = state.activity_project_limit.to_string();
+    register_right_aligned_targets(
+        state,
+        row[1],
+        &[
+            ("VIEW ", None),
+            (
+                " TOKENS ",
+                Some(UiClickAction::SetMetric(UsageMetric::Tokens)),
+            ),
+            (" TIME ", Some(UiClickAction::SetMetric(UsageMetric::Time))),
+            (" RUNS ", Some(UiClickAction::SetMetric(UsageMetric::Runs))),
+            (" PROJECTS ", None),
+            (&project_limit, None),
+        ],
+    );
     let right = Paragraph::new(Line::from(vec![
         Span::styled("VIEW", Style::default().fg(Color::Gray)),
         Span::raw(" "),
@@ -814,7 +841,7 @@ fn write_text(
 fn render_usage_controls(
     frame: &mut Frame<'_>,
     area: Rect,
-    state: &AppState,
+    state: &mut AppState,
     reset_summary: Option<&str>,
 ) {
     let reset_height = reset_summary_height(reset_summary, area.width);
@@ -849,6 +876,32 @@ fn render_usage_controls(
     let month = pill("MONTH", state.range == ChartRange::Month);
     let vert = pill("VERT", state.orientation == ChartOrientation::Vertical);
     let horz = pill("HORZ", state.orientation == ChartOrientation::Horizontal);
+
+    register_right_aligned_targets(
+        state,
+        row[1],
+        &[
+            ("VIEW ", None),
+            (
+                " TOKENS ",
+                Some(UiClickAction::SetMetric(UsageMetric::Tokens)),
+            ),
+            (" TIME ", Some(UiClickAction::SetMetric(UsageMetric::Time))),
+            (" RUNS ", Some(UiClickAction::SetMetric(UsageMetric::Runs))),
+            (" GRAPH ", None),
+            (" WEEK ", Some(UiClickAction::SetRange(ChartRange::Week))),
+            (" MONTH ", Some(UiClickAction::SetRange(ChartRange::Month))),
+            (" BARS ", None),
+            (
+                " VERT ",
+                Some(UiClickAction::SetOrientation(ChartOrientation::Vertical)),
+            ),
+            (
+                " HORZ ",
+                Some(UiClickAction::SetOrientation(ChartOrientation::Horizontal)),
+            ),
+        ],
+    );
 
     let right = Paragraph::new(Line::from(vec![
         Span::styled("VIEW", Style::default().fg(Color::Gray)),
@@ -2296,7 +2349,7 @@ fn render_top_models(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
 fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) {
     let w = area.width.min(60);
-    let h = area.height.min(13);
+    let h = area.height.min(14);
     let popup = centered_rect(w, h, area);
     frame.render_widget(Clear, popup);
 
@@ -2321,6 +2374,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
             Line::from("  w    - toggle timeframe (Week/Month)"),
             Line::from("  f    - toggle layout (Horz/Vert)"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
+            Line::from("  Mouse - click controls; click footer to cycle style"),
             Line::from("  r/F5 - refresh usage + limits"),
             Line::from("  s/F2 - switch screen"),
             Line::from("  ?    - toggle help"),
@@ -2332,6 +2386,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
             Line::from("  +/=  - show more projects"),
             Line::from("  -    - show fewer projects"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
+            Line::from("  Mouse - click view; click footer to cycle style"),
             Line::from("  r/F5 - refresh usage + limits"),
             Line::from("  s/F2 - switch screen"),
             Line::from("  ?    - toggle help"),
@@ -2341,6 +2396,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
             Line::from("Keys:"),
             Line::from("  r/F5 - refresh reset credits"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
+            Line::from("  Mouse - click footer to cycle style"),
             Line::from("  s/F2 - switch screen"),
             Line::from("  ?    - toggle help"),
             Line::from("  q/Esc - quit"),
@@ -2348,6 +2404,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
         ActiveScreen::Read => Text::from(vec![
             Line::from("Keys:"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
+            Line::from("  Mouse - click footer to cycle style"),
             Line::from("  q/Esc - quit"),
         ]),
     };
@@ -2423,6 +2480,55 @@ fn pill(label: &str, active: bool) -> Span<'static> {
         Style::default().fg(Color::Gray)
     };
     Span::styled(format!(" {label} "), style)
+}
+
+fn register_hit_target(state: &mut AppState, area: Rect, action: UiClickAction) {
+    if area.width > 0 && area.height > 0 {
+        state.ui_hit_targets.push(UiHitTarget { area, action });
+    }
+}
+
+fn register_right_aligned_targets(
+    state: &mut AppState,
+    area: Rect,
+    segments: &[(&str, Option<UiClickAction>)],
+) {
+    state
+        .ui_hit_targets
+        .extend(right_aligned_targets(area, segments));
+}
+
+fn right_aligned_targets(
+    area: Rect,
+    segments: &[(&str, Option<UiClickAction>)],
+) -> Vec<UiHitTarget> {
+    let total_width = segments.iter().fold(0_u16, |total, (text, _)| {
+        total.saturating_add(UnicodeWidthStr::width(*text).min(u16::MAX as usize) as u16)
+    });
+    if total_width > area.width || area.height == 0 {
+        return Vec::new();
+    }
+
+    let mut targets = Vec::new();
+    let mut x = area.x.saturating_add(area.width - total_width);
+    for (text, action) in segments {
+        let width = UnicodeWidthStr::width(*text).min(u16::MAX as usize) as u16;
+        if let Some(action) = action {
+            if width > 0 {
+                targets.push(UiHitTarget {
+                    area: Rect {
+                        x,
+                        y: area.y,
+                        width,
+                        height: 1,
+                    },
+                    action: *action,
+                });
+            }
+        }
+        x = x.saturating_add(width);
+    }
+    targets
 }
 
 fn card(
@@ -3132,6 +3238,37 @@ fn inset_with_border_and_padding(area: Rect, padding: Padding) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn right_aligned_control_targets_follow_rendered_segments() {
+        let targets = right_aligned_targets(
+            Rect::new(10, 3, 30, 1),
+            &[
+                ("VIEW ", None),
+                (
+                    " TOKENS ",
+                    Some(UiClickAction::SetMetric(UsageMetric::Tokens)),
+                ),
+                (" TIME ", Some(UiClickAction::SetMetric(UsageMetric::Time))),
+            ],
+        );
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].area, Rect::new(26, 3, 8, 1));
+        assert_eq!(targets[1].area, Rect::new(34, 3, 6, 1));
+    }
+
+    #[test]
+    fn right_aligned_control_targets_are_disabled_when_clipped() {
+        let targets = right_aligned_targets(
+            Rect::new(0, 0, 4, 1),
+            &[(
+                " TOKENS ",
+                Some(UiClickAction::SetMetric(UsageMetric::Tokens)),
+            )],
+        );
+        assert!(targets.is_empty());
+    }
 
     #[test]
     fn token_chart_header_explains_the_slash_pair() {

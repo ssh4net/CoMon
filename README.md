@@ -133,6 +133,7 @@ comon --scan-time-budget-ms 1500 --max-jsonl-line-kib 512
 - `w` Toggle timeframe (Week/Month)
 - `f` Toggle layout (Horz/Vert)
 - `n` Cycle display formatting (Classic/System Compact/System Full)
+- Mouse: click Tokens/Time/Runs, Week/Month, or Horz/Vert controls; click the footer to cycle display formatting
 - `s` / `F2` Switch between Usage and Session history
 - `r` / `F5` Refresh current screen
 - `?` Help overlay

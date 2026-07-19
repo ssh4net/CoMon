@@ -3,8 +3,9 @@ use crate::locale::{DisplayFormatter, DisplayStyle, SystemLocale};
 use crate::read;
 use crate::usage::{ChartRange, LocalUsageSnapshot, UsageMetric};
 use anyhow::{anyhow, Context, Result};
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use ratatui::Terminal;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -71,6 +72,29 @@ pub(crate) enum ActiveScreen {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UiClickAction {
+    SetMetric(UsageMetric),
+    SetRange(ChartRange),
+    SetOrientation(ChartOrientation),
+    CycleDisplayStyle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UiHitTarget {
+    pub(crate) area: Rect,
+    pub(crate) action: UiClickAction,
+}
+
+impl UiHitTarget {
+    fn contains(self, column: u16, row: u16) -> bool {
+        column >= self.area.x
+            && column < self.area.x.saturating_add(self.area.width)
+            && row >= self.area.y
+            && row < self.area.y.saturating_add(self.area.height)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputOutcome {
     Continue(bool),
     Quit,
@@ -113,6 +137,7 @@ pub(crate) struct AppState {
     pub(crate) no_sessions_confirm_dismissed: bool,
     pub(crate) display_style: DisplayStyle,
     pub(crate) system_locale: SystemLocale,
+    pub(crate) ui_hit_targets: Vec<UiHitTarget>,
 
     pub(crate) usage: Option<LocalUsageSnapshot>,
     pub(crate) usage_updated_at: Option<Instant>,
@@ -453,6 +478,7 @@ async fn run_inner(
         no_sessions_confirm_dismissed: restored_ui_state.no_sessions_confirm_dismissed,
         display_style: restored_ui_state.display_style,
         system_locale: config.system_locale.clone(),
+        ui_hit_targets: Vec::new(),
         usage: None,
         usage_updated_at: None,
         usage_error: None,
@@ -574,6 +600,19 @@ fn handle_input_event(
     usage_refresh_tx: &mpsc::Sender<()>,
     limits_refresh_tx: &mpsc::Sender<()>,
 ) -> Result<InputOutcome> {
+    if let Event::Mouse(mouse) = &event {
+        if state.show_help || state.no_sessions_confirm_open {
+            return Ok(InputOutcome::Continue(false));
+        }
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            if let Some(action) = ui_click_action_at(&state.ui_hit_targets, mouse.column, mouse.row)
+            {
+                let changed = apply_ui_click_action(state, action);
+                return Ok(InputOutcome::Continue(changed));
+            }
+        }
+    }
+
     if let Event::Key(key) = &event {
         if key.kind != KeyEventKind::Press {
             return Ok(InputOutcome::Continue(false));
@@ -634,6 +673,37 @@ fn handle_input_event(
             &mut state.read_browser,
             event,
         )?)),
+    }
+}
+
+fn ui_click_action_at(targets: &[UiHitTarget], column: u16, row: u16) -> Option<UiClickAction> {
+    targets
+        .iter()
+        .find(|target| target.contains(column, row))
+        .map(|target| target.action)
+}
+
+fn apply_ui_click_action(state: &mut AppState, action: UiClickAction) -> bool {
+    match action {
+        UiClickAction::SetMetric(metric) => {
+            let changed = state.metric != metric;
+            state.metric = metric;
+            changed
+        }
+        UiClickAction::SetRange(range) => {
+            let changed = state.range != range;
+            state.range = range;
+            changed
+        }
+        UiClickAction::SetOrientation(orientation) => {
+            let changed = state.orientation != orientation;
+            state.orientation = orientation;
+            changed
+        }
+        UiClickAction::CycleDisplayStyle => {
+            state.display_style = state.display_style.toggled();
+            true
+        }
     }
 }
 
@@ -1049,6 +1119,25 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn ui_hit_targets_include_left_top_and_exclude_right_bottom_edges() {
+        let targets = [UiHitTarget {
+            area: Rect::new(10, 5, 4, 2),
+            action: UiClickAction::SetMetric(UsageMetric::Runs),
+        }];
+
+        assert_eq!(
+            ui_click_action_at(&targets, 10, 5),
+            Some(UiClickAction::SetMetric(UsageMetric::Runs))
+        );
+        assert_eq!(
+            ui_click_action_at(&targets, 13, 6),
+            Some(UiClickAction::SetMetric(UsageMetric::Runs))
+        );
+        assert_eq!(ui_click_action_at(&targets, 14, 5), None);
+        assert_eq!(ui_click_action_at(&targets, 10, 7), None);
+    }
 
     fn make_temp_dir(prefix: &str) -> PathBuf {
         let unique = format!(

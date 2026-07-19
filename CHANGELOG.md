@@ -7,6 +7,7 @@ All notable changes to this project are documented in this file.
 - Added a persisted `n` shortcut to cycle display formatting through Classic, System Compact, and System Full for numbers, dates, times, and calendar labels.
 - Clarified token pair charts with the `TOKENS (TOTAL / NON-CACHED)` heading.
 - Added compact `K/M/B/T` notation for large dashboard token values in System Compact mode, including values inside vertical chart bars. System Full keeps those values expanded, while Classic output remains unchanged.
+- Added mouse controls for selecting the visible statistic, chart timeframe, and chart orientation; clicking the footer cycles the display style on every screen.
 
 ## 0.3.6 - 2026-06-05
 

@@ -73,9 +73,12 @@ pub(crate) enum ActiveScreen {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UiClickAction {
+    SetScreen(ActiveScreen),
     SetMetric(UsageMetric),
     SetRange(ChartRange),
     SetOrientation(ChartOrientation),
+    DecreaseProjects,
+    IncreaseProjects,
     CycleDisplayStyle,
 }
 
@@ -685,6 +688,11 @@ fn ui_click_action_at(targets: &[UiHitTarget], column: u16, row: u16) -> Option<
 
 fn apply_ui_click_action(state: &mut AppState, action: UiClickAction) -> bool {
     match action {
+        UiClickAction::SetScreen(screen) => {
+            let changed = state.active_screen != screen;
+            state.active_screen = screen;
+            changed
+        }
         UiClickAction::SetMetric(metric) => {
             let changed = state.metric != metric;
             state.metric = metric;
@@ -698,6 +706,24 @@ fn apply_ui_click_action(state: &mut AppState, action: UiClickAction) -> bool {
         UiClickAction::SetOrientation(orientation) => {
             let changed = state.orientation != orientation;
             state.orientation = orientation;
+            changed
+        }
+        UiClickAction::DecreaseProjects => {
+            let next = state
+                .activity_project_limit
+                .saturating_sub(1)
+                .max(MIN_ACTIVITY_PROJECT_LIMIT);
+            let changed = next != state.activity_project_limit;
+            state.activity_project_limit = next;
+            changed
+        }
+        UiClickAction::IncreaseProjects => {
+            let next = state
+                .activity_project_limit
+                .saturating_add(1)
+                .min(MAX_ACTIVITY_PROJECT_LIMIT);
+            let changed = next != state.activity_project_limit;
+            state.activity_project_limit = next;
             changed
         }
         UiClickAction::CycleDisplayStyle => {

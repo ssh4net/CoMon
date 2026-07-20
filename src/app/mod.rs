@@ -1,9 +1,11 @@
 use crate::codex_rpc::{AccountRateLimits, CodexRpc};
+use crate::locale::{DisplayFormatter, DisplayStyle, SystemLocale};
 use crate::read;
 use crate::usage::{ChartRange, LocalUsageSnapshot, UsageMetric};
 use anyhow::{anyhow, Context, Result};
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use ratatui::Terminal;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -28,6 +30,7 @@ pub struct Config {
     pub refresh_limits_secs: u64,
     pub usage_scan_limits: crate::usage::ScanLimits,
     pub rebuild_cache_on_start: bool,
+    pub(crate) system_locale: SystemLocale,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +69,32 @@ pub(crate) enum ActiveScreen {
     Activity,
     LimitResets,
     Read,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UiClickAction {
+    SetScreen(ActiveScreen),
+    SetMetric(UsageMetric),
+    SetRange(ChartRange),
+    SetOrientation(ChartOrientation),
+    DecreaseProjects,
+    IncreaseProjects,
+    CycleDisplayStyle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UiHitTarget {
+    pub(crate) area: Rect,
+    pub(crate) action: UiClickAction,
+}
+
+impl UiHitTarget {
+    fn contains(self, column: u16, row: u16) -> bool {
+        column >= self.area.x
+            && column < self.area.x.saturating_add(self.area.width)
+            && row >= self.area.y
+            && row < self.area.y.saturating_add(self.area.height)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +138,9 @@ pub(crate) struct AppState {
     pub(crate) workspace_path: Option<std::path::PathBuf>,
     pub(crate) no_sessions_confirm_open: bool,
     pub(crate) no_sessions_confirm_dismissed: bool,
+    pub(crate) display_style: DisplayStyle,
+    pub(crate) system_locale: SystemLocale,
+    pub(crate) ui_hit_targets: Vec<UiHitTarget>,
 
     pub(crate) usage: Option<LocalUsageSnapshot>,
     pub(crate) usage_updated_at: Option<Instant>,
@@ -144,6 +176,7 @@ struct PersistedUiState {
     activity_project_limit: usize,
     workspace_path: Option<PathBuf>,
     no_sessions_confirm_dismissed: bool,
+    display_style: DisplayStyle,
 }
 
 impl PersistedUiState {
@@ -155,6 +188,7 @@ impl PersistedUiState {
             activity_project_limit: DEFAULT_ACTIVITY_PROJECT_LIMIT,
             workspace_path,
             no_sessions_confirm_dismissed: false,
+            display_style: DisplayStyle::Classic,
         }
     }
 
@@ -166,6 +200,7 @@ impl PersistedUiState {
             activity_project_limit: state.activity_project_limit,
             workspace_path: state.workspace_path.clone(),
             no_sessions_confirm_dismissed: state.no_sessions_confirm_dismissed,
+            display_style: state.display_style,
         }
     }
 }
@@ -195,6 +230,7 @@ struct StoredGlobalState {
     range: Option<String>,
     orientation: Option<String>,
     activity_project_limit: Option<usize>,
+    display_style: Option<String>,
     last_workspace_path: Option<String>,
     updated_at: i64,
 }
@@ -443,6 +479,9 @@ async fn run_inner(
         workspace_path: restored_ui_state.workspace_path.clone(),
         no_sessions_confirm_open: false,
         no_sessions_confirm_dismissed: restored_ui_state.no_sessions_confirm_dismissed,
+        display_style: restored_ui_state.display_style,
+        system_locale: config.system_locale.clone(),
+        ui_hit_targets: Vec::new(),
         usage: None,
         usage_updated_at: None,
         usage_error: None,
@@ -564,6 +603,19 @@ fn handle_input_event(
     usage_refresh_tx: &mpsc::Sender<()>,
     limits_refresh_tx: &mpsc::Sender<()>,
 ) -> Result<InputOutcome> {
+    if let Event::Mouse(mouse) = &event {
+        if state.show_help || state.no_sessions_confirm_open {
+            return Ok(InputOutcome::Continue(false));
+        }
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            if let Some(action) = ui_click_action_at(&state.ui_hit_targets, mouse.column, mouse.row)
+            {
+                let changed = apply_ui_click_action(state, action);
+                return Ok(InputOutcome::Continue(changed));
+            }
+        }
+    }
+
     if let Event::Key(key) = &event {
         if key.kind != KeyEventKind::Press {
             return Ok(InputOutcome::Continue(false));
@@ -574,6 +626,10 @@ fn handle_input_event(
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(InputOutcome::Quit),
             (KeyCode::Char('s'), _) | (KeyCode::Char('S'), _) | (KeyCode::F(2), _) => {
                 state.active_screen = next_active_screen(state.active_screen);
+                return Ok(InputOutcome::Continue(true));
+            }
+            (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) => {
+                state.display_style = state.display_style.toggled();
                 return Ok(InputOutcome::Continue(true));
             }
             (KeyCode::Char('r'), _) | (KeyCode::F(5), _)
@@ -620,6 +676,60 @@ fn handle_input_event(
             &mut state.read_browser,
             event,
         )?)),
+    }
+}
+
+fn ui_click_action_at(targets: &[UiHitTarget], column: u16, row: u16) -> Option<UiClickAction> {
+    targets
+        .iter()
+        .find(|target| target.contains(column, row))
+        .map(|target| target.action)
+}
+
+fn apply_ui_click_action(state: &mut AppState, action: UiClickAction) -> bool {
+    match action {
+        UiClickAction::SetScreen(screen) => {
+            let changed = state.active_screen != screen;
+            state.active_screen = screen;
+            changed
+        }
+        UiClickAction::SetMetric(metric) => {
+            let changed = state.metric != metric;
+            state.metric = metric;
+            changed
+        }
+        UiClickAction::SetRange(range) => {
+            let changed = state.range != range;
+            state.range = range;
+            changed
+        }
+        UiClickAction::SetOrientation(orientation) => {
+            let changed = state.orientation != orientation;
+            state.orientation = orientation;
+            changed
+        }
+        UiClickAction::DecreaseProjects => {
+            let next = state
+                .activity_project_limit
+                .saturating_sub(1)
+                .max(MIN_ACTIVITY_PROJECT_LIMIT);
+            let changed = next != state.activity_project_limit;
+            state.activity_project_limit = next;
+            changed
+        }
+        UiClickAction::IncreaseProjects => {
+            let next = state
+                .activity_project_limit
+                .saturating_add(1)
+                .min(MAX_ACTIVITY_PROJECT_LIMIT);
+            let changed = next != state.activity_project_limit;
+            state.activity_project_limit = next;
+            changed
+        }
+        UiClickAction::CycleDisplayStyle => {
+            state.display_style = state.display_style.toggled();
+            true
+        }
     }
 }
 
@@ -882,6 +992,11 @@ fn load_persisted_ui_state(
         state.activity_project_limit =
             limit.clamp(MIN_ACTIVITY_PROJECT_LIMIT, MAX_ACTIVITY_PROJECT_LIMIT);
     }
+    if let Some(style_text) = store.global.display_style.as_deref() {
+        if let Some(style) = DisplayStyle::from_store(style_text) {
+            state.display_style = style;
+        }
+    }
 
     if let Some(workspace_path) = state.workspace_path.as_ref() {
         let workspace_key = workspace_path.to_string_lossy();
@@ -909,6 +1024,7 @@ fn save_persisted_ui_state(comon_home: &Path, state: &PersistedUiState) -> Resul
             .activity_project_limit
             .clamp(MIN_ACTIVITY_PROJECT_LIMIT, MAX_ACTIVITY_PROJECT_LIMIT),
     );
+    store.global.display_style = Some(state.display_style.store_value().to_string());
     store.global.last_workspace_path = workspace_path_text.clone();
     store.global.updated_at = now;
 
@@ -1008,6 +1124,10 @@ fn unix_time_seconds() -> i64 {
 }
 
 impl AppState {
+    pub(crate) fn formatter(&self) -> DisplayFormatter<'_> {
+        DisplayFormatter::new(self.display_style, &self.system_locale)
+    }
+
     pub(crate) fn usage_updated_label(&self) -> Option<String> {
         let updated_at = self.usage_updated_at?;
         Some(crate::ui::format_updated_label(updated_at))
@@ -1025,6 +1145,25 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn ui_hit_targets_include_left_top_and_exclude_right_bottom_edges() {
+        let targets = [UiHitTarget {
+            area: Rect::new(10, 5, 4, 2),
+            action: UiClickAction::SetMetric(UsageMetric::Runs),
+        }];
+
+        assert_eq!(
+            ui_click_action_at(&targets, 10, 5),
+            Some(UiClickAction::SetMetric(UsageMetric::Runs))
+        );
+        assert_eq!(
+            ui_click_action_at(&targets, 13, 6),
+            Some(UiClickAction::SetMetric(UsageMetric::Runs))
+        );
+        assert_eq!(ui_click_action_at(&targets, 14, 5), None);
+        assert_eq!(ui_click_action_at(&targets, 10, 7), None);
+    }
 
     fn make_temp_dir(prefix: &str) -> PathBuf {
         let unique = format!(
@@ -1091,6 +1230,44 @@ mod tests {
             .expect("load persisted ui state");
         assert_eq!(loaded.workspace_path, Some(workspace_path));
         assert!(loaded.no_sessions_confirm_dismissed);
+
+        let _ = std::fs::remove_dir_all(comon_home);
+    }
+
+    #[test]
+    fn legacy_state_without_display_style_defaults_to_classic() {
+        let comon_home = make_temp_dir("legacy-display-style");
+        let store = StateStore::default();
+        write_state_store(&comon_home, &store).expect("write state store");
+
+        let loaded = load_persisted_ui_state(&comon_home, None).expect("load persisted ui state");
+        assert_eq!(loaded.display_style, DisplayStyle::Classic);
+
+        let _ = std::fs::remove_dir_all(comon_home);
+    }
+
+    #[test]
+    fn display_style_round_trips_through_state_store() {
+        let comon_home = make_temp_dir("system-display-style");
+        let mut state = PersistedUiState::default_for_workspace(None);
+        state.display_style = DisplayStyle::SystemFull;
+
+        save_persisted_ui_state(&comon_home, &state).expect("save persisted ui state");
+        let loaded = load_persisted_ui_state(&comon_home, None).expect("load persisted ui state");
+        assert_eq!(loaded.display_style, DisplayStyle::SystemFull);
+
+        let _ = std::fs::remove_dir_all(comon_home);
+    }
+
+    #[test]
+    fn legacy_system_style_restores_as_system_compact() {
+        let comon_home = make_temp_dir("legacy-system-display-style");
+        let mut store = StateStore::default();
+        store.global.display_style = Some("system".to_string());
+        write_state_store(&comon_home, &store).expect("write state store");
+
+        let loaded = load_persisted_ui_state(&comon_home, None).expect("load persisted ui state");
+        assert_eq!(loaded.display_style, DisplayStyle::SystemCompact);
 
         let _ = std::fs::remove_dir_all(comon_home);
     }

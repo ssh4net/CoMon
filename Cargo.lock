@@ -265,12 +265,14 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "libc",
  "ratatui",
  "rusqlite",
  "serde",
  "serde_json",
  "tokio",
  "unicode-width",
+ "windows-sys",
 ]
 
 [[package]]

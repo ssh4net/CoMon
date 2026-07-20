@@ -1,5 +1,6 @@
 mod app;
 mod codex_rpc;
+mod locale;
 mod read;
 mod storage;
 mod ui;
@@ -357,6 +358,7 @@ async fn main() -> Result<()> {
         full_scan,
         scan_cache_max_entries,
     };
+    let system_locale = locale::SystemLocale::detect();
 
     let config = app::Config {
         codex_bin: args.codex_bin.clone(),
@@ -373,6 +375,7 @@ async fn main() -> Result<()> {
         refresh_limits_secs,
         usage_scan_limits,
         rebuild_cache_on_start: args.rebuild_cache_on_start,
+        system_locale,
     };
 
     app::run(config).await

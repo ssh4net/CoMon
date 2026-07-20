@@ -132,6 +132,8 @@ comon --scan-time-budget-ms 1500 --max-jsonl-line-kib 512
 - `Tab` Toggle data (Tokens/Time/Runs)
 - `w` Toggle timeframe (Week/Month)
 - `f` Toggle layout (Horz/Vert)
+- `n` Cycle display formatting (Classic/System Compact/System Full)
+- Mouse: click the top tabs to switch screens; click Tokens/Time/Runs, Week/Month, Horz/Vert, or Activity project-count controls; click the footer to cycle display formatting
 - `s` / `F2` Switch between Usage and Session history
 - `r` / `F5` Refresh current screen
 - `?` Help overlay
@@ -340,6 +342,7 @@ CI also runs this check on each push and pull request via `.github/workflows/asc
 - Usage stats are derived from Codex session JSONL logs. If you have no session data yet, values will be empty.
 - Limits/credits require Codex App Server to start successfully (auth, environment, and a usable working directory). CoMon auto-detects `codex` on `PATH` and common Windows Codex App bundle locations; use `--codex-bin` or `--app-server-bin` when needed.
 - comon stores local app state in `~/.comon/state.json` by default (or `$COMON_HOME`, or `--comon-home`).
+- Display formatting starts in Classic mode; press `n` to cycle through Classic, System Compact, and System Full. Both System modes use the operating system locale for numbers, dates, times, and calendar labels; Compact abbreviates dashboard token values, while Full keeps them expanded except for the pre-existing compact summary values. The choice is saved in `state.json` without changing stored data.
 - comon stores scan cache in `~/.comon/comon.db` to avoid rereading unchanged session files.
 - Large session logs are parsed incrementally with persisted parser offsets in `comon.db`; unchanged files are reused from cache.
 - If historical days look incomplete after adding old session files, run once with `--full-scan --scan-time-budget-ms 0` to force a full reparse and refresh cached summaries.

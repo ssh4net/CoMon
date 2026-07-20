@@ -32,6 +32,9 @@ const ACTIVITY_COLORS: [Color; 4] = [
     Color::Indexed(37),
     Color::Cyan,
 ];
+const DARK_BAR_COLOR: Color = Color::Cyan;
+const LIGHT_BAR_COLOR: Color = Color::LightCyan;
+const USAGE_HEADER_HEIGHT: u16 = 3;
 
 pub fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
@@ -73,13 +76,17 @@ pub fn format_updated_label(updated_at: Instant) -> String {
 pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
     state.ui_hit_targets.clear();
     let area = frame.area();
-    let (title, navigation_targets) = navigation_title(area, state.active_screen);
+    let (navigation, navigation_targets) = navigation_title(area, state.active_screen);
     state.ui_hit_targets.extend(navigation_targets);
 
     let outer = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
-        .title(title);
+        .title(Span::styled(
+            format!(" comon :: {} ", env!("CARGO_PKG_VERSION")),
+            Style::default().add_modifier(Modifier::BOLD),
+        ))
+        .title_top(navigation.right_aligned());
     frame.render_widget(outer, area);
 
     let inner = apply_margin(
@@ -93,14 +100,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
     match state.active_screen {
         ActiveScreen::Usage => {
             let footer_height = footer_height(inner.width, state);
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),
-                    Constraint::Min(0),
-                    Constraint::Length(footer_height),
-                ])
-                .split(inner);
+            let chunks = usage_screen_layout(inner, footer_height);
 
             render_header(frame, chunks[0], state);
             render_usage(frame, chunks[1], state);
@@ -168,6 +168,18 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
     }
 }
 
+fn usage_screen_layout(area: Rect, footer_height: u16) -> [Rect; 3] {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(USAGE_HEADER_HEIGHT),
+            Constraint::Min(0),
+            Constraint::Length(footer_height),
+        ])
+        .split(area);
+    [chunks[0], chunks[1], chunks[2]]
+}
+
 fn navigation_title(area: Rect, active_screen: ActiveScreen) -> (Line<'static>, Vec<UiHitTarget>) {
     let title_area = Rect::new(
         area.x.saturating_add(1),
@@ -176,7 +188,7 @@ fn navigation_title(area: Rect, active_screen: ActiveScreen) -> (Line<'static>, 
         1,
     );
     let segments = [
-        (" comon ::", None),
+        (" ", None),
         (
             " USAGE ",
             Some(UiClickAction::SetScreen(ActiveScreen::Usage)),
@@ -194,38 +206,36 @@ fn navigation_title(area: Rect, active_screen: ActiveScreen) -> (Line<'static>, 
             Some(UiClickAction::SetScreen(ActiveScreen::Read)),
         ),
     ];
-    let targets = left_aligned_targets(title_area, &segments);
-    if targets.len() != 4 {
-        let current = match active_screen {
-            ActiveScreen::Usage => "usage",
-            ActiveScreen::Activity => "activity",
-            ActiveScreen::LimitResets => "limit resets",
-            ActiveScreen::Read => "session history",
-        };
-        return (
-            Line::from(Span::styled(
-                format!(" comon :: {current} "),
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Vec::new(),
-        );
+    let app_title_width =
+        UnicodeWidthStr::width(format!(" comon :: {} ", env!("CARGO_PKG_VERSION")).as_str());
+    let navigation_width = segments
+        .iter()
+        .map(|(text, _)| UnicodeWidthStr::width(*text))
+        .sum::<usize>();
+    if app_title_width
+        .saturating_add(1)
+        .saturating_add(navigation_width)
+        > title_area.width as usize
+    {
+        return (Line::default(), Vec::new());
     }
 
     let line = Line::from(vec![
-        Span::styled(" comon ::", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
         pill("USAGE", active_screen == ActiveScreen::Usage),
         pill("ACTIVITY", active_screen == ActiveScreen::Activity),
         pill("LIMITS", active_screen == ActiveScreen::LimitResets),
         pill("HISTORY", active_screen == ActiveScreen::Read),
     ]);
-    (line, targets)
+    (line, right_aligned_targets(title_area, &segments))
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let line_area = usage_header_line_area(area);
     let row = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(20), Constraint::Length(18)])
-        .split(area);
+        .split(line_area);
 
     let title = "USAGE_SNAPSHOT";
     let left = Paragraph::new(Line::from(Span::styled(
@@ -242,6 +252,15 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
     let right = Paragraph::new(updated).alignment(Alignment::Right);
     frame.render_widget(right, row[1]);
+}
+
+fn usage_header_line_area(area: Rect) -> Rect {
+    Rect {
+        x: area.x,
+        y: area.y.saturating_add(area.height.min(2).saturating_sub(1)),
+        width: area.width,
+        height: area.height.min(1),
+    }
 }
 
 fn render_activity_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -402,7 +421,7 @@ fn render_activity_controls(
     let reset_height = reset_summary_height(reset_summary, area.width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Length(reset_height)])
+        .constraints([Constraint::Length(1), Constraint::Length(reset_height)])
         .split(area);
 
     let workspace_label = state
@@ -414,92 +433,20 @@ fn render_activity_controls(
     let tokens = pill("TOKENS", state.metric == UsageMetric::Tokens);
     let time = pill("TIME", state.metric == UsageMetric::Time);
     let runs = pill("RUNS", state.metric == UsageMetric::Runs);
-    let project_count = format!(" {:>2} ", state.activity_project_limit);
-    let project_count_span = Span::styled(
-        project_count.clone(),
-        Style::default().add_modifier(Modifier::BOLD),
+    let project_count = state.activity_project_limit.to_string();
+
+    render_flat_activity_controls(
+        frame,
+        chunks[0],
+        state,
+        &workspace_label,
+        vec![tokens, time, runs],
+        project_count,
     );
-
-    if let Some([view_area, projects_area]) = activity_control_group_areas(chunks[0]) {
-        let workspace_area = Rect {
-            x: chunks[0].x,
-            y: chunks[0].y.saturating_add(1),
-            width: view_area.x.saturating_sub(chunks[0].x).saturating_sub(1),
-            height: 1,
-        };
-        render_workspace_label(frame, workspace_area, &workspace_label);
-        render_control_group(frame, view_area, "VIEW", vec![tokens, time, runs]);
-        render_control_group(
-            frame,
-            projects_area,
-            "PROJECTS",
-            vec![pill("-", false), project_count_span, pill("+", false)],
-        );
-
-        register_group_targets(
-            state,
-            view_area,
-            &[
-                (
-                    " TOKENS ",
-                    Some(UiClickAction::SetMetric(UsageMetric::Tokens)),
-                ),
-                (" TIME ", Some(UiClickAction::SetMetric(UsageMetric::Time))),
-                (" RUNS ", Some(UiClickAction::SetMetric(UsageMetric::Runs))),
-            ],
-        );
-        register_group_targets(
-            state,
-            projects_area,
-            &[
-                (" - ", Some(UiClickAction::DecreaseProjects)),
-                (&project_count, None),
-                (" + ", Some(UiClickAction::IncreaseProjects)),
-            ],
-        );
-    } else {
-        render_flat_activity_controls(
-            frame,
-            chunks[0],
-            state,
-            &workspace_label,
-            vec![tokens, time, runs],
-            &project_count,
-            project_count_span,
-        );
-    }
 
     if let Some(text) = reset_summary {
         render_reset_summary(frame, chunks[1], text);
     }
-}
-
-fn activity_control_group_areas(area: Rect) -> Option<[Rect; 2]> {
-    const VIEW_WIDTH: u16 = 22;
-    const PROJECTS_WIDTH: u16 = 12;
-    const GAP: u16 = 1;
-    const TOTAL_WIDTH: u16 = VIEW_WIDTH + PROJECTS_WIDTH + GAP;
-    const MIN_WORKSPACE_WIDTH: u16 = 20;
-    const WORKSPACE_GAP: u16 = 1;
-
-    if area.width
-        < TOTAL_WIDTH
-            .saturating_add(MIN_WORKSPACE_WIDTH)
-            .saturating_add(WORKSPACE_GAP)
-        || area.height < 3
-    {
-        return None;
-    }
-
-    let start_x = area.x.saturating_add(area.width - TOTAL_WIDTH);
-    let view = Rect::new(start_x, area.y, VIEW_WIDTH, 3);
-    let projects = Rect::new(
-        view.x.saturating_add(VIEW_WIDTH + GAP),
-        area.y,
-        PROJECTS_WIDTH,
-        3,
-    );
-    Some([view, projects])
 }
 
 fn render_flat_activity_controls(
@@ -508,21 +455,19 @@ fn render_flat_activity_controls(
     state: &mut AppState,
     workspace_label: &str,
     metric_pills: Vec<Span<'static>>,
-    project_count: &str,
-    project_count_span: Span<'static>,
+    project_count: String,
 ) {
-    let center = Rect::new(area.x, area.y.saturating_add(1), area.width, 1);
     let row = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(20), Constraint::Min(0)])
-        .split(center);
+        .split(area);
     render_workspace_label(frame, row[0], workspace_label);
 
     register_right_aligned_targets(
         state,
         row[1],
         &[
-            ("VIEW ", None),
+            (" VIEW ", None),
             (
                 " TOKENS ",
                 Some(UiClickAction::SetMetric(UsageMetric::Tokens)),
@@ -530,29 +475,28 @@ fn render_flat_activity_controls(
             (" TIME ", Some(UiClickAction::SetMetric(UsageMetric::Time))),
             (" RUNS ", Some(UiClickAction::SetMetric(UsageMetric::Runs))),
             (" PROJECTS ", None),
-            (" - ", Some(UiClickAction::DecreaseProjects)),
-            (project_count, None),
             (" + ", Some(UiClickAction::IncreaseProjects)),
+            (&project_count, None),
+            (" -", Some(UiClickAction::DecreaseProjects)),
         ],
     );
 
-    let mut spans = vec![
-        Span::styled("VIEW", Style::default().fg(Color::Gray)),
-        Span::raw(" "),
-    ];
+    let mut spans = vec![control_group_label("VIEW")];
     spans.extend(metric_pills);
-    spans.extend([
-        Span::raw(" "),
-        Span::styled("PROJECTS", Style::default().fg(Color::Gray)),
-        Span::raw(" "),
-        pill("-", false),
-        project_count_span,
-        pill("+", false),
-    ]);
+    spans.push(control_group_label("PROJECTS"));
+    spans.extend(activity_project_control_spans(project_count));
     frame.render_widget(
         Paragraph::new(Line::from(spans)).alignment(Alignment::Right),
         row[1],
     );
+}
+
+fn activity_project_control_spans(project_count: String) -> [Span<'static>; 3] {
+    [
+        pill("+", false),
+        Span::styled(project_count, Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(" -", Style::default().fg(Color::Gray)),
+    ]
 }
 
 fn render_activity_heatmaps(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -962,7 +906,7 @@ fn render_usage_controls(
     let reset_height = reset_summary_height(reset_summary, area.width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Length(reset_height)])
+        .constraints([Constraint::Length(1), Constraint::Length(reset_height)])
         .split(area);
 
     let workspace_label = state
@@ -979,62 +923,13 @@ fn render_usage_controls(
     let vert = pill("VERT", state.orientation == ChartOrientation::Vertical);
     let horz = pill("HORZ", state.orientation == ChartOrientation::Horizontal);
 
-    if let Some([view_area, graph_area, bars_area]) = usage_control_group_areas(chunks[0]) {
-        let workspace_area = Rect {
-            x: chunks[0].x,
-            y: chunks[0].y.saturating_add(1),
-            width: view_area.x.saturating_sub(chunks[0].x).saturating_sub(1),
-            height: 1,
-        };
-        render_workspace_label(frame, workspace_area, &workspace_label);
-
-        render_control_group(frame, view_area, "VIEW", vec![tokens, time, runs]);
-        render_control_group(frame, graph_area, "GRAPH", vec![week, month]);
-        render_control_group(frame, bars_area, "BARS", vec![vert, horz]);
-
-        register_group_targets(
-            state,
-            view_area,
-            &[
-                (
-                    " TOKENS ",
-                    Some(UiClickAction::SetMetric(UsageMetric::Tokens)),
-                ),
-                (" TIME ", Some(UiClickAction::SetMetric(UsageMetric::Time))),
-                (" RUNS ", Some(UiClickAction::SetMetric(UsageMetric::Runs))),
-            ],
-        );
-        register_group_targets(
-            state,
-            graph_area,
-            &[
-                (" WEEK ", Some(UiClickAction::SetRange(ChartRange::Week))),
-                (" MONTH ", Some(UiClickAction::SetRange(ChartRange::Month))),
-            ],
-        );
-        register_group_targets(
-            state,
-            bars_area,
-            &[
-                (
-                    " VERT ",
-                    Some(UiClickAction::SetOrientation(ChartOrientation::Vertical)),
-                ),
-                (
-                    " HORZ ",
-                    Some(UiClickAction::SetOrientation(ChartOrientation::Horizontal)),
-                ),
-            ],
-        );
-    } else {
-        render_flat_usage_controls(
-            frame,
-            chunks[0],
-            state,
-            &workspace_label,
-            vec![tokens, time, runs, week, month, vert, horz],
-        );
-    }
+    render_flat_usage_controls(
+        frame,
+        chunks[0],
+        state,
+        &workspace_label,
+        vec![tokens, time, runs, week, month, vert, horz],
+    );
 
     if let Some(text) = reset_summary {
         render_reset_summary(frame, chunks[1], text);
@@ -1053,71 +948,6 @@ fn render_workspace_label(frame: &mut Frame<'_>, area: Rect, workspace_label: &s
     frame.render_widget(left, area);
 }
 
-fn render_control_group(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    title: &'static str,
-    options: Vec<Span<'static>>,
-) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .title(Span::styled(
-            format!(" {title} "),
-            Style::default().fg(Color::Gray),
-        ));
-    frame.render_widget(Paragraph::new(Line::from(options)).block(block), area);
-}
-
-fn register_group_targets(
-    state: &mut AppState,
-    area: Rect,
-    segments: &[(&str, Option<UiClickAction>)],
-) {
-    let content = Rect {
-        x: area.x.saturating_add(1),
-        y: area.y.saturating_add(1),
-        width: area.width.saturating_sub(2),
-        height: 1,
-    };
-    register_right_aligned_targets(state, content, segments);
-}
-
-fn usage_control_group_areas(area: Rect) -> Option<[Rect; 3]> {
-    const VIEW_WIDTH: u16 = 22;
-    const GRAPH_WIDTH: u16 = 15;
-    const BARS_WIDTH: u16 = 14;
-    const GAP: u16 = 1;
-    const TOTAL_WIDTH: u16 = VIEW_WIDTH + GRAPH_WIDTH + BARS_WIDTH + GAP * 2;
-    const MIN_WORKSPACE_WIDTH: u16 = 20;
-    const WORKSPACE_GAP: u16 = 1;
-
-    if area.width
-        < TOTAL_WIDTH
-            .saturating_add(MIN_WORKSPACE_WIDTH)
-            .saturating_add(WORKSPACE_GAP)
-        || area.height < 3
-    {
-        return None;
-    }
-
-    let start_x = area.x.saturating_add(area.width - TOTAL_WIDTH);
-    let view = Rect::new(start_x, area.y, VIEW_WIDTH, 3);
-    let graph = Rect::new(
-        start_x.saturating_add(VIEW_WIDTH + GAP),
-        area.y,
-        GRAPH_WIDTH,
-        3,
-    );
-    let bars = Rect::new(
-        graph.x.saturating_add(GRAPH_WIDTH + GAP),
-        area.y,
-        BARS_WIDTH,
-        3,
-    );
-    Some([view, graph, bars])
-}
-
 fn render_flat_usage_controls(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1125,18 +955,17 @@ fn render_flat_usage_controls(
     workspace_label: &str,
     pills: Vec<Span<'static>>,
 ) {
-    let center = Rect::new(area.x, area.y.saturating_add(1), area.width, 1);
     let row = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(20), Constraint::Min(0)])
-        .split(center);
+        .split(area);
     render_workspace_label(frame, row[0], workspace_label);
 
     register_right_aligned_targets(
         state,
         row[1],
         &[
-            ("VIEW ", None),
+            (" VIEW ", None),
             (
                 " TOKENS ",
                 Some(UiClickAction::SetMetric(UsageMetric::Tokens)),
@@ -1158,27 +987,26 @@ fn render_flat_usage_controls(
         ],
     );
 
-    let mut spans = vec![
-        Span::styled("VIEW", Style::default().fg(Color::Gray)),
-        Span::raw(" "),
-    ];
+    let mut spans = vec![control_group_label("VIEW")];
     spans.extend(pills[0..3].iter().cloned());
-    spans.extend([
-        Span::raw(" "),
-        Span::styled("GRAPH", Style::default().fg(Color::Gray)),
-        Span::raw(" "),
-    ]);
+    spans.push(control_group_label("GRAPH"));
     spans.extend(pills[3..5].iter().cloned());
-    spans.extend([
-        Span::raw(" "),
-        Span::styled("BARS", Style::default().fg(Color::Gray)),
-        Span::raw(" "),
-    ]);
+    spans.push(control_group_label("BARS"));
     spans.extend(pills[5..7].iter().cloned());
     frame.render_widget(
         Paragraph::new(Line::from(spans)).alignment(Alignment::Right),
         row[1],
     );
+}
+
+fn control_group_label(label: &'static str) -> Span<'static> {
+    Span::styled(
+        format!(" {label} "),
+        Style::default()
+            .fg(Color::Black)
+            .bg(DARK_BAR_COLOR)
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 #[derive(Debug)]
@@ -2175,9 +2003,9 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                 }
 
                 let fill_bg = if i % 2 == 0 {
-                    Color::Cyan
+                    DARK_BAR_COLOR
                 } else {
-                    Color::LightCyan
+                    LIGHT_BAR_COLOR
                 };
 
                 let ratio = (*value as f64) / (max_value as f64);
@@ -2402,9 +2230,9 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                 let ratio = (*value as f64) / (max_value as f64);
                 let filled = ((bar_area.width as f64) * ratio.clamp(0.0, 1.0)).round() as u16;
                 let fill_bg = if idx % 2 == 0 {
-                    Color::Cyan
+                    DARK_BAR_COLOR
                 } else {
-                    Color::LightCyan
+                    LIGHT_BAR_COLOR
                 };
                 for yy in bar_area.y..bar_area.y.saturating_add(bar_area.height) {
                     for xx in bar_area.x..bar_area.x.saturating_add(bar_area.width) {
@@ -2784,34 +2612,6 @@ fn right_aligned_targets(
     targets
 }
 
-fn left_aligned_targets(
-    area: Rect,
-    segments: &[(&str, Option<UiClickAction>)],
-) -> Vec<UiHitTarget> {
-    let total_width = segments.iter().fold(0_u16, |total, (text, _)| {
-        total.saturating_add(UnicodeWidthStr::width(*text).min(u16::MAX as usize) as u16)
-    });
-    if total_width > area.width || area.height == 0 {
-        return Vec::new();
-    }
-
-    let mut targets = Vec::new();
-    let mut x = area.x;
-    for (text, action) in segments {
-        let width = UnicodeWidthStr::width(*text).min(u16::MAX as usize) as u16;
-        if let Some(action) = action {
-            if width > 0 {
-                targets.push(UiHitTarget {
-                    area: Rect::new(x, area.y, width, 1),
-                    action: *action,
-                });
-            }
-        }
-        x = x.saturating_add(width);
-    }
-    targets
-}
-
 fn card(
     title: &str,
     value: &str,
@@ -2951,11 +2751,11 @@ fn reset_summary_height(summary: Option<&str>, width: u16) -> u16 {
 }
 
 fn usage_controls_height(summary: Option<&str>, width: u16) -> u16 {
-    3_u16.saturating_add(reset_summary_height(summary, width))
+    1_u16.saturating_add(reset_summary_height(summary, width))
 }
 
 fn activity_controls_height(summary: Option<&str>, width: u16) -> u16 {
-    3_u16.saturating_add(reset_summary_height(summary, width))
+    1_u16.saturating_add(reset_summary_height(summary, width))
 }
 
 fn render_reset_summary(frame: &mut Frame<'_>, area: Rect, text: &str) {
@@ -3557,62 +3357,71 @@ mod tests {
 
     #[test]
     fn navigation_tabs_are_clickable_on_the_outer_border() {
-        let (title, targets) = navigation_title(Rect::new(4, 2, 45, 20), ActiveScreen::Activity);
+        let (title, targets) = navigation_title(Rect::new(4, 2, 60, 20), ActiveScreen::Activity);
 
-        assert_eq!(title.width(), 43);
+        assert_eq!(title.width(), 35);
         assert_eq!(targets.len(), 4);
-        assert_eq!(targets[0].area, Rect::new(14, 2, 7, 1));
+        assert_eq!(targets[0].area, Rect::new(29, 2, 7, 1));
         assert_eq!(
             targets[0].action,
             UiClickAction::SetScreen(ActiveScreen::Usage)
         );
-        assert_eq!(targets[1].area, Rect::new(21, 2, 10, 1));
-        assert_eq!(targets[2].area, Rect::new(31, 2, 8, 1));
-        assert_eq!(targets[3].area, Rect::new(39, 2, 9, 1));
+        assert_eq!(targets[1].area, Rect::new(36, 2, 10, 1));
+        assert_eq!(targets[2].area, Rect::new(46, 2, 8, 1));
+        assert_eq!(targets[3].area, Rect::new(54, 2, 9, 1));
     }
 
     #[test]
-    fn navigation_title_falls_back_before_tabs_would_touch_the_border() {
-        let (_, targets) = navigation_title(Rect::new(0, 0, 44, 10), ActiveScreen::Usage);
+    fn navigation_title_hides_tabs_before_they_touch_the_version() {
+        let (title, targets) = navigation_title(Rect::new(0, 0, 52, 10), ActiveScreen::Usage);
+        assert!(title.spans.is_empty());
         assert!(targets.is_empty());
     }
 
     #[test]
-    fn activity_control_groups_match_usage_control_height() {
-        let [view, projects] =
-            activity_control_group_areas(Rect::new(10, 4, 60, 3)).expect("framed controls");
+    fn usage_header_has_one_blank_row_above_and_below() {
+        let chunks = usage_screen_layout(Rect::new(2, 1, 100, 20), 1);
+        let header_line = usage_header_line_area(chunks[0]);
 
-        assert_eq!(view, Rect::new(35, 4, 22, 3));
-        assert_eq!(projects, Rect::new(58, 4, 12, 3));
-        assert_eq!(view.height, projects.height);
-        assert_eq!(view.x + view.width + 1, projects.x);
+        assert_eq!(chunks[0], Rect::new(2, 1, 100, 3));
+        assert_eq!(header_line, Rect::new(2, 2, 100, 1));
+        assert_eq!(header_line.y + header_line.height + 1, chunks[1].y);
     }
 
     #[test]
-    fn activity_control_groups_preserve_workspace_width() {
-        assert!(activity_control_group_areas(Rect::new(0, 0, 55, 3)).is_none());
-        assert!(activity_control_group_areas(Rect::new(0, 0, 56, 3)).is_some());
+    fn control_group_labels_include_cyan_side_spaces() {
+        let label = control_group_label("VIEW");
+        assert_eq!(label.content.as_ref(), " VIEW ");
+        assert_eq!(label.style.bg, Some(DARK_BAR_COLOR));
+        assert_eq!(label.style.fg, Some(Color::Black));
     }
 
     #[test]
-    fn usage_control_groups_are_equal_height_and_right_aligned() {
-        let [view, graph, bars] =
-            usage_control_group_areas(Rect::new(10, 4, 80, 3)).expect("framed controls");
+    fn activity_project_controls_are_increment_count_decrement() {
+        let targets = right_aligned_targets(
+            Rect::new(0, 0, 17, 1),
+            &[
+                (" PROJECTS ", None),
+                (" + ", Some(UiClickAction::IncreaseProjects)),
+                ("10", None),
+                (" -", Some(UiClickAction::DecreaseProjects)),
+            ],
+        );
 
-        assert_eq!(view, Rect::new(37, 4, 22, 3));
-        assert_eq!(graph, Rect::new(60, 4, 15, 3));
-        assert_eq!(bars, Rect::new(76, 4, 14, 3));
-        assert_eq!(view.height, graph.height);
-        assert_eq!(graph.height, bars.height);
-        assert_eq!(view.x + view.width + 1, graph.x);
-        assert_eq!(graph.x + graph.width + 1, bars.x);
-    }
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].area, Rect::new(10, 0, 3, 1));
+        assert_eq!(targets[0].action, UiClickAction::IncreaseProjects);
+        assert_eq!(targets[1].area, Rect::new(15, 0, 2, 1));
+        assert_eq!(targets[1].action, UiClickAction::DecreaseProjects);
 
-    #[test]
-    fn usage_control_groups_fall_back_when_too_narrow() {
-        assert!(usage_control_group_areas(Rect::new(0, 0, 73, 3)).is_none());
-        assert!(usage_control_group_areas(Rect::new(0, 0, 74, 3)).is_some());
-        assert!(usage_control_group_areas(Rect::new(0, 0, 74, 2)).is_none());
+        for value in ["7", "42", "1234"] {
+            let spans = activity_project_control_spans(value.to_string());
+            let rendered = spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            assert_eq!(rendered, format!(" + {value} -"));
+        }
     }
 
     #[test]
@@ -3727,8 +3536,8 @@ mod tests {
     fn reset_summary_height_accounts_for_its_label() {
         let summary = "Resets: 3 available | earliest expires 18 Jul";
         assert!(reset_summary_height(Some(summary), 24) > wrapped_line_count(summary, 24));
-        assert_eq!(usage_controls_height(None, 80), 3);
-        assert_eq!(activity_controls_height(None, 80), 3);
+        assert_eq!(usage_controls_height(None, 80), 1);
+        assert_eq!(activity_controls_height(None, 80), 1);
     }
 
     #[test]

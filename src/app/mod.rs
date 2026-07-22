@@ -83,6 +83,10 @@ pub(crate) enum UiClickAction {
     PromptQuit,
     CancelQuit,
     ConfirmQuit,
+    ToggleQuitDontAskAgain,
+    PromptQuitConfirmationPreference,
+    ConfirmQuitConfirmationPreference,
+    CancelQuitConfirmationPreference,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,8 +146,12 @@ pub(crate) struct AppState {
     pub(crate) no_sessions_confirm_open: bool,
     pub(crate) no_sessions_confirm_dismissed: bool,
     pub(crate) quit_confirm_open: bool,
+    pub(crate) quit_dont_ask_again: bool,
+    pub(crate) skip_quit_confirmation: bool,
+    pub(crate) quit_preference_prompt: Option<bool>,
     pub(crate) display_style: DisplayStyle,
     pub(crate) system_locale: SystemLocale,
+    pub(crate) mouse_position: Option<(u16, u16)>,
     pub(crate) ui_hit_targets: Vec<UiHitTarget>,
 
     pub(crate) usage: Option<LocalUsageSnapshot>,
@@ -181,6 +189,7 @@ struct PersistedUiState {
     workspace_path: Option<PathBuf>,
     no_sessions_confirm_dismissed: bool,
     display_style: DisplayStyle,
+    skip_quit_confirmation: bool,
 }
 
 impl PersistedUiState {
@@ -193,6 +202,7 @@ impl PersistedUiState {
             workspace_path,
             no_sessions_confirm_dismissed: false,
             display_style: DisplayStyle::Classic,
+            skip_quit_confirmation: false,
         }
     }
 
@@ -205,6 +215,7 @@ impl PersistedUiState {
             workspace_path: state.workspace_path.clone(),
             no_sessions_confirm_dismissed: state.no_sessions_confirm_dismissed,
             display_style: state.display_style,
+            skip_quit_confirmation: state.skip_quit_confirmation,
         }
     }
 }
@@ -235,6 +246,8 @@ struct StoredGlobalState {
     orientation: Option<String>,
     activity_project_limit: Option<usize>,
     display_style: Option<String>,
+    #[serde(default)]
+    skip_quit_confirmation: bool,
     last_workspace_path: Option<String>,
     updated_at: i64,
 }
@@ -484,8 +497,12 @@ async fn run_inner(
         no_sessions_confirm_open: false,
         no_sessions_confirm_dismissed: restored_ui_state.no_sessions_confirm_dismissed,
         quit_confirm_open: false,
+        quit_dont_ask_again: false,
+        skip_quit_confirmation: restored_ui_state.skip_quit_confirmation,
+        quit_preference_prompt: None,
         display_style: restored_ui_state.display_style,
         system_locale: config.system_locale.clone(),
+        mouse_position: None,
         ui_hit_targets: Vec::new(),
         usage: None,
         usage_updated_at: None,
@@ -608,20 +625,28 @@ fn handle_input_event(
     usage_refresh_tx: &mpsc::Sender<()>,
     limits_refresh_tx: &mpsc::Sender<()>,
 ) -> Result<InputOutcome> {
-    if state.quit_confirm_open {
+    if let Some(desired_skip_confirmation) = state.quit_preference_prompt {
         return match event {
             Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
                 match ui_click_action_at(&state.ui_hit_targets, mouse.column, mouse.row) {
-                    Some(UiClickAction::ConfirmQuit) => Ok(InputOutcome::Quit),
-                    Some(UiClickAction::CancelQuit) => {
-                        state.quit_confirm_open = false;
+                    Some(UiClickAction::ConfirmQuitConfirmationPreference) => {
+                        state.skip_quit_confirmation = desired_skip_confirmation;
+                        state.quit_preference_prompt = None;
+                        Ok(InputOutcome::Continue(true))
+                    }
+                    Some(UiClickAction::CancelQuitConfirmationPreference) => {
+                        state.quit_preference_prompt = None;
                         Ok(InputOutcome::Continue(true))
                     }
                     _ => Ok(InputOutcome::Continue(false)),
                 }
             }
             Event::Key(key) if key.kind == KeyEventKind::Press => match (key.code, key.modifiers) {
-                (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => Ok(InputOutcome::Quit),
+                (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
+                    state.skip_quit_confirmation = desired_skip_confirmation;
+                    state.quit_preference_prompt = None;
+                    Ok(InputOutcome::Continue(true))
+                }
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => Ok(InputOutcome::Quit),
                 (KeyCode::Enter, _)
                 | (KeyCode::Esc, _)
@@ -629,7 +654,54 @@ fn handle_input_event(
                 | (KeyCode::Char('N'), _)
                 | (KeyCode::Char('q'), _)
                 | (KeyCode::Char('Q'), _) => {
+                    state.quit_preference_prompt = None;
+                    Ok(InputOutcome::Continue(true))
+                }
+                _ => Ok(InputOutcome::Continue(false)),
+            },
+            Event::Resize(_, _) => Ok(InputOutcome::Continue(true)),
+            _ => Ok(InputOutcome::Continue(false)),
+        };
+    }
+
+    if state.quit_confirm_open {
+        return match event {
+            Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+                match ui_click_action_at(&state.ui_hit_targets, mouse.column, mouse.row) {
+                    Some(UiClickAction::ConfirmQuit) => {
+                        state.skip_quit_confirmation = state.quit_dont_ask_again;
+                        Ok(InputOutcome::Quit)
+                    }
+                    Some(UiClickAction::CancelQuit) => {
+                        state.quit_confirm_open = false;
+                        state.quit_dont_ask_again = false;
+                        Ok(InputOutcome::Continue(true))
+                    }
+                    Some(UiClickAction::ToggleQuitDontAskAgain) => {
+                        state.quit_dont_ask_again = !state.quit_dont_ask_again;
+                        Ok(InputOutcome::Continue(true))
+                    }
+                    _ => Ok(InputOutcome::Continue(false)),
+                }
+            }
+            Event::Key(key) if key.kind == KeyEventKind::Press => match (key.code, key.modifiers) {
+                (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
+                    state.skip_quit_confirmation = state.quit_dont_ask_again;
+                    Ok(InputOutcome::Quit)
+                }
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) => Ok(InputOutcome::Quit),
+                (KeyCode::Char(' '), _) => {
+                    state.quit_dont_ask_again = !state.quit_dont_ask_again;
+                    Ok(InputOutcome::Continue(true))
+                }
+                (KeyCode::Enter, _)
+                | (KeyCode::Esc, _)
+                | (KeyCode::Char('n'), _)
+                | (KeyCode::Char('N'), _)
+                | (KeyCode::Char('q'), _)
+                | (KeyCode::Char('Q'), _) => {
                     state.quit_confirm_open = false;
+                    state.quit_dont_ask_again = false;
                     Ok(InputOutcome::Continue(true))
                 }
                 _ => Ok(InputOutcome::Continue(false)),
@@ -640,18 +712,27 @@ fn handle_input_event(
     }
 
     if let Event::Mouse(mouse) = &event {
+        let mouse_position = Some((mouse.column, mouse.row));
+        let mouse_moved = state.mouse_position != mouse_position;
+        state.mouse_position = mouse_position;
+
         if state.show_help || state.no_sessions_confirm_open {
             return Ok(InputOutcome::Continue(false));
         }
         if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
             if let Some(action) = ui_click_action_at(&state.ui_hit_targets, mouse.column, mouse.row)
             {
-                if action == UiClickAction::ConfirmQuit {
+                if action == UiClickAction::ConfirmQuit
+                    || (action == UiClickAction::PromptQuit && state.skip_quit_confirmation)
+                {
                     return Ok(InputOutcome::Quit);
                 }
                 let changed = apply_ui_click_action(state, action);
                 return Ok(InputOutcome::Continue(changed));
             }
+        }
+        if mouse.kind == MouseEventKind::Moved {
+            return Ok(InputOutcome::Continue(mouse_moved));
         }
     }
 
@@ -662,7 +743,11 @@ fn handle_input_event(
 
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), _) | (KeyCode::Char('Q'), _) => {
+                if state.skip_quit_confirmation {
+                    return Ok(InputOutcome::Quit);
+                }
                 state.quit_confirm_open = true;
+                state.quit_dont_ask_again = false;
                 return Ok(InputOutcome::Continue(true));
             }
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(InputOutcome::Quit),
@@ -688,6 +773,7 @@ fn handle_input_event(
     }
 
     if matches!(event, Event::Resize(_, _)) {
+        state.mouse_position = None;
         return Ok(InputOutcome::Continue(true));
     }
 
@@ -775,13 +861,36 @@ fn apply_ui_click_action(state: &mut AppState, action: UiClickAction) -> bool {
         }
         UiClickAction::PromptQuit => {
             state.quit_confirm_open = true;
+            state.quit_dont_ask_again = false;
             true
         }
         UiClickAction::CancelQuit => {
             state.quit_confirm_open = false;
+            state.quit_dont_ask_again = false;
             true
         }
-        UiClickAction::ConfirmQuit => false,
+        UiClickAction::ConfirmQuit => {
+            state.skip_quit_confirmation = state.quit_dont_ask_again;
+            false
+        }
+        UiClickAction::ToggleQuitDontAskAgain => {
+            state.quit_dont_ask_again = !state.quit_dont_ask_again;
+            true
+        }
+        UiClickAction::PromptQuitConfirmationPreference => {
+            state.quit_preference_prompt = Some(!state.skip_quit_confirmation);
+            true
+        }
+        UiClickAction::ConfirmQuitConfirmationPreference => {
+            if let Some(desired_skip_confirmation) = state.quit_preference_prompt.take() {
+                state.skip_quit_confirmation = desired_skip_confirmation;
+            }
+            true
+        }
+        UiClickAction::CancelQuitConfirmationPreference => {
+            state.quit_preference_prompt = None;
+            true
+        }
     }
 }
 
@@ -1049,6 +1158,7 @@ fn load_persisted_ui_state(
             state.display_style = style;
         }
     }
+    state.skip_quit_confirmation = store.global.skip_quit_confirmation;
 
     if let Some(workspace_path) = state.workspace_path.as_ref() {
         let workspace_key = workspace_path.to_string_lossy();
@@ -1077,6 +1187,7 @@ fn save_persisted_ui_state(comon_home: &Path, state: &PersistedUiState) -> Resul
             .clamp(MIN_ACTIVITY_PROJECT_LIMIT, MAX_ACTIVITY_PROJECT_LIMIT),
     );
     store.global.display_style = Some(state.display_style.store_value().to_string());
+    store.global.skip_quit_confirmation = state.skip_quit_confirmation;
     store.global.last_workspace_path = workspace_path_text.clone();
     store.global.updated_at = now;
 
@@ -1307,6 +1418,19 @@ mod tests {
         save_persisted_ui_state(&comon_home, &state).expect("save persisted ui state");
         let loaded = load_persisted_ui_state(&comon_home, None).expect("load persisted ui state");
         assert_eq!(loaded.display_style, DisplayStyle::SystemFull);
+
+        let _ = std::fs::remove_dir_all(comon_home);
+    }
+
+    #[test]
+    fn quit_confirmation_preference_round_trips_through_state_store() {
+        let comon_home = make_temp_dir("quit-confirmation-preference");
+        let mut state = PersistedUiState::default_for_workspace(None);
+        state.skip_quit_confirmation = true;
+
+        save_persisted_ui_state(&comon_home, &state).expect("save persisted ui state");
+        let loaded = load_persisted_ui_state(&comon_home, None).expect("load persisted ui state");
+        assert!(loaded.skip_quit_confirmation);
 
         let _ = std::fs::remove_dir_all(comon_home);
     }

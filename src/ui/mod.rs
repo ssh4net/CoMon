@@ -78,7 +78,8 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
     let area = frame.area();
     let (navigation, navigation_targets) = navigation_title(area, state.active_screen);
     state.ui_hit_targets.extend(navigation_targets);
-    let (quit, quit_targets) = quit_title(area, state.quit_confirm_open);
+    let (quit, quit_targets) =
+        quit_title(area, state.quit_confirm_open, state.skip_quit_confirmation);
     state.ui_hit_targets.extend(quit_targets);
 
     let outer = Block::default()
@@ -163,6 +164,8 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
 
     if state.quit_confirm_open {
         render_quit_confirmation(frame, area, state);
+    } else if state.quit_preference_prompt.is_some() {
+        render_quit_preference_confirmation(frame, area, state);
     }
 }
 
@@ -228,15 +231,35 @@ fn navigation_title(area: Rect, active_screen: ActiveScreen) -> (Line<'static>, 
     (line, right_aligned_targets(title_area, &segments))
 }
 
-fn quit_title(area: Rect, active: bool) -> (Line<'static>, Vec<UiHitTarget>) {
+fn quit_title(
+    area: Rect,
+    active: bool,
+    skip_confirmation: bool,
+) -> (Line<'static>, Vec<UiHitTarget>) {
     let title_area = Rect::new(
         area.x.saturating_add(1),
         area.y.saturating_add(area.height.saturating_sub(1)),
         area.width.saturating_sub(2),
         1,
     );
-    let segments = [(" QUIT ", Some(UiClickAction::PromptQuit)), (" ", None)];
-    let line = Line::from(vec![pill("QUIT", active), Span::raw(" ")]);
+    let checkbox = if skip_confirmation {
+        " [✓] "
+    } else {
+        " [ ] "
+    };
+    let segments = [
+        (
+            checkbox,
+            Some(UiClickAction::PromptQuitConfirmationPreference),
+        ),
+        (" QUIT ", Some(UiClickAction::PromptQuit)),
+        (" ", None),
+    ];
+    let line = Line::from(vec![
+        checkbox_span(skip_confirmation, None),
+        pill("QUIT", active),
+        Span::raw(" "),
+    ]);
     (line, right_aligned_targets(title_area, &segments))
 }
 
@@ -2021,6 +2044,27 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             let bw = bar_width.max(1);
 
             let max_value = values.iter().copied().max().unwrap_or(0).max(1);
+            let hovered_bar = hovered_vertical_bar_index(
+                state.mouse_position,
+                bars_area,
+                bw,
+                bar_gap,
+                &values,
+                max_value,
+            );
+            let hover_tooltip = hovered_bar.and_then(|index| {
+                state.mouse_position.map(|mouse| {
+                    (
+                        mouse,
+                        format_vertical_bar_tooltip(
+                            &days[index].day,
+                            values[index],
+                            state.metric,
+                            formatter,
+                        ),
+                    )
+                })
+            });
             let buf = frame.buffer_mut();
 
             // Bars are laid left-to-right.
@@ -2084,7 +2128,7 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                             }
                         }
                         UsageMetric::Runs => {
-                            let raw = value.to_string();
+                            let raw = formatter.format_u64(*value);
                             if raw.len() <= w as usize {
                                 raw
                             } else {
@@ -2122,6 +2166,10 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                             .set_style(Style::default().fg(Color::Gray));
                     }
                 }
+            }
+
+            if let Some((mouse, tooltip)) = hover_tooltip {
+                render_chart_tooltip(frame, inner, mouse, &tooltip);
             }
         }
         ChartOrientation::Horizontal => {
@@ -2325,6 +2373,126 @@ fn usage_chart_metric_label(metric: UsageMetric) -> &'static str {
     }
 }
 
+fn hovered_vertical_bar_index(
+    mouse_position: Option<(u16, u16)>,
+    bars_area: Rect,
+    bar_width: u16,
+    bar_gap: u16,
+    values: &[u64],
+    max_value: u64,
+) -> Option<usize> {
+    let (mouse_x, mouse_y) = mouse_position?;
+    let right = bars_area.x.saturating_add(bars_area.width);
+    let bottom = bars_area.y.saturating_add(bars_area.height);
+    if mouse_x < bars_area.x
+        || mouse_x >= right
+        || mouse_y < bars_area.y
+        || mouse_y >= bottom
+        || bar_width == 0
+    {
+        return None;
+    }
+
+    let stride = bar_width.saturating_add(bar_gap);
+    if stride == 0 {
+        return None;
+    }
+    let offset_x = mouse_x.saturating_sub(bars_area.x);
+    let index = (offset_x / stride) as usize;
+    let value = *values.get(index)?;
+    let bar_x = bars_area
+        .x
+        .saturating_add((index as u16).saturating_mul(stride));
+    let actual_width = bar_width.min(right.saturating_sub(bar_x));
+    if mouse_x >= bar_x.saturating_add(actual_width) {
+        return None;
+    }
+
+    let ratio = (value as f64) / (max_value.max(1) as f64);
+    let filled_height = ((bars_area.height as f64) * ratio.clamp(0.0, 1.0)).round() as u16;
+    if filled_height == 0 {
+        return None;
+    }
+    let bottom_y = bottom.saturating_sub(1);
+    let top_filled_y = bottom_y.saturating_sub(filled_height.saturating_sub(1));
+    (mouse_y >= top_filled_y).then_some(index)
+}
+
+fn format_vertical_bar_tooltip(
+    day: &str,
+    value: u64,
+    metric: UsageMetric,
+    formatter: DisplayFormatter<'_>,
+) -> String {
+    let date = NaiveDate::parse_from_str(day, "%Y-%m-%d")
+        .map(|date| formatter.format_full_date(date))
+        .unwrap_or_else(|_| day.to_string());
+    let value = match metric {
+        UsageMetric::Tokens => format!("{} tokens", formatter.format_u64(value)),
+        UsageMetric::Time => format_duration_words(
+            value.min((i64::MAX as u64) / 60_000).saturating_mul(60_000) as i64,
+        ),
+        UsageMetric::Runs => format!("{} runs", formatter.format_u64(value)),
+    };
+    format!("{date} · {value}")
+}
+
+fn render_chart_tooltip(frame: &mut Frame<'_>, bounds: Rect, mouse: (u16, u16), text: &str) {
+    let Some(area) = chart_tooltip_rect(
+        bounds,
+        mouse,
+        UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16,
+    ) else {
+        return;
+    };
+    let text = truncate_middle(text, area.width.saturating_sub(2) as usize);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(Color::White))
+        .style(Style::default().bg(Color::Black));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            text,
+            Style::default().add_modifier(Modifier::BOLD),
+        )))
+        .alignment(Alignment::Center)
+        .block(block),
+        area,
+    );
+}
+
+fn chart_tooltip_rect(bounds: Rect, mouse: (u16, u16), content_width: u16) -> Option<Rect> {
+    if bounds.width < 3 || bounds.height < 3 {
+        return None;
+    }
+    let width = content_width.saturating_add(2).clamp(3, bounds.width);
+    let height = 3;
+    let right = bounds.x.saturating_add(bounds.width);
+    let bottom = bounds.y.saturating_add(bounds.height);
+    let max_x = right.saturating_sub(width);
+    let max_y = bottom.saturating_sub(height);
+
+    let preferred_x = if mouse.0.saturating_add(1).saturating_add(width) <= right {
+        mouse.0.saturating_add(1)
+    } else {
+        mouse.0.saturating_sub(width)
+    };
+    let preferred_y = if mouse.1 >= bounds.y.saturating_add(height) {
+        mouse.1.saturating_sub(height)
+    } else {
+        mouse.1.saturating_add(1)
+    };
+
+    Some(Rect::new(
+        preferred_x.clamp(bounds.x, max_x),
+        preferred_y.clamp(bounds.y, max_y),
+        width,
+        height,
+    ))
+}
+
 fn format_vertical_token_value(
     value: u64,
     max_width: u16,
@@ -2335,7 +2503,7 @@ fn format_vertical_token_value(
         DisplayStyle::SystemCompact => format_tokens_compact(value as i64, formatter),
         DisplayStyle::SystemFull => formatter.format_u64(value),
     };
-    if preferred.len() <= max_width as usize || formatter.style() == DisplayStyle::SystemFull {
+    if preferred.len() <= max_width as usize {
         preferred
     } else {
         format_compact_kmb(value, max_width, formatter)
@@ -2593,7 +2761,7 @@ fn render_no_sessions_overlay(frame: &mut Frame<'_>, area: Rect, state: &AppStat
 fn render_quit_confirmation(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     state.ui_hit_targets.clear();
 
-    let popup = centered_rect(area.width.min(35), area.height.min(7), area);
+    let popup = centered_rect(area.width.min(39), area.height.min(10), area);
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Block::default()
@@ -2610,7 +2778,7 @@ fn render_quit_confirmation(frame: &mut Frame<'_>, area: Rect, state: &mut AppSt
         popup.x.saturating_add(1),
         popup.y.saturating_add(2),
         popup.width.saturating_sub(2),
-        2.min(popup.height.saturating_sub(3)),
+        3.min(popup.height.saturating_sub(3)),
     );
     frame.render_widget(
         Paragraph::new(Text::from(vec![
@@ -2619,9 +2787,37 @@ fn render_quit_confirmation(frame: &mut Frame<'_>, area: Rect, state: &mut AppSt
                 "Y confirms; N/Esc/Enter cancels",
                 Style::default().fg(Color::Gray),
             )),
+            Line::from(Span::styled(
+                "Space toggles the checkbox",
+                Style::default().fg(Color::Gray),
+            )),
         ]))
         .alignment(Alignment::Center),
         message_area,
+    );
+
+    let checkbox_area = Rect::new(
+        popup.x.saturating_add(1),
+        popup.y.saturating_add(6),
+        popup.width.saturating_sub(2),
+        1,
+    );
+    let checkbox_text = if state.quit_dont_ask_again {
+        "[✓] Don't show again"
+    } else {
+        "[ ] Don't show again"
+    };
+    state.ui_hit_targets.extend(centered_targets(
+        checkbox_area,
+        &[(checkbox_text, Some(UiClickAction::ToggleQuitDontAskAgain))],
+    ));
+    frame.render_widget(
+        Paragraph::new(Line::from(checkbox_span(
+            state.quit_dont_ask_again,
+            Some("Don't show again"),
+        )))
+        .alignment(Alignment::Center),
+        checkbox_area,
     );
 
     let buttons_area = Rect::new(
@@ -2647,6 +2843,98 @@ fn render_quit_confirmation(frame: &mut Frame<'_>, area: Rect, state: &mut AppSt
         .alignment(Alignment::Center),
         buttons_area,
     );
+}
+
+fn render_quit_preference_confirmation(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
+    state.ui_hit_targets.clear();
+    let disable_confirmation = state.quit_preference_prompt.unwrap_or(false);
+    let (title, question, explanation) = if disable_confirmation {
+        (
+            " Exit confirmation ",
+            "Disable exit confirmation?",
+            "q and QUIT will exit immediately.",
+        )
+    } else {
+        (
+            " Exit confirmation ",
+            "Enable exit confirmation?",
+            "q and QUIT will ask before exiting.",
+        )
+    };
+
+    let popup = centered_rect(area.width.min(43), area.height.min(8), area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .title(Span::styled(
+                title,
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+        popup,
+    );
+
+    let message_area = Rect::new(
+        popup.x.saturating_add(1),
+        popup.y.saturating_add(2),
+        popup.width.saturating_sub(2),
+        2.min(popup.height.saturating_sub(3)),
+    );
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            Line::from(question),
+            Line::from(Span::styled(explanation, Style::default().fg(Color::Gray))),
+        ]))
+        .alignment(Alignment::Center),
+        message_area,
+    );
+
+    let buttons_area = Rect::new(
+        popup.x.saturating_add(1),
+        popup.y.saturating_add(popup.height.saturating_sub(2)),
+        popup.width.saturating_sub(2),
+        1,
+    );
+    let segments = [
+        (
+            " YES ",
+            Some(UiClickAction::ConfirmQuitConfirmationPreference),
+        ),
+        ("   ", None),
+        (
+            " NO ",
+            Some(UiClickAction::CancelQuitConfirmationPreference),
+        ),
+    ];
+    state
+        .ui_hit_targets
+        .extend(centered_targets(buttons_area, &segments));
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            pill("YES", false),
+            Span::raw("   "),
+            pill("NO", true),
+        ]))
+        .alignment(Alignment::Center),
+        buttons_area,
+    );
+}
+
+fn checkbox_span(checked: bool, label: Option<&str>) -> Span<'static> {
+    let mark = if checked { "✓" } else { " " };
+    let text = match label {
+        Some(label) => format!("[{mark}] {label}"),
+        None => format!(" [{mark}] "),
+    };
+    let style = if checked {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    Span::styled(text, style)
 }
 
 fn pill(label: &str, active: bool) -> Span<'static> {
@@ -3515,13 +3803,19 @@ mod tests {
 
     #[test]
     fn quit_action_is_on_the_bottom_right_border() {
-        let (title, targets) = quit_title(Rect::new(4, 2, 71, 20), true);
+        let (title, targets) = quit_title(Rect::new(4, 2, 71, 20), true, true);
 
-        assert_eq!(title.spans[0].style.fg, Some(Color::Black));
-        assert_eq!(title.spans[0].style.bg, Some(Color::White));
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].area, Rect::new(67, 21, 6, 1));
-        assert_eq!(targets[0].action, UiClickAction::PromptQuit);
+        assert_eq!(title.spans[0].content.as_ref(), " [✓] ");
+        assert_eq!(title.spans[1].style.fg, Some(Color::Black));
+        assert_eq!(title.spans[1].style.bg, Some(Color::White));
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].area, Rect::new(62, 21, 5, 1));
+        assert_eq!(
+            targets[0].action,
+            UiClickAction::PromptQuitConfirmationPreference
+        );
+        assert_eq!(targets[1].area, Rect::new(67, 21, 6, 1));
+        assert_eq!(targets[1].action, UiClickAction::PromptQuit);
     }
 
     #[test]
@@ -3835,7 +4129,7 @@ mod tests {
     }
 
     #[test]
-    fn system_full_keeps_chart_token_values_expanded() {
+    fn system_full_compacts_only_tight_vertical_token_values() {
         let system_locale = crate::locale::SystemLocale::default();
         let formatter =
             DisplayFormatter::new(crate::locale::DisplayStyle::SystemFull, &system_locale);
@@ -3864,9 +4158,44 @@ mod tests {
             ),
             "45 456 785 / 1 756 241"
         );
+        assert_eq!(format_vertical_token_value(45_456_785, 4, formatter), "45M");
+    }
+
+    #[test]
+    fn vertical_bar_hover_requires_the_filled_bar_and_ignores_gaps() {
+        let area = Rect::new(10, 5, 11, 10);
+        let values = [50, 100];
+
         assert_eq!(
-            format_vertical_token_value(45_456_785, 4, formatter),
-            "45 456 785"
+            hovered_vertical_bar_index(Some((10, 10)), area, 3, 1, &values, 100),
+            Some(0)
+        );
+        assert_eq!(
+            hovered_vertical_bar_index(Some((10, 9)), area, 3, 1, &values, 100),
+            None
+        );
+        assert_eq!(
+            hovered_vertical_bar_index(Some((13, 12)), area, 3, 1, &values, 100),
+            None
+        );
+        assert_eq!(
+            hovered_vertical_bar_index(Some((14, 5)), area, 3, 1, &values, 100),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn vertical_bar_tooltip_shows_exact_value_and_stays_inside_chart() {
+        let system_locale = crate::locale::SystemLocale::default();
+        let formatter = DisplayFormatter::new(DisplayStyle::Classic, &system_locale);
+
+        assert_eq!(
+            format_vertical_bar_tooltip("2026-07-22", 45_456_785, UsageMetric::Tokens, formatter,),
+            "2026-07-22 · 45,456,785 tokens"
+        );
+        assert_eq!(
+            chart_tooltip_rect(Rect::new(2, 2, 20, 10), (20, 3), 10),
+            Some(Rect::new(8, 4, 12, 3))
         );
     }
 

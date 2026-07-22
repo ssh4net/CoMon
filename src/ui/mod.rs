@@ -242,11 +242,7 @@ fn quit_title(
         area.width.saturating_sub(2),
         1,
     );
-    let checkbox = if skip_confirmation {
-        " [✓] "
-    } else {
-        " [ ] "
-    };
+    let checkbox = if skip_confirmation { " [x] " } else { " [ ] " };
     let segments = [
         (
             checkbox,
@@ -2434,7 +2430,7 @@ fn format_vertical_bar_tooltip(
         ),
         UsageMetric::Runs => format!("{} runs", formatter.format_u64(value)),
     };
-    format!("{date} · {value}")
+    format!("{date} | {value}")
 }
 
 fn render_chart_tooltip(frame: &mut Frame<'_>, bounds: Rect, mouse: (u16, u16), text: &str) {
@@ -2803,7 +2799,7 @@ fn render_quit_confirmation(frame: &mut Frame<'_>, area: Rect, state: &mut AppSt
         1,
     );
     let checkbox_text = if state.quit_dont_ask_again {
-        "[✓] Don't show again"
+        "[x] Don't show again"
     } else {
         "[ ] Don't show again"
     };
@@ -2922,7 +2918,7 @@ fn render_quit_preference_confirmation(frame: &mut Frame<'_>, area: Rect, state:
 }
 
 fn checkbox_span(checked: bool, label: Option<&str>) -> Span<'static> {
-    let mark = if checked { "✓" } else { " " };
+    let mark = if checked { "x" } else { " " };
     let text = match label {
         Some(label) => format!("[{mark}] {label}"),
         None => format!(" [{mark}] "),
@@ -3805,7 +3801,7 @@ mod tests {
     fn quit_action_is_on_the_bottom_right_border() {
         let (title, targets) = quit_title(Rect::new(4, 2, 71, 20), true, true);
 
-        assert_eq!(title.spans[0].content.as_ref(), " [✓] ");
+        assert_eq!(title.spans[0].content.as_ref(), " [x] ");
         assert_eq!(title.spans[1].style.fg, Some(Color::Black));
         assert_eq!(title.spans[1].style.bg, Some(Color::White));
         assert_eq!(targets.len(), 2);
@@ -4191,7 +4187,7 @@ mod tests {
 
         assert_eq!(
             format_vertical_bar_tooltip("2026-07-22", 45_456_785, UsageMetric::Tokens, formatter,),
-            "2026-07-22 · 45,456,785 tokens"
+            "2026-07-22 | 45,456,785 tokens"
         );
         assert_eq!(
             chart_tooltip_rect(Rect::new(2, 2, 20, 10), (20, 3), 10),

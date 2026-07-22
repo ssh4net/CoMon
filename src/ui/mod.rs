@@ -5,7 +5,7 @@ use crate::usage::{
     format_tokens_overview, ChartRange, ProjectActivity, UsageMetric, ACTIVITY_TIMELINE_WEEKS,
 };
 use anyhow::Result;
-use chrono::{Datelike, Local, NaiveDate, TimeZone, Weekday};
+use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, TimeZone, Weekday};
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
@@ -78,6 +78,8 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
     let area = frame.area();
     let (navigation, navigation_targets) = navigation_title(area, state.active_screen);
     state.ui_hit_targets.extend(navigation_targets);
+    let (quit, quit_targets) = quit_title(area, state.quit_confirm_open);
+    state.ui_hit_targets.extend(quit_targets);
 
     let outer = Block::default()
         .borders(Borders::ALL)
@@ -86,7 +88,8 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
             format!(" comon :: {} ", env!("CARGO_PKG_VERSION")),
             Style::default().add_modifier(Modifier::BOLD),
         ))
-        .title_top(navigation.right_aligned());
+        .title_top(navigation.right_aligned())
+        .title_bottom(quit.right_aligned());
     frame.render_widget(outer, area);
 
     let inner = apply_margin(
@@ -152,19 +155,14 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
             }
         }
         ActiveScreen::Read => {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),
-                    Constraint::Min(0),
-                    Constraint::Length(2),
-                ])
-                .split(inner);
-            register_hit_target(state, chunks[2], UiClickAction::CycleDisplayStyle);
             let system_locale = state.system_locale.clone();
             let formatter = DisplayFormatter::new(state.display_style, &system_locale);
             crate::read::tui::render(frame, inner, &mut state.read_browser, formatter);
         }
+    }
+
+    if state.quit_confirm_open {
+        render_quit_confirmation(frame, area, state);
     }
 }
 
@@ -227,6 +225,18 @@ fn navigation_title(area: Rect, active_screen: ActiveScreen) -> (Line<'static>, 
         pill("LIMITS", active_screen == ActiveScreen::LimitResets),
         pill("HISTORY", active_screen == ActiveScreen::Read),
     ]);
+    (line, right_aligned_targets(title_area, &segments))
+}
+
+fn quit_title(area: Rect, active: bool) -> (Line<'static>, Vec<UiHitTarget>) {
+    let title_area = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(area.height.saturating_sub(1)),
+        area.width.saturating_sub(2),
+        1,
+    );
+    let segments = [(" QUIT ", Some(UiClickAction::PromptQuit)), (" ", None)];
+    let line = Line::from(vec![pill("QUIT", active), Span::raw(" ")]);
     (line, right_aligned_targets(title_area, &segments))
 }
 
@@ -347,7 +357,7 @@ fn footer_height(width: u16, state: &AppState) -> u16 {
     wrapped_line_count(&footer_text(state), width).max(1)
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
+fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let err = footer_error(state);
     let style = format!("Style [n]: {}", state.formatter().style_label());
     let line = Line::from(vec![
@@ -362,7 +372,6 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     ]);
 
     frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), area);
-    register_hit_target(state, area, UiClickAction::CycleDisplayStyle);
 }
 
 fn render_usage(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
@@ -922,13 +931,27 @@ fn render_usage_controls(
     let month = pill("MONTH", state.range == ChartRange::Month);
     let vert = pill("VERT", state.orientation == ChartOrientation::Vertical);
     let horz = pill("HORZ", state.orientation == ChartOrientation::Horizontal);
+    let classic = pill("CLASS", state.display_style == DisplayStyle::Classic);
+    let system_compact = pill("SCOMP", state.display_style == DisplayStyle::SystemCompact);
+    let system_full = pill("SFULL", state.display_style == DisplayStyle::SystemFull);
 
     render_flat_usage_controls(
         frame,
         chunks[0],
         state,
         &workspace_label,
-        vec![tokens, time, runs, week, month, vert, horz],
+        vec![
+            tokens,
+            time,
+            runs,
+            week,
+            month,
+            vert,
+            horz,
+            classic,
+            system_compact,
+            system_full,
+        ],
     );
 
     if let Some(text) = reset_summary {
@@ -957,7 +980,7 @@ fn render_flat_usage_controls(
 ) {
     let row = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Min(0)])
+        .constraints([Constraint::Min(20), Constraint::Length(92)])
         .split(area);
     render_workspace_label(frame, row[0], workspace_label);
 
@@ -984,6 +1007,19 @@ fn render_flat_usage_controls(
                 " HORZ ",
                 Some(UiClickAction::SetOrientation(ChartOrientation::Horizontal)),
             ),
+            (" STYLE ", None),
+            (
+                " CLASS ",
+                Some(UiClickAction::SetDisplayStyle(DisplayStyle::Classic)),
+            ),
+            (
+                " SCOMP ",
+                Some(UiClickAction::SetDisplayStyle(DisplayStyle::SystemCompact)),
+            ),
+            (
+                " SFULL ",
+                Some(UiClickAction::SetDisplayStyle(DisplayStyle::SystemFull)),
+            ),
         ],
     );
 
@@ -993,6 +1029,8 @@ fn render_flat_usage_controls(
     spans.extend(pills[3..5].iter().cloned());
     spans.push(control_group_label("BARS"));
     spans.extend(pills[5..7].iter().cloned());
+    spans.push(control_group_label("STYLE"));
+    spans.extend(pills[7..10].iter().cloned());
     frame.render_widget(
         Paragraph::new(Line::from(spans)).alignment(Alignment::Right),
         row[1],
@@ -1325,6 +1363,7 @@ fn usage_cards_height(state: &AppState, width: u16) -> u16 {
 
 fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let formatter = state.formatter();
+    let today_title = today_card_title(formatter, Local::now().naive_local());
     let card_layout = usage_card_layout(area.width);
     let row_heights = usage_card_row_heights(state, area.width);
     let two_rows = row_heights.len() > 1;
@@ -1457,7 +1496,7 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                     );
                     frame.render_widget(
                         card(
-                            "TODAY",
+                            &today_title,
                             &today_value,
                             Some(&today_caption1),
                             Some(&today_caption2),
@@ -1511,7 +1550,7 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                     let runs7 = last7_runs_caption.as_deref();
                     frame.render_widget(
                         card(
-                            "TODAY",
+                            &today_title,
                             &today_value,
                             Some(&today_caption1),
                             Some(&today_caption2),
@@ -1611,7 +1650,7 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                     );
                     frame.render_widget(
                         card(
-                            "TODAY",
+                            &today_title,
                             &today_value,
                             Some(&today_caption1),
                             Some(&today_caption2),
@@ -1662,7 +1701,7 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                     let runs7 = last7_runs_caption.as_deref();
                     frame.render_widget(
                         card(
-                            "TODAY",
+                            &today_title,
                             &today_value,
                             Some(&today_caption1),
                             Some(&today_caption2),
@@ -1789,7 +1828,7 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                     );
                     frame.render_widget(
                         card(
-                            "TODAY",
+                            &today_title,
                             &today_value,
                             Some(&today_caption1),
                             Some(&today_caption2),
@@ -1837,7 +1876,7 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                     );
                     frame.render_widget(
                         card(
-                            "TODAY",
+                            &today_title,
                             &today_value,
                             Some(&today_caption1),
                             Some(&today_caption2),
@@ -2455,11 +2494,11 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
             Line::from("  w    - toggle timeframe (Week/Month)"),
             Line::from("  f    - toggle layout (Horz/Vert)"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
-            Line::from("  Mouse - click tabs/controls; footer cycles style"),
+            Line::from("  Mouse - click tabs/controls/format/quit"),
             Line::from("  r/F5 - refresh usage + limits"),
             Line::from("  s/F2 - switch screen"),
             Line::from("  ?    - toggle help"),
-            Line::from("  q/Esc - quit"),
+            Line::from("  q    - quit (confirm)"),
         ]),
         ActiveScreen::Activity => Text::from(vec![
             Line::from("Keys:"),
@@ -2467,26 +2506,26 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
             Line::from("  +/=  - show more projects"),
             Line::from("  -    - show fewer projects"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
-            Line::from("  Mouse - click tabs/view/projects; footer cycles style"),
+            Line::from("  Mouse - click tabs/view/projects/quit"),
             Line::from("  r/F5 - refresh usage + limits"),
             Line::from("  s/F2 - switch screen"),
             Line::from("  ?    - toggle help"),
-            Line::from("  q/Esc - quit"),
+            Line::from("  q    - quit (confirm)"),
         ]),
         ActiveScreen::LimitResets => Text::from(vec![
             Line::from("Keys:"),
             Line::from("  r/F5 - refresh reset credits"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
-            Line::from("  Mouse - click tabs; footer cycles style"),
+            Line::from("  Mouse - click tabs/quit"),
             Line::from("  s/F2 - switch screen"),
             Line::from("  ?    - toggle help"),
-            Line::from("  q/Esc - quit"),
+            Line::from("  q    - quit (confirm)"),
         ]),
         ActiveScreen::Read => Text::from(vec![
             Line::from("Keys:"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
-            Line::from("  Mouse - click tabs; footer cycles style"),
-            Line::from("  q/Esc - quit"),
+            Line::from("  Mouse - click tabs/quit"),
+            Line::from("  q    - quit (confirm)"),
         ]),
     };
     frame.render_widget(
@@ -2551,6 +2590,65 @@ fn render_no_sessions_overlay(frame: &mut Frame<'_>, area: Rect, state: &AppStat
     );
 }
 
+fn render_quit_confirmation(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
+    state.ui_hit_targets.clear();
+
+    let popup = centered_rect(area.width.min(35), area.height.min(7), area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .title(Span::styled(
+                " Quit ",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+        popup,
+    );
+
+    let message_area = Rect::new(
+        popup.x.saturating_add(1),
+        popup.y.saturating_add(2),
+        popup.width.saturating_sub(2),
+        2.min(popup.height.saturating_sub(3)),
+    );
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            Line::from("Are you sure you want to quit?"),
+            Line::from(Span::styled(
+                "Y confirms; N/Esc/Enter cancels",
+                Style::default().fg(Color::Gray),
+            )),
+        ]))
+        .alignment(Alignment::Center),
+        message_area,
+    );
+
+    let buttons_area = Rect::new(
+        popup.x.saturating_add(1),
+        popup.y.saturating_add(popup.height.saturating_sub(2)),
+        popup.width.saturating_sub(2),
+        1,
+    );
+    let segments = [
+        (" YES ", Some(UiClickAction::ConfirmQuit)),
+        ("   ", None),
+        (" NO ", Some(UiClickAction::CancelQuit)),
+    ];
+    state
+        .ui_hit_targets
+        .extend(centered_targets(buttons_area, &segments));
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            pill("YES", false),
+            Span::raw("   "),
+            pill("NO", true),
+        ]))
+        .alignment(Alignment::Center),
+        buttons_area,
+    );
+}
+
 fn pill(label: &str, active: bool) -> Span<'static> {
     let style = if active {
         Style::default()
@@ -2561,12 +2659,6 @@ fn pill(label: &str, active: bool) -> Span<'static> {
         Style::default().fg(Color::Gray)
     };
     Span::styled(format!(" {label} "), style)
-}
-
-fn register_hit_target(state: &mut AppState, area: Rect, action: UiClickAction) {
-    if area.width > 0 && area.height > 0 {
-        state.ui_hit_targets.push(UiHitTarget { area, action });
-    }
 }
 
 fn register_right_aligned_targets(
@@ -2612,6 +2704,33 @@ fn right_aligned_targets(
     targets
 }
 
+fn centered_targets(area: Rect, segments: &[(&str, Option<UiClickAction>)]) -> Vec<UiHitTarget> {
+    let total_width = segments.iter().fold(0_u16, |total, (text, _)| {
+        total.saturating_add(UnicodeWidthStr::width(*text).min(u16::MAX as usize) as u16)
+    });
+    if total_width > area.width || area.height == 0 {
+        return Vec::new();
+    }
+
+    let mut targets = Vec::new();
+    let mut x = area
+        .x
+        .saturating_add((area.width.saturating_sub(total_width)) / 2);
+    for (text, action) in segments {
+        let width = UnicodeWidthStr::width(*text).min(u16::MAX as usize) as u16;
+        if let Some(action) = action {
+            if width > 0 {
+                targets.push(UiHitTarget {
+                    area: Rect::new(x, area.y, width, 1),
+                    action: *action,
+                });
+            }
+        }
+        x = x.saturating_add(width);
+    }
+    targets
+}
+
 fn card(
     title: &str,
     value: &str,
@@ -2619,6 +2738,10 @@ fn card(
     caption2: Option<&str>,
 ) -> Paragraph<'static> {
     card_with_captions(title, value, &[caption1, caption2])
+}
+
+fn today_card_title(formatter: DisplayFormatter<'_>, now: NaiveDateTime) -> String {
+    format!("TODAY {}", formatter.format_session_datetime(now))
 }
 
 fn card4(
@@ -3372,10 +3495,49 @@ mod tests {
     }
 
     #[test]
+    fn today_card_title_includes_the_current_date_and_time() {
+        let system_locale = crate::locale::SystemLocale::default();
+        let formatter = DisplayFormatter::new(DisplayStyle::Classic, &system_locale);
+        let now = NaiveDate::from_ymd_opt(2026, 7, 22)
+            .unwrap()
+            .and_hms_opt(14, 35, 0)
+            .unwrap();
+
+        assert_eq!(today_card_title(formatter, now), "TODAY 2026-07-22 14:35");
+    }
+
+    #[test]
     fn navigation_title_hides_tabs_before_they_touch_the_version() {
         let (title, targets) = navigation_title(Rect::new(0, 0, 52, 10), ActiveScreen::Usage);
         assert!(title.spans.is_empty());
         assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn quit_action_is_on_the_bottom_right_border() {
+        let (title, targets) = quit_title(Rect::new(4, 2, 71, 20), true);
+
+        assert_eq!(title.spans[0].style.fg, Some(Color::Black));
+        assert_eq!(title.spans[0].style.bg, Some(Color::White));
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].area, Rect::new(67, 21, 6, 1));
+        assert_eq!(targets[0].action, UiClickAction::PromptQuit);
+    }
+
+    #[test]
+    fn quit_confirmation_buttons_are_centered_and_separate() {
+        let targets = centered_targets(
+            Rect::new(10, 5, 33, 1),
+            &[
+                (" YES ", Some(UiClickAction::ConfirmQuit)),
+                ("   ", None),
+                (" NO ", Some(UiClickAction::CancelQuit)),
+            ],
+        );
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].area, Rect::new(20, 5, 5, 1));
+        assert_eq!(targets[1].area, Rect::new(28, 5, 4, 1));
     }
 
     #[test]
@@ -3686,11 +3848,11 @@ mod tests {
                 u16::MAX,
                 formatter,
             ),
-            "45456785 / 1756241"
+            "45 456 785 / 1 756 241"
         );
         assert_eq!(
             format_vertical_token_value(45_456_785, 20, formatter),
-            "45456785"
+            "45 456 785"
         );
         assert_eq!(
             format_horizontal_value(
@@ -3700,11 +3862,11 @@ mod tests {
                 8,
                 formatter,
             ),
-            "45456785 / 1756241"
+            "45 456 785 / 1 756 241"
         );
         assert_eq!(
             format_vertical_token_value(45_456_785, 4, formatter),
-            "45456785"
+            "45 456 785"
         );
     }
 

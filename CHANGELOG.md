@@ -7,10 +7,13 @@ All notable changes to this project are documented in this file.
 - Added a persisted `n` shortcut to cycle display formatting through Classic, System Compact, and System Full for numbers, dates, times, and calendar labels.
 - Clarified token pair charts with the `TOKENS (TOTAL / NON-CACHED)` heading.
 - Added compact `K/M/B/T` notation for large dashboard token values in System Compact mode, including values inside vertical chart bars. System Full keeps those values expanded, while Classic output remains unchanged.
-- Added mouse controls for selecting the visible statistic, chart timeframe, and chart orientation; clicking the footer cycles the display style on every screen.
+- Added mouse controls for selecting the visible statistic, chart timeframe, chart orientation, screen, and display style.
 - Restored compact one-line control strips on the Usage and Activity screens and highlighted the padded group labels with the chart's darker cyan.
 - Removed duplicate shortcut hints from screen headers, leaving the complete shortcut reference in the footer and help overlay.
 - Added clickable screen tabs to the outer title and matching framed View/Projects controls to the Activity screen.
+- System Full now groups expanded integers with regular spaces while retaining system-localized dates, times, and decimals.
+- Added a compact `STYLE CLASS/SCOMP/SFULL` selector after the Usage bar controls and a bottom-border Quit action with a safe Yes/No confirmation dialog; the `q` shortcut opens the same dialog.
+- Added the current locale-aware date and time to the `TODAY` card border.
 
 ## 0.3.6 - 2026-06-05
 

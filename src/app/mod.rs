@@ -74,12 +74,15 @@ pub(crate) enum ActiveScreen {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UiClickAction {
     SetScreen(ActiveScreen),
+    SetDisplayStyle(DisplayStyle),
     SetMetric(UsageMetric),
     SetRange(ChartRange),
     SetOrientation(ChartOrientation),
     DecreaseProjects,
     IncreaseProjects,
-    CycleDisplayStyle,
+    PromptQuit,
+    CancelQuit,
+    ConfirmQuit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +141,7 @@ pub(crate) struct AppState {
     pub(crate) workspace_path: Option<std::path::PathBuf>,
     pub(crate) no_sessions_confirm_open: bool,
     pub(crate) no_sessions_confirm_dismissed: bool,
+    pub(crate) quit_confirm_open: bool,
     pub(crate) display_style: DisplayStyle,
     pub(crate) system_locale: SystemLocale,
     pub(crate) ui_hit_targets: Vec<UiHitTarget>,
@@ -479,6 +483,7 @@ async fn run_inner(
         workspace_path: restored_ui_state.workspace_path.clone(),
         no_sessions_confirm_open: false,
         no_sessions_confirm_dismissed: restored_ui_state.no_sessions_confirm_dismissed,
+        quit_confirm_open: false,
         display_style: restored_ui_state.display_style,
         system_locale: config.system_locale.clone(),
         ui_hit_targets: Vec::new(),
@@ -603,6 +608,37 @@ fn handle_input_event(
     usage_refresh_tx: &mpsc::Sender<()>,
     limits_refresh_tx: &mpsc::Sender<()>,
 ) -> Result<InputOutcome> {
+    if state.quit_confirm_open {
+        return match event {
+            Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+                match ui_click_action_at(&state.ui_hit_targets, mouse.column, mouse.row) {
+                    Some(UiClickAction::ConfirmQuit) => Ok(InputOutcome::Quit),
+                    Some(UiClickAction::CancelQuit) => {
+                        state.quit_confirm_open = false;
+                        Ok(InputOutcome::Continue(true))
+                    }
+                    _ => Ok(InputOutcome::Continue(false)),
+                }
+            }
+            Event::Key(key) if key.kind == KeyEventKind::Press => match (key.code, key.modifiers) {
+                (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => Ok(InputOutcome::Quit),
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) => Ok(InputOutcome::Quit),
+                (KeyCode::Enter, _)
+                | (KeyCode::Esc, _)
+                | (KeyCode::Char('n'), _)
+                | (KeyCode::Char('N'), _)
+                | (KeyCode::Char('q'), _)
+                | (KeyCode::Char('Q'), _) => {
+                    state.quit_confirm_open = false;
+                    Ok(InputOutcome::Continue(true))
+                }
+                _ => Ok(InputOutcome::Continue(false)),
+            },
+            Event::Resize(_, _) => Ok(InputOutcome::Continue(true)),
+            _ => Ok(InputOutcome::Continue(false)),
+        };
+    }
+
     if let Event::Mouse(mouse) = &event {
         if state.show_help || state.no_sessions_confirm_open {
             return Ok(InputOutcome::Continue(false));
@@ -610,6 +646,9 @@ fn handle_input_event(
         if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
             if let Some(action) = ui_click_action_at(&state.ui_hit_targets, mouse.column, mouse.row)
             {
+                if action == UiClickAction::ConfirmQuit {
+                    return Ok(InputOutcome::Quit);
+                }
                 let changed = apply_ui_click_action(state, action);
                 return Ok(InputOutcome::Continue(changed));
             }
@@ -622,7 +661,10 @@ fn handle_input_event(
         }
 
         match (key.code, key.modifiers) {
-            (KeyCode::Char('q'), _) => return Ok(InputOutcome::Quit),
+            (KeyCode::Char('q'), _) | (KeyCode::Char('Q'), _) => {
+                state.quit_confirm_open = true;
+                return Ok(InputOutcome::Continue(true));
+            }
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(InputOutcome::Quit),
             (KeyCode::Char('s'), _) | (KeyCode::Char('S'), _) | (KeyCode::F(2), _) => {
                 state.active_screen = next_active_screen(state.active_screen);
@@ -693,6 +735,11 @@ fn apply_ui_click_action(state: &mut AppState, action: UiClickAction) -> bool {
             state.active_screen = screen;
             changed
         }
+        UiClickAction::SetDisplayStyle(style) => {
+            let changed = state.display_style != style;
+            state.display_style = style;
+            changed
+        }
         UiClickAction::SetMetric(metric) => {
             let changed = state.metric != metric;
             state.metric = metric;
@@ -726,10 +773,15 @@ fn apply_ui_click_action(state: &mut AppState, action: UiClickAction) -> bool {
             state.activity_project_limit = next;
             changed
         }
-        UiClickAction::CycleDisplayStyle => {
-            state.display_style = state.display_style.toggled();
+        UiClickAction::PromptQuit => {
+            state.quit_confirm_open = true;
             true
         }
+        UiClickAction::CancelQuit => {
+            state.quit_confirm_open = false;
+            true
+        }
+        UiClickAction::ConfirmQuit => false,
     }
 }
 

@@ -109,7 +109,9 @@ impl<'a> DisplayFormatter<'a> {
             DisplayStyle::SystemCompact => {
                 format!("System Compact ({})", self.system.id())
             }
-            DisplayStyle::SystemFull => format!("System Full ({})", self.system.id()),
+            DisplayStyle::SystemFull => {
+                format!("System Full ({}, space grouped)", self.system.id())
+            }
         }
     }
 
@@ -124,9 +126,8 @@ impl<'a> DisplayFormatter<'a> {
     pub(crate) fn format_u64(self, value: u64) -> String {
         let separator = match self.style {
             DisplayStyle::Classic => ",",
-            DisplayStyle::SystemCompact | DisplayStyle::SystemFull => {
-                self.system.thousands_separator.as_str()
-            }
+            DisplayStyle::SystemCompact => self.system.thousands_separator.as_str(),
+            DisplayStyle::SystemFull => " ",
         };
         group_decimal_digits(value, separator)
     }
@@ -669,6 +670,19 @@ mod tests {
         let formatter = DisplayFormatter::new(DisplayStyle::SystemCompact, &system);
         assert_eq!(formatter.format_count(1_234_567), "1\u{a0}234\u{a0}567");
         assert_eq!(formatter.localize_decimal("1.23M"), "1,23M");
+    }
+
+    #[test]
+    fn system_full_uses_regular_spaces_for_digit_grouping() {
+        let system = european_profile();
+        let formatter = DisplayFormatter::new(DisplayStyle::SystemFull, &system);
+
+        assert_eq!(formatter.format_count(1_234_567), "1 234 567");
+        assert_eq!(formatter.localize_decimal("1.23"), "1,23");
+        assert_eq!(
+            formatter.style_label(),
+            "System Full (et-EE, space grouped)"
+        );
     }
 
     #[test]

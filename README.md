@@ -133,11 +133,12 @@ comon --scan-time-budget-ms 1500 --max-jsonl-line-kib 512
 - `w` Toggle timeframe (Week/Month)
 - `f` Toggle layout (Horz/Vert)
 - `n` Cycle display formatting (Classic/System Compact/System Full)
-- Mouse: click the top tabs to switch screens; click Tokens/Time/Runs, Week/Month, Horz/Vert, or Activity project-count controls; click the footer to cycle display formatting
+- Mouse: click the top tabs, Usage/Activity controls (including the Usage style selector), or the bottom-right Quit action
+- Mouse: hover a filled vertical chart bar to see its exact date and full locale-aware value
 - `s` / `F2` Switch between Usage and Session history
 - `r` / `F5` Refresh current screen
 - `?` Help overlay
-- `Esc` / `q` Quit
+- `q` Quit (with confirmation)
 - `Enter` / `y` Continue past "no sessions found" warning (when shown)
 - Session history: `Up` / `Down` / mouse wheel navigate, `Enter` / `Right` open project sessions, `Backspace` / `Left` / `Esc` go back
 
@@ -342,7 +343,9 @@ CI also runs this check on each push and pull request via `.github/workflows/asc
 - Usage stats are derived from Codex session JSONL logs. If you have no session data yet, values will be empty.
 - Limits/credits require Codex App Server to start successfully (auth, environment, and a usable working directory). CoMon auto-detects `codex` on `PATH` and common Windows Codex App bundle locations; use `--codex-bin` or `--app-server-bin` when needed.
 - comon stores local app state in `~/.comon/state.json` by default (or `$COMON_HOME`, or `--comon-home`).
-- Display formatting starts in Classic mode; press `n` to cycle through Classic, System Compact, and System Full. Both System modes use the operating system locale for numbers, dates, times, and calendar labels; Compact abbreviates dashboard token values, while Full keeps them expanded except for the pre-existing compact summary values. The choice is saved in `state.json` without changing stored data.
+- Display formatting starts in Classic mode; press `n` or use `STYLE CLASS/SCOMP/SFULL` in the Usage controls to choose Classic, System Compact, or System Full. Both System modes use the operating system locale for dates, times, decimals, and calendar labels; Compact uses the detected thousands separator and abbreviates dashboard token values, while Full groups expanded integers with regular spaces. The choice is saved in `state.json` without changing stored data.
+- Vertical chart labels preserve the selected style when they fit and compact only individual values that exceed their bar width. Hovering a filled bar shows the exact value.
+- The quit dialog's `Don't show again` checkbox disables future `q`/`QUIT` confirmations after a confirmed exit. The checkbox beside `QUIT` shows that saved state; clicking it asks before enabling or disabling confirmation.
 - comon stores scan cache in `~/.comon/comon.db` to avoid rereading unchanged session files.
 - Large session logs are parsed incrementally with persisted parser offsets in `comon.db`; unchanged files are reused from cache.
 - If historical days look incomplete after adding old session files, run once with `--full-scan --scan-time-budget-ms 0` to force a full reparse and refresh cached summaries.

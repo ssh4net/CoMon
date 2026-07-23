@@ -5,7 +5,7 @@ use crate::usage::{
     format_tokens_overview, ChartRange, ProjectActivity, UsageMetric, ACTIVITY_TIMELINE_WEEKS,
 };
 use anyhow::Result;
-use chrono::{Datelike, Local, NaiveDate, TimeZone, Weekday};
+use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, TimeZone, Weekday};
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
@@ -78,6 +78,9 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
     let area = frame.area();
     let (navigation, navigation_targets) = navigation_title(area, state.active_screen);
     state.ui_hit_targets.extend(navigation_targets);
+    let (quit, quit_targets) =
+        quit_title(area, state.quit_confirm_open, state.skip_quit_confirmation);
+    state.ui_hit_targets.extend(quit_targets);
 
     let outer = Block::default()
         .borders(Borders::ALL)
@@ -86,7 +89,8 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
             format!(" comon :: {} ", env!("CARGO_PKG_VERSION")),
             Style::default().add_modifier(Modifier::BOLD),
         ))
-        .title_top(navigation.right_aligned());
+        .title_top(navigation.right_aligned())
+        .title_bottom(quit.right_aligned());
     frame.render_widget(outer, area);
 
     let inner = apply_margin(
@@ -152,19 +156,16 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
             }
         }
         ActiveScreen::Read => {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),
-                    Constraint::Min(0),
-                    Constraint::Length(2),
-                ])
-                .split(inner);
-            register_hit_target(state, chunks[2], UiClickAction::CycleDisplayStyle);
             let system_locale = state.system_locale.clone();
             let formatter = DisplayFormatter::new(state.display_style, &system_locale);
             crate::read::tui::render(frame, inner, &mut state.read_browser, formatter);
         }
+    }
+
+    if state.quit_confirm_open {
+        render_quit_confirmation(frame, area, state);
+    } else if state.quit_preference_prompt.is_some() {
+        render_quit_preference_confirmation(frame, area, state);
     }
 }
 
@@ -226,6 +227,34 @@ fn navigation_title(area: Rect, active_screen: ActiveScreen) -> (Line<'static>, 
         pill("ACTIVITY", active_screen == ActiveScreen::Activity),
         pill("LIMITS", active_screen == ActiveScreen::LimitResets),
         pill("HISTORY", active_screen == ActiveScreen::Read),
+    ]);
+    (line, right_aligned_targets(title_area, &segments))
+}
+
+fn quit_title(
+    area: Rect,
+    active: bool,
+    skip_confirmation: bool,
+) -> (Line<'static>, Vec<UiHitTarget>) {
+    let title_area = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(area.height.saturating_sub(1)),
+        area.width.saturating_sub(2),
+        1,
+    );
+    let checkbox = if skip_confirmation { " [x] " } else { " [ ] " };
+    let segments = [
+        (
+            checkbox,
+            Some(UiClickAction::PromptQuitConfirmationPreference),
+        ),
+        (" QUIT ", Some(UiClickAction::PromptQuit)),
+        (" ", None),
+    ];
+    let line = Line::from(vec![
+        checkbox_span(skip_confirmation, None),
+        pill("QUIT", active),
+        Span::raw(" "),
     ]);
     (line, right_aligned_targets(title_area, &segments))
 }
@@ -347,7 +376,7 @@ fn footer_height(width: u16, state: &AppState) -> u16 {
     wrapped_line_count(&footer_text(state), width).max(1)
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
+fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let err = footer_error(state);
     let style = format!("Style [n]: {}", state.formatter().style_label());
     let line = Line::from(vec![
@@ -362,7 +391,6 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     ]);
 
     frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), area);
-    register_hit_target(state, area, UiClickAction::CycleDisplayStyle);
 }
 
 fn render_usage(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
@@ -922,13 +950,27 @@ fn render_usage_controls(
     let month = pill("MONTH", state.range == ChartRange::Month);
     let vert = pill("VERT", state.orientation == ChartOrientation::Vertical);
     let horz = pill("HORZ", state.orientation == ChartOrientation::Horizontal);
+    let classic = pill("CLASS", state.display_style == DisplayStyle::Classic);
+    let system_compact = pill("SCOMP", state.display_style == DisplayStyle::SystemCompact);
+    let system_full = pill("SFULL", state.display_style == DisplayStyle::SystemFull);
 
     render_flat_usage_controls(
         frame,
         chunks[0],
         state,
         &workspace_label,
-        vec![tokens, time, runs, week, month, vert, horz],
+        vec![
+            tokens,
+            time,
+            runs,
+            week,
+            month,
+            vert,
+            horz,
+            classic,
+            system_compact,
+            system_full,
+        ],
     );
 
     if let Some(text) = reset_summary {
@@ -957,7 +999,7 @@ fn render_flat_usage_controls(
 ) {
     let row = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Min(0)])
+        .constraints([Constraint::Min(20), Constraint::Length(92)])
         .split(area);
     render_workspace_label(frame, row[0], workspace_label);
 
@@ -984,6 +1026,19 @@ fn render_flat_usage_controls(
                 " HORZ ",
                 Some(UiClickAction::SetOrientation(ChartOrientation::Horizontal)),
             ),
+            (" STYLE ", None),
+            (
+                " CLASS ",
+                Some(UiClickAction::SetDisplayStyle(DisplayStyle::Classic)),
+            ),
+            (
+                " SCOMP ",
+                Some(UiClickAction::SetDisplayStyle(DisplayStyle::SystemCompact)),
+            ),
+            (
+                " SFULL ",
+                Some(UiClickAction::SetDisplayStyle(DisplayStyle::SystemFull)),
+            ),
         ],
     );
 
@@ -993,6 +1048,8 @@ fn render_flat_usage_controls(
     spans.extend(pills[3..5].iter().cloned());
     spans.push(control_group_label("BARS"));
     spans.extend(pills[5..7].iter().cloned());
+    spans.push(control_group_label("STYLE"));
+    spans.extend(pills[7..10].iter().cloned());
     frame.render_widget(
         Paragraph::new(Line::from(spans)).alignment(Alignment::Right),
         row[1],
@@ -1325,6 +1382,7 @@ fn usage_cards_height(state: &AppState, width: u16) -> u16 {
 
 fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let formatter = state.formatter();
+    let today_title = today_card_title(formatter, Local::now().naive_local());
     let card_layout = usage_card_layout(area.width);
     let row_heights = usage_card_row_heights(state, area.width);
     let two_rows = row_heights.len() > 1;
@@ -1457,7 +1515,7 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                     );
                     frame.render_widget(
                         card(
-                            "TODAY",
+                            &today_title,
                             &today_value,
                             Some(&today_caption1),
                             Some(&today_caption2),
@@ -1511,7 +1569,7 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                     let runs7 = last7_runs_caption.as_deref();
                     frame.render_widget(
                         card(
-                            "TODAY",
+                            &today_title,
                             &today_value,
                             Some(&today_caption1),
                             Some(&today_caption2),
@@ -1611,7 +1669,7 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                     );
                     frame.render_widget(
                         card(
-                            "TODAY",
+                            &today_title,
                             &today_value,
                             Some(&today_caption1),
                             Some(&today_caption2),
@@ -1662,7 +1720,7 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                     let runs7 = last7_runs_caption.as_deref();
                     frame.render_widget(
                         card(
-                            "TODAY",
+                            &today_title,
                             &today_value,
                             Some(&today_caption1),
                             Some(&today_caption2),
@@ -1789,7 +1847,7 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                     );
                     frame.render_widget(
                         card(
-                            "TODAY",
+                            &today_title,
                             &today_value,
                             Some(&today_caption1),
                             Some(&today_caption2),
@@ -1837,7 +1895,7 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                     );
                     frame.render_widget(
                         card(
-                            "TODAY",
+                            &today_title,
                             &today_value,
                             Some(&today_caption1),
                             Some(&today_caption2),
@@ -1982,6 +2040,27 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             let bw = bar_width.max(1);
 
             let max_value = values.iter().copied().max().unwrap_or(0).max(1);
+            let hovered_bar = hovered_vertical_bar_index(
+                state.mouse_position,
+                bars_area,
+                bw,
+                bar_gap,
+                &values,
+                max_value,
+            );
+            let hover_tooltip = hovered_bar.and_then(|index| {
+                state.mouse_position.map(|mouse| {
+                    (
+                        mouse,
+                        format_vertical_bar_tooltip(
+                            &days[index].day,
+                            values[index],
+                            state.metric,
+                            formatter,
+                        ),
+                    )
+                })
+            });
             let buf = frame.buffer_mut();
 
             // Bars are laid left-to-right.
@@ -2045,7 +2124,7 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                             }
                         }
                         UsageMetric::Runs => {
-                            let raw = value.to_string();
+                            let raw = formatter.format_u64(*value);
                             if raw.len() <= w as usize {
                                 raw
                             } else {
@@ -2083,6 +2162,10 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                             .set_style(Style::default().fg(Color::Gray));
                     }
                 }
+            }
+
+            if let Some((mouse, tooltip)) = hover_tooltip {
+                render_chart_tooltip(frame, inner, mouse, &tooltip);
             }
         }
         ChartOrientation::Horizontal => {
@@ -2286,6 +2369,126 @@ fn usage_chart_metric_label(metric: UsageMetric) -> &'static str {
     }
 }
 
+fn hovered_vertical_bar_index(
+    mouse_position: Option<(u16, u16)>,
+    bars_area: Rect,
+    bar_width: u16,
+    bar_gap: u16,
+    values: &[u64],
+    max_value: u64,
+) -> Option<usize> {
+    let (mouse_x, mouse_y) = mouse_position?;
+    let right = bars_area.x.saturating_add(bars_area.width);
+    let bottom = bars_area.y.saturating_add(bars_area.height);
+    if mouse_x < bars_area.x
+        || mouse_x >= right
+        || mouse_y < bars_area.y
+        || mouse_y >= bottom
+        || bar_width == 0
+    {
+        return None;
+    }
+
+    let stride = bar_width.saturating_add(bar_gap);
+    if stride == 0 {
+        return None;
+    }
+    let offset_x = mouse_x.saturating_sub(bars_area.x);
+    let index = (offset_x / stride) as usize;
+    let value = *values.get(index)?;
+    let bar_x = bars_area
+        .x
+        .saturating_add((index as u16).saturating_mul(stride));
+    let actual_width = bar_width.min(right.saturating_sub(bar_x));
+    if mouse_x >= bar_x.saturating_add(actual_width) {
+        return None;
+    }
+
+    let ratio = (value as f64) / (max_value.max(1) as f64);
+    let filled_height = ((bars_area.height as f64) * ratio.clamp(0.0, 1.0)).round() as u16;
+    if filled_height == 0 {
+        return None;
+    }
+    let bottom_y = bottom.saturating_sub(1);
+    let top_filled_y = bottom_y.saturating_sub(filled_height.saturating_sub(1));
+    (mouse_y >= top_filled_y).then_some(index)
+}
+
+fn format_vertical_bar_tooltip(
+    day: &str,
+    value: u64,
+    metric: UsageMetric,
+    formatter: DisplayFormatter<'_>,
+) -> String {
+    let date = NaiveDate::parse_from_str(day, "%Y-%m-%d")
+        .map(|date| formatter.format_full_date(date))
+        .unwrap_or_else(|_| day.to_string());
+    let value = match metric {
+        UsageMetric::Tokens => format!("{} tokens", formatter.format_u64(value)),
+        UsageMetric::Time => format_duration_words(
+            value.min((i64::MAX as u64) / 60_000).saturating_mul(60_000) as i64,
+        ),
+        UsageMetric::Runs => format!("{} runs", formatter.format_u64(value)),
+    };
+    format!("{date} | {value}")
+}
+
+fn render_chart_tooltip(frame: &mut Frame<'_>, bounds: Rect, mouse: (u16, u16), text: &str) {
+    let Some(area) = chart_tooltip_rect(
+        bounds,
+        mouse,
+        UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16,
+    ) else {
+        return;
+    };
+    let text = truncate_middle(text, area.width.saturating_sub(2) as usize);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(Color::White))
+        .style(Style::default().bg(Color::Black));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            text,
+            Style::default().add_modifier(Modifier::BOLD),
+        )))
+        .alignment(Alignment::Center)
+        .block(block),
+        area,
+    );
+}
+
+fn chart_tooltip_rect(bounds: Rect, mouse: (u16, u16), content_width: u16) -> Option<Rect> {
+    if bounds.width < 3 || bounds.height < 3 {
+        return None;
+    }
+    let width = content_width.saturating_add(2).clamp(3, bounds.width);
+    let height = 3;
+    let right = bounds.x.saturating_add(bounds.width);
+    let bottom = bounds.y.saturating_add(bounds.height);
+    let max_x = right.saturating_sub(width);
+    let max_y = bottom.saturating_sub(height);
+
+    let preferred_x = if mouse.0.saturating_add(1).saturating_add(width) <= right {
+        mouse.0.saturating_add(1)
+    } else {
+        mouse.0.saturating_sub(width)
+    };
+    let preferred_y = if mouse.1 >= bounds.y.saturating_add(height) {
+        mouse.1.saturating_sub(height)
+    } else {
+        mouse.1.saturating_add(1)
+    };
+
+    Some(Rect::new(
+        preferred_x.clamp(bounds.x, max_x),
+        preferred_y.clamp(bounds.y, max_y),
+        width,
+        height,
+    ))
+}
+
 fn format_vertical_token_value(
     value: u64,
     max_width: u16,
@@ -2296,7 +2499,7 @@ fn format_vertical_token_value(
         DisplayStyle::SystemCompact => format_tokens_compact(value as i64, formatter),
         DisplayStyle::SystemFull => formatter.format_u64(value),
     };
-    if preferred.len() <= max_width as usize || formatter.style() == DisplayStyle::SystemFull {
+    if preferred.len() <= max_width as usize {
         preferred
     } else {
         format_compact_kmb(value, max_width, formatter)
@@ -2455,11 +2658,11 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
             Line::from("  w    - toggle timeframe (Week/Month)"),
             Line::from("  f    - toggle layout (Horz/Vert)"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
-            Line::from("  Mouse - click tabs/controls; footer cycles style"),
+            Line::from("  Mouse - click tabs/controls/format/quit"),
             Line::from("  r/F5 - refresh usage + limits"),
             Line::from("  s/F2 - switch screen"),
             Line::from("  ?    - toggle help"),
-            Line::from("  q/Esc - quit"),
+            Line::from("  q    - quit (confirm)"),
         ]),
         ActiveScreen::Activity => Text::from(vec![
             Line::from("Keys:"),
@@ -2467,26 +2670,26 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
             Line::from("  +/=  - show more projects"),
             Line::from("  -    - show fewer projects"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
-            Line::from("  Mouse - click tabs/view/projects; footer cycles style"),
+            Line::from("  Mouse - click tabs/view/projects/quit"),
             Line::from("  r/F5 - refresh usage + limits"),
             Line::from("  s/F2 - switch screen"),
             Line::from("  ?    - toggle help"),
-            Line::from("  q/Esc - quit"),
+            Line::from("  q    - quit (confirm)"),
         ]),
         ActiveScreen::LimitResets => Text::from(vec![
             Line::from("Keys:"),
             Line::from("  r/F5 - refresh reset credits"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
-            Line::from("  Mouse - click tabs; footer cycles style"),
+            Line::from("  Mouse - click tabs/quit"),
             Line::from("  s/F2 - switch screen"),
             Line::from("  ?    - toggle help"),
-            Line::from("  q/Esc - quit"),
+            Line::from("  q    - quit (confirm)"),
         ]),
         ActiveScreen::Read => Text::from(vec![
             Line::from("Keys:"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
-            Line::from("  Mouse - click tabs; footer cycles style"),
-            Line::from("  q/Esc - quit"),
+            Line::from("  Mouse - click tabs/quit"),
+            Line::from("  q    - quit (confirm)"),
         ]),
     };
     frame.render_widget(
@@ -2551,6 +2754,185 @@ fn render_no_sessions_overlay(frame: &mut Frame<'_>, area: Rect, state: &AppStat
     );
 }
 
+fn render_quit_confirmation(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
+    state.ui_hit_targets.clear();
+
+    let popup = centered_rect(area.width.min(39), area.height.min(10), area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .title(Span::styled(
+                " Quit ",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+        popup,
+    );
+
+    let message_area = Rect::new(
+        popup.x.saturating_add(1),
+        popup.y.saturating_add(2),
+        popup.width.saturating_sub(2),
+        3.min(popup.height.saturating_sub(3)),
+    );
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            Line::from("Are you sure you want to quit?"),
+            Line::from(Span::styled(
+                "Y confirms; N/Esc/Enter cancels",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(Span::styled(
+                "Space toggles the checkbox",
+                Style::default().fg(Color::Gray),
+            )),
+        ]))
+        .alignment(Alignment::Center),
+        message_area,
+    );
+
+    let checkbox_area = Rect::new(
+        popup.x.saturating_add(1),
+        popup.y.saturating_add(6),
+        popup.width.saturating_sub(2),
+        1,
+    );
+    let checkbox_text = if state.quit_dont_ask_again {
+        "[x] Don't show again"
+    } else {
+        "[ ] Don't show again"
+    };
+    state.ui_hit_targets.extend(centered_targets(
+        checkbox_area,
+        &[(checkbox_text, Some(UiClickAction::ToggleQuitDontAskAgain))],
+    ));
+    frame.render_widget(
+        Paragraph::new(Line::from(checkbox_span(
+            state.quit_dont_ask_again,
+            Some("Don't show again"),
+        )))
+        .alignment(Alignment::Center),
+        checkbox_area,
+    );
+
+    let buttons_area = Rect::new(
+        popup.x.saturating_add(1),
+        popup.y.saturating_add(popup.height.saturating_sub(2)),
+        popup.width.saturating_sub(2),
+        1,
+    );
+    let segments = [
+        (" YES ", Some(UiClickAction::ConfirmQuit)),
+        ("   ", None),
+        (" NO ", Some(UiClickAction::CancelQuit)),
+    ];
+    state
+        .ui_hit_targets
+        .extend(centered_targets(buttons_area, &segments));
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            pill("YES", false),
+            Span::raw("   "),
+            pill("NO", true),
+        ]))
+        .alignment(Alignment::Center),
+        buttons_area,
+    );
+}
+
+fn render_quit_preference_confirmation(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
+    state.ui_hit_targets.clear();
+    let disable_confirmation = state.quit_preference_prompt.unwrap_or(false);
+    let (title, question, explanation) = if disable_confirmation {
+        (
+            " Exit confirmation ",
+            "Disable exit confirmation?",
+            "q and QUIT will exit immediately.",
+        )
+    } else {
+        (
+            " Exit confirmation ",
+            "Enable exit confirmation?",
+            "q and QUIT will ask before exiting.",
+        )
+    };
+
+    let popup = centered_rect(area.width.min(43), area.height.min(8), area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .title(Span::styled(
+                title,
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+        popup,
+    );
+
+    let message_area = Rect::new(
+        popup.x.saturating_add(1),
+        popup.y.saturating_add(2),
+        popup.width.saturating_sub(2),
+        2.min(popup.height.saturating_sub(3)),
+    );
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            Line::from(question),
+            Line::from(Span::styled(explanation, Style::default().fg(Color::Gray))),
+        ]))
+        .alignment(Alignment::Center),
+        message_area,
+    );
+
+    let buttons_area = Rect::new(
+        popup.x.saturating_add(1),
+        popup.y.saturating_add(popup.height.saturating_sub(2)),
+        popup.width.saturating_sub(2),
+        1,
+    );
+    let segments = [
+        (
+            " YES ",
+            Some(UiClickAction::ConfirmQuitConfirmationPreference),
+        ),
+        ("   ", None),
+        (
+            " NO ",
+            Some(UiClickAction::CancelQuitConfirmationPreference),
+        ),
+    ];
+    state
+        .ui_hit_targets
+        .extend(centered_targets(buttons_area, &segments));
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            pill("YES", false),
+            Span::raw("   "),
+            pill("NO", true),
+        ]))
+        .alignment(Alignment::Center),
+        buttons_area,
+    );
+}
+
+fn checkbox_span(checked: bool, label: Option<&str>) -> Span<'static> {
+    let mark = if checked { "x" } else { " " };
+    let text = match label {
+        Some(label) => format!("[{mark}] {label}"),
+        None => format!(" [{mark}] "),
+    };
+    let style = if checked {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    Span::styled(text, style)
+}
+
 fn pill(label: &str, active: bool) -> Span<'static> {
     let style = if active {
         Style::default()
@@ -2561,12 +2943,6 @@ fn pill(label: &str, active: bool) -> Span<'static> {
         Style::default().fg(Color::Gray)
     };
     Span::styled(format!(" {label} "), style)
-}
-
-fn register_hit_target(state: &mut AppState, area: Rect, action: UiClickAction) {
-    if area.width > 0 && area.height > 0 {
-        state.ui_hit_targets.push(UiHitTarget { area, action });
-    }
 }
 
 fn register_right_aligned_targets(
@@ -2612,6 +2988,33 @@ fn right_aligned_targets(
     targets
 }
 
+fn centered_targets(area: Rect, segments: &[(&str, Option<UiClickAction>)]) -> Vec<UiHitTarget> {
+    let total_width = segments.iter().fold(0_u16, |total, (text, _)| {
+        total.saturating_add(UnicodeWidthStr::width(*text).min(u16::MAX as usize) as u16)
+    });
+    if total_width > area.width || area.height == 0 {
+        return Vec::new();
+    }
+
+    let mut targets = Vec::new();
+    let mut x = area
+        .x
+        .saturating_add((area.width.saturating_sub(total_width)) / 2);
+    for (text, action) in segments {
+        let width = UnicodeWidthStr::width(*text).min(u16::MAX as usize) as u16;
+        if let Some(action) = action {
+            if width > 0 {
+                targets.push(UiHitTarget {
+                    area: Rect::new(x, area.y, width, 1),
+                    action: *action,
+                });
+            }
+        }
+        x = x.saturating_add(width);
+    }
+    targets
+}
+
 fn card(
     title: &str,
     value: &str,
@@ -2619,6 +3022,13 @@ fn card(
     caption2: Option<&str>,
 ) -> Paragraph<'static> {
     card_with_captions(title, value, &[caption1, caption2])
+}
+
+fn today_card_title(formatter: DisplayFormatter<'_>, now: NaiveDateTime) -> String {
+    format!(
+        "TODAY_{}",
+        formatter.format_session_datetime(now).replace(' ', "_")
+    )
 }
 
 fn card4(
@@ -3372,10 +3782,60 @@ mod tests {
     }
 
     #[test]
+    fn today_card_title_includes_the_current_date_and_time() {
+        let system_locale = crate::locale::SystemLocale::default();
+        let formatter = DisplayFormatter::new(DisplayStyle::Classic, &system_locale);
+        let now = NaiveDate::from_ymd_opt(2026, 7, 22)
+            .unwrap()
+            .and_hms_opt(14, 35, 0)
+            .unwrap();
+
+        assert_eq!(today_card_title(formatter, now), "TODAY_2026-07-22_14:35");
+
+        for style in [DisplayStyle::SystemCompact, DisplayStyle::SystemFull] {
+            let formatter = DisplayFormatter::new(style, &system_locale);
+            assert_eq!(today_card_title(formatter, now), "TODAY_07/22/2026_14:35");
+        }
+    }
+
+    #[test]
     fn navigation_title_hides_tabs_before_they_touch_the_version() {
         let (title, targets) = navigation_title(Rect::new(0, 0, 52, 10), ActiveScreen::Usage);
         assert!(title.spans.is_empty());
         assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn quit_action_is_on_the_bottom_right_border() {
+        let (title, targets) = quit_title(Rect::new(4, 2, 71, 20), true, true);
+
+        assert_eq!(title.spans[0].content.as_ref(), " [x] ");
+        assert_eq!(title.spans[1].style.fg, Some(Color::Black));
+        assert_eq!(title.spans[1].style.bg, Some(Color::White));
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].area, Rect::new(62, 21, 5, 1));
+        assert_eq!(
+            targets[0].action,
+            UiClickAction::PromptQuitConfirmationPreference
+        );
+        assert_eq!(targets[1].area, Rect::new(67, 21, 6, 1));
+        assert_eq!(targets[1].action, UiClickAction::PromptQuit);
+    }
+
+    #[test]
+    fn quit_confirmation_buttons_are_centered_and_separate() {
+        let targets = centered_targets(
+            Rect::new(10, 5, 33, 1),
+            &[
+                (" YES ", Some(UiClickAction::ConfirmQuit)),
+                ("   ", None),
+                (" NO ", Some(UiClickAction::CancelQuit)),
+            ],
+        );
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].area, Rect::new(20, 5, 5, 1));
+        assert_eq!(targets[1].area, Rect::new(28, 5, 4, 1));
     }
 
     #[test]
@@ -3673,7 +4133,7 @@ mod tests {
     }
 
     #[test]
-    fn system_full_keeps_chart_token_values_expanded() {
+    fn system_full_compacts_only_tight_vertical_token_values() {
         let system_locale = crate::locale::SystemLocale::default();
         let formatter =
             DisplayFormatter::new(crate::locale::DisplayStyle::SystemFull, &system_locale);
@@ -3686,11 +4146,11 @@ mod tests {
                 u16::MAX,
                 formatter,
             ),
-            "45456785 / 1756241"
+            "45 456 785 / 1 756 241"
         );
         assert_eq!(
             format_vertical_token_value(45_456_785, 20, formatter),
-            "45456785"
+            "45 456 785"
         );
         assert_eq!(
             format_horizontal_value(
@@ -3700,11 +4160,46 @@ mod tests {
                 8,
                 formatter,
             ),
-            "45456785 / 1756241"
+            "45 456 785 / 1 756 241"
+        );
+        assert_eq!(format_vertical_token_value(45_456_785, 4, formatter), "45M");
+    }
+
+    #[test]
+    fn vertical_bar_hover_requires_the_filled_bar_and_ignores_gaps() {
+        let area = Rect::new(10, 5, 11, 10);
+        let values = [50, 100];
+
+        assert_eq!(
+            hovered_vertical_bar_index(Some((10, 10)), area, 3, 1, &values, 100),
+            Some(0)
         );
         assert_eq!(
-            format_vertical_token_value(45_456_785, 4, formatter),
-            "45456785"
+            hovered_vertical_bar_index(Some((10, 9)), area, 3, 1, &values, 100),
+            None
+        );
+        assert_eq!(
+            hovered_vertical_bar_index(Some((13, 12)), area, 3, 1, &values, 100),
+            None
+        );
+        assert_eq!(
+            hovered_vertical_bar_index(Some((14, 5)), area, 3, 1, &values, 100),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn vertical_bar_tooltip_shows_exact_value_and_stays_inside_chart() {
+        let system_locale = crate::locale::SystemLocale::default();
+        let formatter = DisplayFormatter::new(DisplayStyle::Classic, &system_locale);
+
+        assert_eq!(
+            format_vertical_bar_tooltip("2026-07-22", 45_456_785, UsageMetric::Tokens, formatter,),
+            "2026-07-22 | 45,456,785 tokens"
+        );
+        assert_eq!(
+            chart_tooltip_rect(Rect::new(2, 2, 20, 10), (20, 3), 10),
+            Some(Rect::new(8, 4, 12, 3))
         );
     }
 

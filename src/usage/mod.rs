@@ -18,7 +18,7 @@ const DEFAULT_MAX_SESSION_FILES_SCANNED: usize = 10_000;
 const DEFAULT_MAX_JSONL_LINE_BYTES: usize = 512 * 1024;
 const DEFAULT_SCAN_TIME_BUDGET_MS: u64 = 1500;
 const MAX_DISTINCT_MODELS: usize = 5_000;
-const SCAN_CACHE_DB_SCHEMA_VERSION: i64 = 3;
+const SCAN_CACHE_DB_SCHEMA_VERSION: i64 = 4;
 const FORK_REPLAY_END_GAP_MS: i64 = 1_000;
 const FORK_REPLAY_NO_TOKEN_GRACE_MS: i64 = 2_000;
 pub const DEFAULT_SCAN_CACHE_MAX_ENTRIES: usize = 50_000;
@@ -1206,12 +1206,15 @@ fn parse_file_summary(
             session_cwd = extract_cwd(&value);
         }
 
-        if entry_type == "session_meta" {
-            maybe_start_fork_replay(&value, &mut first_session_meta_seen, &mut fork_replay);
-        }
+        let started_fork_replay = if entry_type == "session_meta" {
+            maybe_start_fork_replay(&value, &mut first_session_meta_seen, &mut fork_replay)
+        } else {
+            false
+        };
 
         let event_timestamp_ms = read_timestamp_ms(&value);
-        let skip_fork_replay = fork_replay_should_skip_event(&mut fork_replay, event_timestamp_ms);
+        let skip_fork_replay = started_fork_replay
+            || fork_replay_should_skip_event(&mut fork_replay, event_timestamp_ms);
 
         if entry_type == "turn_context" {
             if !skip_fork_replay {
@@ -1491,8 +1494,10 @@ fn open_or_init_scan_cache_db(path: &Path) -> Result<ScanCacheDb> {
     if schema_version == 1 || !has_v2_columns {
         migrate_scan_cache_db_v1_to_v2(&conn, path)?;
     }
+    if schema_version < 4 {
+        invalidate_forked_session_cache_rows(&conn, path)?;
+    }
     if schema_version < SCAN_CACHE_DB_SCHEMA_VERSION {
-        migrate_scan_cache_db_to_v3(&conn, path)?;
         conn.execute(
             "UPDATE cache_meta SET value = ?1 WHERE key = 'schema_version';",
             params![SCAN_CACHE_DB_SCHEMA_VERSION],
@@ -1576,9 +1581,10 @@ fn migrate_scan_cache_db_v1_to_v2(conn: &Connection, path: &Path) -> Result<()> 
     Ok(())
 }
 
-fn migrate_scan_cache_db_to_v3(conn: &Connection, path: &Path) -> Result<()> {
-    // v3 changes forked-session accounting semantics. Reusing those old rows would keep
-    // inflated totals, but non-forked cache rows are still valid.
+fn invalidate_forked_session_cache_rows(conn: &Connection, path: &Path) -> Result<()> {
+    // v3 and v4 change forked-session accounting semantics. Reusing older fork rows
+    // would keep inflated totals, but non-forked cache rows are still valid. One pass
+    // is sufficient even when upgrading across multiple schema versions at once.
     let mut stmt = conn
         .prepare("SELECT file_path FROM file_cache;")
         .with_context(|| {
@@ -1603,7 +1609,7 @@ fn migrate_scan_cache_db_to_v3(conn: &Connection, path: &Path) -> Result<()> {
                 path.display()
             )
         })?;
-        if cached_session_needs_v3_reparse(&file_path) {
+        if forked_session_cache_needs_reparse(&file_path) {
             stale_paths.push(file_path);
         }
     }
@@ -1625,7 +1631,7 @@ fn migrate_scan_cache_db_to_v3(conn: &Connection, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cached_session_needs_v3_reparse(file_path: &str) -> bool {
+fn forked_session_cache_needs_reparse(file_path: &str) -> bool {
     let file = match File::open(file_path) {
         Ok(file) => file,
         Err(_) => return true,
@@ -2180,28 +2186,29 @@ fn maybe_start_fork_replay(
     value: &Value,
     first_session_meta_seen: &mut bool,
     replay: &mut ForkReplayState,
-) {
+) -> bool {
     if *first_session_meta_seen {
-        return;
+        return false;
     }
     *first_session_meta_seen = true;
 
     let payload = value.get("payload").and_then(Value::as_object);
     let Some(payload) = payload else {
-        return;
+        return false;
     };
     if payload
         .get("forked_from_id")
         .and_then(Value::as_str)
         .is_none()
     {
-        return;
+        return false;
     }
 
-    let start_ms = payload
-        .get("timestamp")
-        .and_then(parse_timestamp_value_ms)
-        .or_else(|| read_timestamp_ms(value));
+    // The outer timestamp records when this JSONL event was emitted. The payload
+    // timestamp can be earlier because preparing a large fork replay takes time;
+    // using it as last_event_ms can falsely look like the end-of-replay gap.
+    let start_ms = read_timestamp_ms(value)
+        .or_else(|| payload.get("timestamp").and_then(parse_timestamp_value_ms));
     *replay = ForkReplayState {
         active: true,
         done: false,
@@ -2209,6 +2216,7 @@ fn maybe_start_fork_replay(
         last_event_ms: start_ms,
         token_events: 0,
     };
+    true
 }
 
 fn fork_replay_should_skip_event(
@@ -2224,21 +2232,24 @@ fn fork_replay_should_skip_event(
     };
     let start_ms = replay.start_ms.unwrap_or(timestamp_ms);
     let elapsed_ms = timestamp_ms - start_ms;
-    let gap_ms = replay
-        .last_event_ms
+    let previous_event_ms = replay.last_event_ms;
+    let gap_ms = previous_event_ms
         .map(|last_ms| timestamp_ms - last_ms)
         .unwrap_or(0);
+    let monotonic_event_ms = previous_event_ms
+        .map(|last_ms| last_ms.max(timestamp_ms))
+        .unwrap_or(timestamp_ms);
 
     if gap_ms >= FORK_REPLAY_END_GAP_MS
         || (replay.token_events == 0 && elapsed_ms >= FORK_REPLAY_NO_TOKEN_GRACE_MS)
     {
         replay.active = false;
         replay.done = true;
-        replay.last_event_ms = Some(timestamp_ms);
+        replay.last_event_ms = Some(monotonic_event_ms);
         return false;
     }
 
-    replay.last_event_ms = Some(timestamp_ms);
+    replay.last_event_ms = Some(monotonic_event_ms);
     true
 }
 
@@ -2649,6 +2660,64 @@ mod tests {
         append_agent_message_line(path, timestamp_ms + 1_800);
     }
 
+    fn write_delayed_fork_replay_prefix(
+        path: &Path,
+        payload_timestamp_ms: i64,
+        outer_delay_ms: i64,
+    ) -> i64 {
+        let payload_timestamp = Utc
+            .timestamp_millis_opt(payload_timestamp_ms)
+            .single()
+            .expect("valid payload timestamp")
+            .to_rfc3339();
+        let outer_timestamp_ms = payload_timestamp_ms + outer_delay_ms;
+        let outer_timestamp = Utc
+            .timestamp_millis_opt(outer_timestamp_ms)
+            .single()
+            .expect("valid outer timestamp")
+            .to_rfc3339();
+        append_json_line(
+            path,
+            serde_json::json!({
+                "type": "session_meta",
+                "timestamp": outer_timestamp,
+                "payload": {
+                    "id": "fork-child",
+                    "forked_from_id": "parent",
+                    "timestamp": payload_timestamp,
+                    "cwd": "/tmp/forked-project"
+                }
+            }),
+        );
+        append_json_line(
+            path,
+            serde_json::json!({
+                "type": "session_meta",
+                "timestamp": Utc
+                    .timestamp_millis_opt(outer_timestamp_ms + 1)
+                    .single()
+                    .expect("valid replay metadata timestamp")
+                    .to_rfc3339(),
+                "payload": {
+                    "id": "parent",
+                    "timestamp": payload_timestamp,
+                    "cwd": "/tmp/forked-project"
+                }
+            }),
+        );
+        append_total_token_line(path, outer_timestamp_ms + 2, 1_000, 800, 100);
+        for offset in 3..67 {
+            append_agent_message_line(path, outer_timestamp_ms + offset);
+        }
+        append_total_token_line(path, outer_timestamp_ms + 100, 1_500, 1_300, 130);
+        outer_timestamp_ms
+    }
+
+    fn append_fork_replay_live_tail(path: &Path, outer_timestamp_ms: i64) {
+        append_total_token_line(path, outer_timestamp_ms + 4_000, 1_700, 1_400, 150);
+        append_agent_message_line(path, outer_timestamp_ms + 4_001);
+    }
+
     fn default_test_limits(full_scan: bool) -> ScanLimits {
         ScanLimits {
             max_session_file_bytes: 4 * 1024 * 1024,
@@ -2685,6 +2754,24 @@ mod tests {
             .expect("parse monday-first activity key");
         assert_eq!(sunday.weekday(), Weekday::Sun);
         assert_eq!(monday.weekday(), Weekday::Mon);
+    }
+
+    #[test]
+    fn fork_replay_keeps_last_event_timestamp_monotonic() {
+        let mut replay = ForkReplayState {
+            active: true,
+            done: false,
+            start_ms: Some(1_000),
+            last_event_ms: Some(1_000),
+            token_events: 1,
+        };
+
+        assert!(fork_replay_should_skip_event(&mut replay, Some(1_100)));
+        assert!(fork_replay_should_skip_event(&mut replay, Some(900)));
+        assert_eq!(replay.last_event_ms, Some(1_100));
+        assert!(fork_replay_should_skip_event(&mut replay, Some(1_150)));
+        assert!(replay.active);
+        assert!(!replay.done);
     }
 
     #[test]
@@ -2748,6 +2835,93 @@ mod tests {
             Some(cache_db_path.as_path()),
         )
         .expect("cached snapshot");
+        assert_eq!(cached.totals.last30_days_tokens, 220);
+        assert_eq!(cached.days.iter().map(|day| day.agent_runs).sum::<i64>(), 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compute_snapshot_ignores_delayed_fork_metadata_replay() {
+        let root = make_temp_dir("fork-replay-delayed-metadata");
+        let codex_home = root.join("codex");
+        let sessions_root = codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions root");
+
+        let payload_timestamp_ms =
+            Utc::now().timestamp_millis() - Duration::hours(1).num_milliseconds();
+        let session_path = sessions_root.join("forked.jsonl");
+        let outer_timestamp_ms =
+            write_delayed_fork_replay_prefix(&session_path, payload_timestamp_ms, 1_500);
+        append_fork_replay_live_tail(&session_path, outer_timestamp_ms);
+
+        let snapshot = compute_snapshot(30, &codex_home, None, default_test_limits(false), None)
+            .expect("snapshot");
+        assert_eq!(snapshot.totals.last30_days_tokens, 220);
+        assert_eq!(
+            snapshot.days.iter().map(|day| day.agent_runs).sum::<i64>(),
+            1,
+            "the delayed outer session timestamp must not expose compressed replay runs"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compute_snapshot_resumes_active_delayed_fork_replay_from_cache() {
+        let root = make_temp_dir("fork-replay-delayed-resume");
+        let codex_home = root.join("codex");
+        let sessions_root = codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions root");
+
+        let payload_timestamp_ms =
+            Utc::now().timestamp_millis() - Duration::hours(1).num_milliseconds();
+        let session_path = sessions_root.join("forked.jsonl");
+        let outer_timestamp_ms =
+            write_delayed_fork_replay_prefix(&session_path, payload_timestamp_ms, 1_500);
+        let cache_db_path = root.join("comon.db");
+
+        let replay_only = compute_snapshot(
+            30,
+            &codex_home,
+            None,
+            default_test_limits(false),
+            Some(cache_db_path.as_path()),
+        )
+        .expect("replay-only snapshot");
+        assert_eq!(replay_only.totals.last30_days_tokens, 0);
+        assert_eq!(
+            replay_only
+                .days
+                .iter()
+                .map(|day| day.agent_runs)
+                .sum::<i64>(),
+            0
+        );
+
+        append_fork_replay_live_tail(&session_path, outer_timestamp_ms);
+        let resumed = compute_snapshot(
+            30,
+            &codex_home,
+            None,
+            default_test_limits(false),
+            Some(cache_db_path.as_path()),
+        )
+        .expect("resumed snapshot");
+        assert_eq!(resumed.totals.last30_days_tokens, 220);
+        assert_eq!(
+            resumed.days.iter().map(|day| day.agent_runs).sum::<i64>(),
+            1
+        );
+
+        let cached = compute_snapshot(
+            30,
+            &codex_home,
+            None,
+            default_test_limits(false),
+            Some(cache_db_path.as_path()),
+        )
+        .expect("cached resumed snapshot");
         assert_eq!(cached.totals.last30_days_tokens, 220);
         assert_eq!(cached.days.iter().map(|day| day.agent_runs).sum::<i64>(), 1);
 
@@ -3244,6 +3418,75 @@ mod tests {
         let forked_key = forked_path.to_string_lossy().to_string();
         assert!(store.entries.contains_key(&keep_key));
         assert!(!store.entries.contains_key(&forked_key));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn open_or_init_scan_cache_db_v4_reparses_only_forked_rows() {
+        let root = make_temp_dir("cache-migrate-v4");
+        let sessions_root = root.join("sessions");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions root");
+        let keep_path = sessions_root.join("keep.jsonl");
+        let forked_path = sessions_root.join("forked.jsonl");
+        let now_ms = Utc::now().timestamp_millis();
+        write_token_file(&keep_path, now_ms, 10, 5);
+        write_delayed_fork_replay_prefix(&forked_path, now_ms, 1_500);
+
+        let db_path = root.join("comon.db");
+        let conn = Connection::open(&db_path).expect("open v3 db");
+        conn.execute_batch(
+            "
+            CREATE TABLE cache_meta (
+                key TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            );
+            INSERT INTO cache_meta(key, value) VALUES('schema_version', 3);
+            CREATE TABLE file_cache (
+                file_path TEXT PRIMARY KEY,
+                file_size INTEGER NOT NULL,
+                file_mtime INTEGER,
+                file_offset INTEGER NOT NULL DEFAULT 0,
+                fully_parsed INTEGER NOT NULL DEFAULT 1,
+                session_cwd TEXT,
+                parser_state_json TEXT NOT NULL DEFAULT '{}',
+                daily_json TEXT NOT NULL,
+                model_daily_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            ",
+        )
+        .expect("create v3 schema");
+        for path in [&keep_path, &forked_path] {
+            conn.execute(
+                "
+                INSERT INTO file_cache(
+                    file_path, file_size, file_mtime, file_offset, fully_parsed,
+                    session_cwd, parser_state_json, daily_json, model_daily_json, updated_at
+                ) VALUES(?1, 1, 1, 1, 1, '/tmp', '{}', '{}', '{}', 1);
+                ",
+                rusqlite::params![path.to_string_lossy().to_string()],
+            )
+            .expect("insert cache row");
+        }
+        drop(conn);
+
+        let db = open_or_init_scan_cache_db(&db_path).expect("open and migrate");
+        let (store, _) = load_scan_cache_store(&db).expect("load migrated cache");
+        let keep_key = keep_path.to_string_lossy().to_string();
+        let forked_key = forked_path.to_string_lossy().to_string();
+        assert!(store.entries.contains_key(&keep_key));
+        assert!(!store.entries.contains_key(&forked_key));
+
+        let schema_version: i64 = db
+            .conn
+            .query_row(
+                "SELECT value FROM cache_meta WHERE key = 'schema_version';",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read schema version");
+        assert_eq!(schema_version, 4);
 
         let _ = std::fs::remove_dir_all(root);
     }

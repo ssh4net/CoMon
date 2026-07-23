@@ -3025,7 +3025,10 @@ fn card(
 }
 
 fn today_card_title(formatter: DisplayFormatter<'_>, now: NaiveDateTime) -> String {
-    format!("TODAY {}", formatter.format_session_datetime(now))
+    format!(
+        "TODAY_{}",
+        formatter.format_session_datetime(now).replace(' ', "_")
+    )
 }
 
 fn card4(
@@ -3787,7 +3790,12 @@ mod tests {
             .and_hms_opt(14, 35, 0)
             .unwrap();
 
-        assert_eq!(today_card_title(formatter, now), "TODAY 2026-07-22 14:35");
+        assert_eq!(today_card_title(formatter, now), "TODAY_2026-07-22_14:35");
+
+        for style in [DisplayStyle::SystemCompact, DisplayStyle::SystemFull] {
+            let formatter = DisplayFormatter::new(style, &system_locale);
+            assert_eq!(today_card_title(formatter, now), "TODAY_07/22/2026_14:35");
+        }
     }
 
     #[test]

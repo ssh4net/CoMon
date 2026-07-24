@@ -1,11 +1,17 @@
-use crate::app::{ActiveScreen, AppState, ChartOrientation, UiClickAction, UiHitTarget};
+use crate::app::{
+    ActiveScreen, ApiStatGraph, ApiStatGrouping, AppState, ChartOrientation, UiClickAction,
+    UiHitTarget,
+};
 use crate::locale::{DisplayFormatter, DisplayStyle};
 use crate::usage::{
     format_compact_kmb, format_count, format_duration_compact, format_tokens_compact,
-    format_tokens_overview, ChartRange, ProjectActivity, UsageMetric, ACTIVITY_TIMELINE_WEEKS,
+    format_tokens_overview, ChartRange, ProjectActivity, UsageDay, UsageMetric, UsageZone,
+    ACTIVITY_TIMELINE_WEEKS,
 };
 use anyhow::Result;
-use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, TimeZone, Weekday};
+use chrono::{
+    Datelike, Duration as ChronoDuration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc, Weekday,
+};
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
@@ -19,6 +25,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
     Frame, Terminal,
 };
+use std::collections::BTreeMap;
 use std::io::{self, Stdout};
 use std::time::Instant;
 use unicode_width::UnicodeWidthStr;
@@ -75,6 +82,9 @@ pub fn format_updated_label(updated_at: Instant) -> String {
 
 pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
     state.ui_hit_targets.clear();
+    state.usage_scroll_area = None;
+    state.activity_scroll_area = None;
+    state.api_stat_scroll_area = None;
     let area = frame.area();
     let (navigation, navigation_targets) = navigation_title(area, state.active_screen);
     state.ui_hit_targets.extend(navigation_targets);
@@ -86,7 +96,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .title(Span::styled(
-            format!(" comon :: {} ", env!("CARGO_PKG_VERSION")),
+            app_title(state.active_screen),
             Style::default().add_modifier(Modifier::BOLD),
         ))
         .title_top(navigation.right_aligned())
@@ -136,6 +146,25 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
                 render_help_overlay(frame, area, state.active_screen);
             }
         }
+        ActiveScreen::ApiStat => {
+            let footer_height = footer_height(inner.width, state);
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(0),
+                    Constraint::Length(footer_height),
+                ])
+                .split(inner);
+
+            render_api_stat_header(frame, chunks[0], state);
+            render_api_stats(frame, chunks[1], state);
+            render_footer(frame, chunks[2], state);
+
+            if state.show_help {
+                render_help_overlay(frame, area, state.active_screen);
+            }
+        }
         ActiveScreen::LimitResets => {
             let footer_height = footer_height(inner.width, state);
             let chunks = Layout::default()
@@ -169,6 +198,14 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
     }
 }
 
+fn app_title(active_screen: ActiveScreen) -> String {
+    if active_screen == ActiveScreen::ApiStat {
+        format!(" comon :: {} :: SOURCE OPENAI ", env!("CARGO_PKG_VERSION"))
+    } else {
+        format!(" comon :: {} ", env!("CARGO_PKG_VERSION"))
+    }
+}
+
 fn usage_screen_layout(area: Rect, footer_height: u16) -> [Rect; 3] {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -199,6 +236,10 @@ fn navigation_title(area: Rect, active_screen: ActiveScreen) -> (Line<'static>, 
             Some(UiClickAction::SetScreen(ActiveScreen::Activity)),
         ),
         (
+            " APISTAT ",
+            Some(UiClickAction::SetScreen(ActiveScreen::ApiStat)),
+        ),
+        (
             " LIMITS ",
             Some(UiClickAction::SetScreen(ActiveScreen::LimitResets)),
         ),
@@ -207,8 +248,7 @@ fn navigation_title(area: Rect, active_screen: ActiveScreen) -> (Line<'static>, 
             Some(UiClickAction::SetScreen(ActiveScreen::Read)),
         ),
     ];
-    let app_title_width =
-        UnicodeWidthStr::width(format!(" comon :: {} ", env!("CARGO_PKG_VERSION")).as_str());
+    let app_title_width = UnicodeWidthStr::width(app_title(active_screen).as_str());
     let navigation_width = segments
         .iter()
         .map(|(text, _)| UnicodeWidthStr::width(*text))
@@ -225,6 +265,7 @@ fn navigation_title(area: Rect, active_screen: ActiveScreen) -> (Line<'static>, 
         Span::raw(" "),
         pill("USAGE", active_screen == ActiveScreen::Usage),
         pill("ACTIVITY", active_screen == ActiveScreen::Activity),
+        pill("APISTAT", active_screen == ActiveScreen::ApiStat),
         pill("LIMITS", active_screen == ActiveScreen::LimitResets),
         pill("HISTORY", active_screen == ActiveScreen::Read),
     ]);
@@ -263,10 +304,10 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let line_area = usage_header_line_area(area);
     let row = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Length(18)])
+        .constraints([Constraint::Min(20), Constraint::Length(40)])
         .split(line_area);
 
-    let title = "USAGE_SNAPSHOT";
+    let title = "USAGE_SNAPSHOT :: LOCAL";
     let left = Paragraph::new(Line::from(Span::styled(
         title,
         Style::default().add_modifier(Modifier::BOLD),
@@ -274,10 +315,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     .alignment(Alignment::Left);
     frame.render_widget(left, row[0]);
 
-    let updated = state
-        .usage_updated_label()
-        .or_else(|| state.limits_updated_label())
-        .unwrap_or_else(|| "Updated --".to_string());
+    let updated = usage_scan_status_label(state).unwrap_or_else(|| "Updated --".to_string());
 
     let right = Paragraph::new(updated).alignment(Alignment::Right);
     frame.render_widget(right, row[1]);
@@ -295,7 +333,7 @@ fn usage_header_line_area(area: Rect) -> Rect {
 fn render_activity_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let row = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Length(18)])
+        .constraints([Constraint::Min(20), Constraint::Length(40)])
         .split(area);
 
     let left = Paragraph::new(Line::from(Span::styled(
@@ -305,11 +343,27 @@ fn render_activity_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     .alignment(Alignment::Left);
     frame.render_widget(left, row[0]);
 
-    let updated = state
-        .usage_updated_label()
-        .unwrap_or_else(|| "Updated --".to_string());
+    let updated = usage_scan_status_label(state).unwrap_or_else(|| "Updated --".to_string());
     let right = Paragraph::new(updated).alignment(Alignment::Right);
     frame.render_widget(right, row[1]);
+}
+
+fn usage_scan_status_label(state: &AppState) -> Option<String> {
+    let updated = state
+        .usage_updated_label()
+        .or_else(|| state.limits_updated_label())?;
+    let Some(snapshot) = state.usage.as_ref() else {
+        return Some(updated);
+    };
+    let status = if snapshot.scan_pending_files == 0 {
+        "COMPLETE"
+    } else {
+        "PARTIAL"
+    };
+    Some(format!(
+        "{updated} | {status} {}/{}",
+        snapshot.scan_indexed_files, snapshot.scan_total_files
+    ))
 }
 
 fn render_limit_resets_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -333,13 +387,1448 @@ fn render_limit_resets_header(frame: &mut Frame<'_>, area: Rect, state: &AppStat
     frame.render_widget(right, row[1]);
 }
 
+fn render_api_stat_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(20), Constraint::Length(18)])
+        .split(area);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "CODEX_ACCOUNT_STATS",
+            Style::default().add_modifier(Modifier::BOLD),
+        ))),
+        row[0],
+    );
+
+    let updated = state
+        .account_usage_updated_label()
+        .unwrap_or_else(|| "Updated --".to_string());
+    frame.render_widget(Paragraph::new(updated).alignment(Alignment::Right), row[1]);
+}
+
+fn render_api_stats(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
+    let unavailable_message = if !state.account_usage_enabled {
+        state
+            .account_usage_error
+            .as_deref()
+            .or(state.account_usage_notice.as_deref())
+    } else if state.account_usage.is_none() {
+        state.account_usage_error.as_deref()
+    } else {
+        None
+    };
+    if let Some(message) = unavailable_message {
+        render_api_stat_message(frame, area, message);
+        return;
+    }
+
+    let Some(account_usage) = state.account_usage.clone() else {
+        render_api_stat_message(frame, area, "Loading account statistics...");
+        return;
+    };
+
+    let summary_height = if area.width >= 110 { 5 } else { 10 };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(summary_height),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    render_api_stat_controls(frame, chunks[0], state);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("SOURCE  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "CODEX APP SERVER :: account/usage/read :: ACCOUNT-WIDE / UTC",
+                Style::default().fg(Color::Cyan),
+            ),
+        ])),
+        chunks[1],
+    );
+    render_api_stat_summary(frame, chunks[2], &account_usage, state.formatter());
+    render_api_stat_chart(frame, chunks[3], &account_usage, state);
+}
+
+fn render_api_stat_controls(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
+    let bars = pill("BARS", state.api_stat_graph == ApiStatGraph::Bars);
+    let heat = pill("HEAT", state.api_stat_graph == ApiStatGraph::Heat);
+    let day = pill("DAY", state.api_stat_grouping == ApiStatGrouping::Day);
+    let week = pill("WEEK", state.api_stat_grouping == ApiStatGrouping::Week);
+    let month = pill("MONTH", state.api_stat_grouping == ApiStatGrouping::Month);
+    let vert = pill(
+        "VERT",
+        state.api_stat_orientation == ChartOrientation::Vertical,
+    );
+    let horz = pill(
+        "HORZ",
+        state.api_stat_orientation == ChartOrientation::Horizontal,
+    );
+    let classic = pill("CLASS", state.display_style == DisplayStyle::Classic);
+    let system_compact = pill("SCOMP", state.display_style == DisplayStyle::SystemCompact);
+    let system_full = pill("SFULL", state.display_style == DisplayStyle::SystemFull);
+
+    let mut segments = vec![
+        (" VIEW ", None),
+        (
+            " BARS ",
+            Some(UiClickAction::SetApiStatGraph(ApiStatGraph::Bars)),
+        ),
+        (
+            " HEAT ",
+            Some(UiClickAction::SetApiStatGraph(ApiStatGraph::Heat)),
+        ),
+        (" GRAPH ", None),
+        (
+            " DAY ",
+            Some(UiClickAction::SetApiStatGrouping(ApiStatGrouping::Day)),
+        ),
+        (
+            " WEEK ",
+            Some(UiClickAction::SetApiStatGrouping(ApiStatGrouping::Week)),
+        ),
+        (
+            " MONTH ",
+            Some(UiClickAction::SetApiStatGrouping(ApiStatGrouping::Month)),
+        ),
+    ];
+    let mut spans = vec![control_group_label("VIEW"), bars, heat];
+    spans.push(control_group_label("GRAPH"));
+    spans.extend([day, week, month]);
+    if state.api_stat_graph == ApiStatGraph::Bars {
+        segments.extend([
+            (" BARS ", None),
+            (
+                " VERT ",
+                Some(UiClickAction::SetApiStatOrientation(
+                    ChartOrientation::Vertical,
+                )),
+            ),
+            (
+                " HORZ ",
+                Some(UiClickAction::SetApiStatOrientation(
+                    ChartOrientation::Horizontal,
+                )),
+            ),
+        ]);
+        spans.push(control_group_label("BARS"));
+        spans.extend([vert, horz]);
+    }
+    segments.extend([
+        (" ZONE ", None),
+        (" UTC ", None),
+        (" STYLE ", None),
+        (
+            " CLASS ",
+            Some(UiClickAction::SetDisplayStyle(DisplayStyle::Classic)),
+        ),
+        (
+            " SCOMP ",
+            Some(UiClickAction::SetDisplayStyle(DisplayStyle::SystemCompact)),
+        ),
+        (
+            " SFULL ",
+            Some(UiClickAction::SetDisplayStyle(DisplayStyle::SystemFull)),
+        ),
+    ]);
+    spans.push(control_group_label("ZONE"));
+    spans.push(pill("UTC", true));
+    spans.push(control_group_label("STYLE"));
+    spans.extend([classic, system_compact, system_full]);
+
+    register_right_aligned_targets(state, area, &segments);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).alignment(Alignment::Right),
+        area,
+    );
+}
+
+fn render_api_stat_message(frame: &mut Frame<'_>, area: Rect, message: &str) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .padding(Padding {
+            left: 2,
+            right: 1,
+            top: 1,
+            bottom: 0,
+        })
+        .title(Span::styled(
+            " CODEX_ACCOUNT ",
+            Style::default().fg(Color::Gray),
+        ));
+    let text = Text::from(vec![
+        Line::from(message.to_string()),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Requires ChatGPT-backed Codex authentication; API-key-only auth is not supported.",
+            Style::default().fg(Color::Gray),
+        )),
+    ]);
+    frame.render_widget(
+        Paragraph::new(text).block(block).wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_api_stat_summary(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    usage: &crate::codex_rpc::AccountUsage,
+    formatter: DisplayFormatter<'_>,
+) {
+    let summary = &usage.summary;
+    let cards = [
+        (
+            "LIFETIME",
+            format_optional_account_tokens(summary.lifetime_tokens, formatter),
+            "tokens",
+        ),
+        (
+            "PEAK_DAY",
+            format_optional_account_tokens(summary.peak_daily_tokens, formatter),
+            "tokens",
+        ),
+        (
+            "STREAK",
+            format_optional_days(summary.current_streak_days, formatter),
+            "current",
+        ),
+        (
+            "BEST_STREAK",
+            format_optional_days(summary.longest_streak_days, formatter),
+            "longest",
+        ),
+        (
+            "LONGEST_TURN",
+            summary
+                .longest_running_turn_sec
+                .map(format_account_duration)
+                .unwrap_or_else(|| "--".to_string()),
+            "elapsed",
+        ),
+    ];
+
+    if area.width >= 110 {
+        render_api_stat_card_row(frame, area, &cards);
+    } else {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+            .split(area);
+        render_api_stat_card_row(frame, rows[0], &cards[..3]);
+        render_api_stat_card_row(frame, rows[1], &cards[3..]);
+    }
+}
+
+fn render_api_stat_card_row(frame: &mut Frame<'_>, area: Rect, cards: &[(&str, String, &str)]) {
+    if cards.is_empty() {
+        return;
+    }
+    let constraints = vec![Constraint::Ratio(1, cards.len() as u32); cards.len()];
+    let areas = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(constraints)
+        .split(area);
+
+    for (index, (title, value, caption)) in cards.iter().enumerate() {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .padding(Padding {
+                left: 1,
+                right: 1,
+                top: 0,
+                bottom: 0,
+            })
+            .title(Span::styled(
+                format!(" {title} "),
+                Style::default().fg(Color::Gray),
+            ));
+        let text = Text::from(vec![
+            Line::from(Span::styled(
+                value.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                (*caption).to_string(),
+                Style::default().fg(Color::Gray),
+            )),
+        ]);
+        frame.render_widget(Paragraph::new(text).block(block), areas[index]);
+    }
+}
+
+fn format_optional_account_tokens(value: Option<u64>, formatter: DisplayFormatter<'_>) -> String {
+    let Some(value) = value else {
+        return "--".to_string();
+    };
+    match formatter.style() {
+        DisplayStyle::SystemCompact => format_compact_kmb(value, 16, formatter),
+        DisplayStyle::Classic | DisplayStyle::SystemFull => formatter.format_u64(value),
+    }
+}
+
+fn format_optional_days(value: Option<u64>, formatter: DisplayFormatter<'_>) -> String {
+    value
+        .map(|value| format!("{} days", formatter.format_u64(value)))
+        .unwrap_or_else(|| "--".to_string())
+}
+
+fn format_account_duration(mut seconds: u64) -> String {
+    let days = seconds / 86_400;
+    seconds %= 86_400;
+    let hours = seconds / 3_600;
+    seconds %= 3_600;
+    let minutes = seconds / 60;
+    seconds %= 60;
+
+    if days > 0 {
+        format!("{days}d {hours}h {minutes}m")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ApiStatPoint {
+    start: NaiveDate,
+    end: NaiveDate,
+    tokens: u64,
+    active_days: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChartScrollbarOwner {
+    Usage,
+    ApiStat,
+    Activity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChartScrollbarAxis {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChartScrollbarViewport {
+    total: usize,
+    visible: usize,
+    offset_from_newest: usize,
+}
+
+fn reserve_chart_scrollbar(
+    area: Rect,
+    axis: ChartScrollbarAxis,
+    show: bool,
+) -> (Rect, Option<Rect>) {
+    if !show {
+        return (area, None);
+    }
+    match axis {
+        ChartScrollbarAxis::Vertical if area.width > 2 && area.height >= 3 => (
+            Rect::new(area.x, area.y, area.width - 2, area.height),
+            Some(Rect::new(
+                area.x.saturating_add(area.width - 1),
+                area.y,
+                1,
+                area.height,
+            )),
+        ),
+        ChartScrollbarAxis::Horizontal if area.height > 2 && area.width >= 3 => (
+            Rect::new(area.x, area.y, area.width, area.height - 2),
+            Some(Rect::new(
+                area.x,
+                area.y.saturating_add(area.height - 1),
+                area.width,
+                1,
+            )),
+        ),
+        _ => (area, None),
+    }
+}
+
+fn render_chart_scrollbar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    axis: ChartScrollbarAxis,
+    viewport: ChartScrollbarViewport,
+    owner: ChartScrollbarOwner,
+    state: &mut AppState,
+) {
+    let ChartScrollbarViewport {
+        total,
+        visible,
+        offset_from_newest,
+    } = viewport;
+    if total <= visible || visible == 0 {
+        return;
+    }
+    let length = match axis {
+        ChartScrollbarAxis::Horizontal => area.width,
+        ChartScrollbarAxis::Vertical => area.height,
+    };
+    if length < 3 {
+        return;
+    }
+
+    let max_offset = total.saturating_sub(visible);
+    let track_length = usize::from(length.saturating_sub(2));
+    let thumb_length = track_length
+        .saturating_mul(visible)
+        .saturating_add(total.saturating_sub(1))
+        .checked_div(total.max(1))
+        .unwrap_or(1)
+        .clamp(1, track_length);
+    let thumb_travel = track_length.saturating_sub(thumb_length);
+    let window_start = max_offset.saturating_sub(offset_from_newest.min(max_offset));
+    let thumb_start = window_start
+        .saturating_mul(thumb_travel)
+        .checked_div(max_offset)
+        .unwrap_or(0);
+
+    let (older_char, newer_char) = match axis {
+        ChartScrollbarAxis::Horizontal => ('<', '>'),
+        ChartScrollbarAxis::Vertical => ('^', 'v'),
+    };
+    let point_at = |position: u16| match axis {
+        ChartScrollbarAxis::Horizontal => (area.x.saturating_add(position), area.y),
+        ChartScrollbarAxis::Vertical => (area.x, area.y.saturating_add(position)),
+    };
+    let rect_at = |position: u16| {
+        let (x, y) = point_at(position);
+        Rect::new(x, y, 1, 1)
+    };
+    let (older_action, newer_action) = match owner {
+        ChartScrollbarOwner::Usage => (
+            UiClickAction::ScrollUsageOlder,
+            UiClickAction::ScrollUsageNewer,
+        ),
+        ChartScrollbarOwner::ApiStat => (
+            UiClickAction::ScrollApiStatOlder,
+            UiClickAction::ScrollApiStatNewer,
+        ),
+        ChartScrollbarOwner::Activity => (
+            UiClickAction::ScrollActivityOlder,
+            UiClickAction::ScrollActivityNewer,
+        ),
+    };
+    state.ui_hit_targets.push(UiHitTarget {
+        area: rect_at(0),
+        action: older_action,
+    });
+    state.ui_hit_targets.push(UiHitTarget {
+        area: rect_at(length - 1),
+        action: newer_action,
+    });
+
+    let buf = frame.buffer_mut();
+    for (position, ch, style) in [
+        (
+            0,
+            older_char,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        (
+            length - 1,
+            newer_char,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ] {
+        let (x, y) = point_at(position);
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.set_char(ch).set_style(style);
+        }
+    }
+
+    for index in 0..track_length {
+        let position = index as u16 + 1;
+        let in_thumb = index >= thumb_start && index < thumb_start.saturating_add(thumb_length);
+        let (x, y) = point_at(position);
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            let (ch, style) = chart_scrollbar_cell(in_thumb);
+            cell.set_char(ch).set_style(style);
+        }
+        let logical_start = if track_length <= 1 {
+            0
+        } else {
+            index.saturating_mul(max_offset) / track_length.saturating_sub(1)
+        };
+        let offset = max_offset.saturating_sub(logical_start);
+        let action = match owner {
+            ChartScrollbarOwner::Usage => UiClickAction::SetUsageScrollOffset(offset),
+            ChartScrollbarOwner::ApiStat => UiClickAction::SetApiStatScrollOffset(offset),
+            ChartScrollbarOwner::Activity => UiClickAction::SetActivityScrollOffset(offset),
+        };
+        state.ui_hit_targets.push(UiHitTarget {
+            area: rect_at(position),
+            action,
+        });
+    }
+}
+
+fn chart_scrollbar_cell(in_thumb: bool) -> (char, Style) {
+    if !in_thumb {
+        return ('.', Style::default().fg(Color::DarkGray));
+    }
+    (' ', Style::default().bg(Color::White))
+}
+
+fn viewport_bounds(
+    total: usize,
+    visible_capacity: usize,
+    offset_from_newest: usize,
+) -> (usize, usize) {
+    let visible = total.min(visible_capacity.max(1));
+    let max_offset = total.saturating_sub(visible);
+    let offset = offset_from_newest.min(max_offset);
+    let start = max_offset.saturating_sub(offset);
+    (start, start.saturating_add(visible).min(total))
+}
+
+fn viewport_label(
+    total: usize,
+    start: usize,
+    end: usize,
+    formatter: DisplayFormatter<'_>,
+) -> String {
+    if total == 0 || (start == 0 && end == total) {
+        return formatter.format_usize(total);
+    }
+    let older = if start > 0 { "<" } else { " " };
+    let newer = if end < total { ">" } else { " " };
+    format!(
+        "{older} {}-{} / {} {newer}",
+        formatter.format_usize(start.saturating_add(1)),
+        formatter.format_usize(end),
+        formatter.format_usize(total)
+    )
+}
+
+fn horizontal_bar_height(total: usize, height: u16) -> u16 {
+    if total == 0 {
+        return 1;
+    }
+    if total <= usize::from(height / 3) {
+        3
+    } else if total <= usize::from(height / 2) {
+        2
+    } else {
+        1
+    }
+}
+
+fn usage_horizontal_bar_height(total: usize, height: u16) -> u16 {
+    if total == 0 {
+        return 1;
+    }
+    let max_per_bar = height / (total as u16).max(1);
+    if max_per_bar >= 5 {
+        5
+    } else if max_per_bar >= 4 {
+        4
+    } else if max_per_bar >= 3 {
+        3
+    } else {
+        1
+    }
+}
+
+fn update_api_stat_viewport(
+    state: &mut AppState,
+    area: Rect,
+    total: usize,
+    visible_capacity: usize,
+) -> (usize, usize) {
+    let (start, end) = viewport_bounds(total, visible_capacity, state.api_stat_period_offset);
+    state.api_stat_period_offset = total.saturating_sub(end);
+    state.api_stat_total_periods = total;
+    state.api_stat_visible_periods = end.saturating_sub(start);
+    state.api_stat_scroll_area = Some(area);
+    (start, end)
+}
+
+fn update_usage_viewport(
+    state: &mut AppState,
+    area: Rect,
+    total: usize,
+    visible_capacity: usize,
+) -> (usize, usize) {
+    let (start, end) = viewport_bounds(total, visible_capacity, state.usage_period_offset);
+    state.usage_period_offset = total.saturating_sub(end);
+    state.usage_total_periods = total;
+    state.usage_visible_periods = end.saturating_sub(start);
+    state.usage_scroll_area = Some(area);
+    (start, end)
+}
+
+fn render_api_stat_chart(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    usage: &crate::codex_rpc::AccountUsage,
+    state: &mut AppState,
+) {
+    match state.api_stat_graph {
+        ApiStatGraph::Heat => render_api_stat_heatmap(frame, area, usage, state),
+        ApiStatGraph::Bars
+            if state.api_stat_grouping == ApiStatGrouping::Day
+                && state.api_stat_orientation == ChartOrientation::Vertical =>
+        {
+            render_api_daily_chart(frame, area, usage, state)
+        }
+        ApiStatGraph::Bars => {
+            let points = aggregate_api_stat_points(
+                usage.daily_usage_buckets.as_deref().unwrap_or(&[]),
+                state.api_stat_grouping,
+                crate::usage::system_first_weekday(),
+            );
+            render_api_grouped_bars(frame, area, &points, state);
+        }
+    }
+}
+
+fn aggregate_api_stat_points(
+    buckets: &[crate::codex_rpc::DailyUsageBucket],
+    grouping: ApiStatGrouping,
+    first_weekday: Weekday,
+) -> Vec<ApiStatPoint> {
+    let mut grouped = BTreeMap::<NaiveDate, (u64, usize)>::new();
+    for bucket in buckets {
+        let Ok(date) = NaiveDate::parse_from_str(&bucket.start_date, "%Y-%m-%d") else {
+            continue;
+        };
+        let start = api_stat_period_start(date, grouping, first_weekday);
+        let entry = grouped.entry(start).or_default();
+        entry.0 = entry.0.saturating_add(bucket.tokens);
+        entry.1 = entry.1.saturating_add(1);
+    }
+    grouped
+        .into_iter()
+        .map(|(start, (tokens, active_days))| ApiStatPoint {
+            start,
+            end: api_stat_period_end(start, grouping),
+            tokens,
+            active_days,
+        })
+        .collect()
+}
+
+fn api_stat_period_start(
+    date: NaiveDate,
+    grouping: ApiStatGrouping,
+    _first_weekday: Weekday,
+) -> NaiveDate {
+    match grouping {
+        ApiStatGrouping::Day => date,
+        ApiStatGrouping::Week => {
+            date - ChronoDuration::days(date.weekday().num_days_from_monday() as i64)
+        }
+        ApiStatGrouping::Month => {
+            NaiveDate::from_ymd_opt(date.year(), date.month(), 1).unwrap_or(date)
+        }
+    }
+}
+
+fn api_stat_period_end(start: NaiveDate, grouping: ApiStatGrouping) -> NaiveDate {
+    match grouping {
+        ApiStatGrouping::Day => start,
+        ApiStatGrouping::Week => start + ChronoDuration::days(6),
+        ApiStatGrouping::Month => {
+            let (year, month) = if start.month() == 12 {
+                (start.year().saturating_add(1), 1)
+            } else {
+                (start.year(), start.month() + 1)
+            };
+            NaiveDate::from_ymd_opt(year, month, 1)
+                .map(|next| next - ChronoDuration::days(1))
+                .unwrap_or(start)
+        }
+    }
+}
+
+fn api_stat_grouping_label(grouping: ApiStatGrouping) -> &'static str {
+    match grouping {
+        ApiStatGrouping::Day => "DAY",
+        ApiStatGrouping::Week => "WEEK",
+        ApiStatGrouping::Month => "MONTH",
+    }
+}
+
+fn format_api_stat_point_label(
+    point: &ApiStatPoint,
+    grouping: ApiStatGrouping,
+    formatter: DisplayFormatter<'_>,
+) -> String {
+    match grouping {
+        ApiStatGrouping::Day => formatter.format_short_date(point.start),
+        ApiStatGrouping::Week => {
+            let range = if point.start.month() == point.end.month() {
+                format!(
+                    "{} {}-{}",
+                    formatter.abbreviated_month(point.start.month()),
+                    point.start.day(),
+                    point.end.day()
+                )
+            } else {
+                format!(
+                    "{} {}-{} {}",
+                    formatter.abbreviated_month(point.start.month()),
+                    point.start.day(),
+                    formatter.abbreviated_month(point.end.month()),
+                    point.end.day()
+                )
+            };
+            format!("W{:02} ({range})", point.start.iso_week().week())
+        }
+        ApiStatGrouping::Month => format!(
+            "{} {}",
+            formatter.abbreviated_month(point.start.month()),
+            point.start.year()
+        ),
+    }
+}
+
+fn format_api_stat_point_tooltip(
+    point: &ApiStatPoint,
+    grouping: ApiStatGrouping,
+    formatter: DisplayFormatter<'_>,
+) -> String {
+    let period = if grouping == ApiStatGrouping::Day {
+        formatter.format_full_date(point.start)
+    } else {
+        format!(
+            "{} - {}",
+            formatter.format_full_date(point.start),
+            formatter.format_full_date(point.end)
+        )
+    };
+    format!(
+        "{period} | {} tokens | {} active days",
+        formatter.format_u64(point.tokens),
+        formatter.format_usize(point.active_days)
+    )
+}
+
+fn render_api_grouped_bars(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    points: &[ApiStatPoint],
+    state: &mut AppState,
+) {
+    let grouping = state.api_stat_grouping;
+    let inner = inset_with_border_and_padding(
+        area,
+        Padding {
+            left: 1,
+            right: 1,
+            top: 1,
+            bottom: 0,
+        },
+    );
+    let visible_capacity = match state.api_stat_orientation {
+        ChartOrientation::Vertical => vertical_bar_capacity(inner.width),
+        ChartOrientation::Horizontal => {
+            let bar_height = horizontal_bar_height(points.len(), inner.height);
+            usize::from((inner.height / bar_height).max(1))
+        }
+    };
+    let scrollbar_axis = match state.api_stat_orientation {
+        ChartOrientation::Vertical => ChartScrollbarAxis::Horizontal,
+        ChartOrientation::Horizontal => ChartScrollbarAxis::Vertical,
+    };
+    let (chart_inner, scrollbar_area) =
+        reserve_chart_scrollbar(inner, scrollbar_axis, points.len() > visible_capacity);
+    let (start, end) = update_api_stat_viewport(state, area, points.len(), visible_capacity);
+    let visible = &points[start..end];
+    let formatter = state.formatter();
+    let title = format!(" TOKEN_ACTIVITY_BY_{} ", api_stat_grouping_label(grouping));
+    let count = format!(
+        " {} PERIODS ",
+        viewport_label(points.len(), start, end, formatter)
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .padding(Padding {
+            left: 1,
+            right: 1,
+            top: 1,
+            bottom: 0,
+        })
+        .title(Span::styled(title, Style::default().fg(Color::Gray)))
+        .title_top(
+            Line::from(Span::styled(count, Style::default().fg(Color::Gray))).right_aligned(),
+        );
+    frame.render_widget(block, area);
+    if points.is_empty() {
+        frame.render_widget(
+            Paragraph::new("The account service returned no daily usage buckets.")
+                .style(Style::default().fg(Color::Gray)),
+            inner,
+        );
+        return;
+    }
+
+    match state.api_stat_orientation {
+        ChartOrientation::Vertical => {
+            render_api_grouped_vertical_bars(frame, chart_inner, visible, grouping, state)
+        }
+        ChartOrientation::Horizontal => {
+            render_api_grouped_horizontal_bars(frame, chart_inner, visible, grouping, state)
+        }
+    }
+    if let Some(scrollbar_area) = scrollbar_area {
+        render_chart_scrollbar(
+            frame,
+            scrollbar_area,
+            scrollbar_axis,
+            ChartScrollbarViewport {
+                total: points.len(),
+                visible: end.saturating_sub(start),
+                offset_from_newest: state.api_stat_period_offset,
+            },
+            ChartScrollbarOwner::ApiStat,
+            state,
+        );
+    }
+}
+
+fn render_api_grouped_vertical_bars(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    points: &[ApiStatPoint],
+    grouping: ApiStatGrouping,
+    state: &mut AppState,
+) {
+    if area.width < 3 || area.height < 3 {
+        return;
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(2), Constraint::Length(1)])
+        .split(area);
+    let bars_area = chunks[0];
+    let labels_area = chunks[1];
+    let values = points.iter().map(|point| point.tokens).collect::<Vec<_>>();
+    let (bar_width, bar_gap) = compute_bar_layout(bars_area, points.len() as u16);
+    let bar_width = bar_width.max(1);
+    let max_value = values.iter().copied().max().unwrap_or(0).max(1);
+    let hovered = hovered_vertical_bar_index(
+        state.mouse_position,
+        bars_area,
+        bar_width,
+        bar_gap,
+        &values,
+        max_value,
+    );
+    let tooltip = hovered.and_then(|index| {
+        state.mouse_position.map(|mouse| {
+            (
+                mouse,
+                format_api_stat_point_tooltip(&points[index], grouping, state.formatter()),
+            )
+        })
+    });
+    let right = bars_area.x.saturating_add(bars_area.width);
+    let buf = frame.buffer_mut();
+    let mut last_label_end = labels_area.x;
+    for (index, point) in points.iter().enumerate() {
+        let x = bars_area
+            .x
+            .saturating_add((index as u16).saturating_mul(bar_width.saturating_add(bar_gap)));
+        if x >= right {
+            break;
+        }
+        let width = bar_width.min(right.saturating_sub(x));
+        let color = if index % 2 == 0 {
+            DARK_BAR_COLOR
+        } else {
+            LIGHT_BAR_COLOR
+        };
+        let filled = ((bars_area.height as f64)
+            * (point.tokens as f64 / max_value as f64).clamp(0.0, 1.0))
+        .round() as u16;
+        let bottom = bars_area
+            .y
+            .saturating_add(bars_area.height)
+            .saturating_sub(1);
+        let top = bottom.saturating_sub(filled.saturating_sub(1));
+        for y in bars_area.y..bars_area.y.saturating_add(bars_area.height) {
+            for cell_x in x..x.saturating_add(width) {
+                if let Some(cell) = buf.cell_mut((cell_x, y)) {
+                    cell.set_char(' ');
+                    if filled > 0 && y >= top {
+                        cell.set_style(Style::default().bg(color));
+                    }
+                }
+            }
+        }
+        if width >= 4 && filled >= 2 {
+            let value = format_compact_kmb(point.tokens, width, state.formatter());
+            let value = truncate_middle(&value, width as usize);
+            let value_x = x.saturating_add(width.saturating_sub(value.len() as u16) / 2);
+            let value_y = bottom.saturating_sub(1);
+            for (offset, ch) in value.chars().enumerate() {
+                if let Some(cell) = buf.cell_mut((value_x + offset as u16, value_y)) {
+                    cell.set_char(ch).set_style(
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(color)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                }
+            }
+        }
+
+        let label = format_api_stat_point_label(point, grouping, state.formatter());
+        if x >= last_label_end {
+            let label = truncate_middle(&label, right.saturating_sub(x) as usize);
+            for (offset, ch) in label.chars().enumerate() {
+                if let Some(cell) = buf.cell_mut((x + offset as u16, labels_area.y)) {
+                    cell.set_char(ch)
+                        .set_style(Style::default().fg(Color::Gray));
+                }
+            }
+            last_label_end = x.saturating_add(label.len() as u16).saturating_add(1);
+        }
+    }
+    if let Some((mouse, text)) = tooltip {
+        render_chart_tooltip(frame, area, mouse, &text);
+    }
+}
+
+fn render_api_grouped_horizontal_bars(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    points: &[ApiStatPoint],
+    grouping: ApiStatGrouping,
+    state: &mut AppState,
+) {
+    if area.width < 18 || area.height == 0 {
+        return;
+    }
+    let row_height = horizontal_bar_height(points.len(), area.height);
+    let max_value = points
+        .iter()
+        .map(|point| point.tokens)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let desired_label_width = points
+        .iter()
+        .map(|point| {
+            UnicodeWidthStr::width(
+                format_api_stat_point_label(point, grouping, state.formatter()).as_str(),
+            ) as u16
+        })
+        .max()
+        .unwrap_or(5)
+        .saturating_add(1);
+    let label_width = desired_label_width
+        .min(area.width.saturating_sub(14).max(6))
+        .max(6);
+    let value_width = 17_u16.min(area.width / 3).max(6);
+    let bar_width = area
+        .width
+        .saturating_sub(label_width)
+        .saturating_sub(value_width)
+        .saturating_sub(1)
+        .max(1);
+    let mut hovered = None;
+    let buf = frame.buffer_mut();
+    for (index, point) in points.iter().enumerate() {
+        let row_y = area
+            .y
+            .saturating_add((index as u16).saturating_mul(row_height));
+        if row_y >= area.y.saturating_add(area.height) {
+            break;
+        }
+        let mid_y = row_y.saturating_add(row_height / 2);
+        let label = truncate_middle(
+            &format_api_stat_point_label(point, grouping, state.formatter()),
+            label_width.saturating_sub(1) as usize,
+        );
+        write_text(
+            buf,
+            area.x,
+            mid_y,
+            label_width.saturating_sub(1),
+            &label,
+            Style::default().fg(Color::Gray),
+        );
+        let bar_x = area.x.saturating_add(label_width);
+        let filled = ((bar_width as f64) * (point.tokens as f64 / max_value as f64).clamp(0.0, 1.0))
+            .round() as u16;
+        let color = if index % 2 == 0 {
+            DARK_BAR_COLOR
+        } else {
+            LIGHT_BAR_COLOR
+        };
+        for y in row_y..row_y.saturating_add(row_height).min(area.y + area.height) {
+            for offset in 0..bar_width {
+                if let Some(cell) = buf.cell_mut((bar_x + offset, y)) {
+                    cell.set_char(' ');
+                    if offset < filled {
+                        cell.set_style(Style::default().bg(color));
+                    }
+                }
+            }
+        }
+        let value = format_optional_account_tokens(Some(point.tokens), state.formatter());
+        let value = truncate_middle(&value, value_width.saturating_sub(1) as usize);
+        let value_x = area
+            .x
+            .saturating_add(area.width)
+            .saturating_sub(value.len() as u16);
+        write_text(
+            buf,
+            value_x,
+            mid_y,
+            value.len() as u16,
+            &value,
+            Style::default().fg(Color::Gray),
+        );
+
+        if let Some((mouse_x, mouse_y)) = state.mouse_position {
+            if mouse_y >= row_y
+                && mouse_y < row_y.saturating_add(row_height)
+                && mouse_x >= bar_x
+                && mouse_x < bar_x.saturating_add(filled)
+            {
+                hovered = Some((
+                    (mouse_x, mouse_y),
+                    format_api_stat_point_tooltip(point, grouping, state.formatter()),
+                ));
+            }
+        }
+    }
+    if let Some((mouse, text)) = hovered {
+        render_chart_tooltip(frame, area, mouse, &text);
+    }
+}
+
+fn render_api_stat_heatmap(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    usage: &crate::codex_rpc::AccountUsage,
+    state: &mut AppState,
+) {
+    let mut values = BTreeMap::<NaiveDate, u64>::new();
+    for bucket in usage.daily_usage_buckets.as_deref().unwrap_or(&[]) {
+        if let Ok(date) = NaiveDate::parse_from_str(&bucket.start_date, "%Y-%m-%d") {
+            values
+                .entry(date)
+                .and_modify(|tokens| *tokens = tokens.saturating_add(bucket.tokens))
+                .or_insert(bucket.tokens);
+        }
+    }
+    let inner = inset_with_border_and_padding(
+        area,
+        Padding {
+            left: 1,
+            right: 1,
+            top: 1,
+            bottom: 0,
+        },
+    );
+    let first_weekday = Weekday::Mon;
+    let first_date = *values.keys().next().unwrap_or(&Utc::now().date_naive());
+    let last_date = *values.keys().next_back().unwrap_or(&first_date);
+    let calendar_start = api_stat_period_start(first_date, ApiStatGrouping::Week, first_weekday);
+    let calendar_end = api_stat_period_end(
+        api_stat_period_start(last_date, ApiStatGrouping::Week, first_weekday),
+        ApiStatGrouping::Week,
+    );
+    let weeks_total = if values.is_empty() {
+        0
+    } else {
+        ((calendar_end - calendar_start).num_days() / 7 + 1).max(1) as usize
+    };
+    let grid_width = inner.width.saturating_sub(ACTIVITY_WEEKDAY_LABEL_WIDTH);
+    let cell_width = activity_day_cell_width(grid_width, weeks_total);
+    let weeks_capacity = usize::from(grid_width / cell_width.max(1)).max(1);
+    let (chart_inner, scrollbar_area) = reserve_chart_scrollbar(
+        inner,
+        ChartScrollbarAxis::Horizontal,
+        weeks_total > weeks_capacity,
+    );
+    let (week_start, week_end) = update_api_stat_viewport(state, area, weeks_total, weeks_capacity);
+    let formatter = state.formatter();
+    let title = " DAILY_TOKEN_HEATMAP ";
+    let count = if weeks_total == 0 {
+        " 0 ACTIVE DAYS ".to_string()
+    } else {
+        format!(
+            " {} ACTIVE DAYS | {} WEEKS ",
+            formatter.format_usize(values.len()),
+            viewport_label(weeks_total, week_start, week_end, formatter)
+        )
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .padding(Padding {
+            left: 1,
+            right: 1,
+            top: 1,
+            bottom: 0,
+        })
+        .title(Span::styled(title, Style::default().fg(Color::Gray)))
+        .title_top(
+            Line::from(Span::styled(count, Style::default().fg(Color::Gray))).right_aligned(),
+        );
+    frame.render_widget(block, area);
+    let inner = chart_inner;
+    if values.is_empty() {
+        frame.render_widget(
+            Paragraph::new("The account service returned no daily usage buckets.")
+                .style(Style::default().fg(Color::Gray)),
+            inner,
+        );
+        return;
+    }
+    if inner.width <= ACTIVITY_WEEKDAY_LABEL_WIDTH || inner.height < 8 {
+        render_activity_message(frame, inner, "Heatmap needs more space.");
+        return;
+    }
+
+    let weeks_visible = week_end.saturating_sub(week_start);
+    if weeks_visible == 0 {
+        return;
+    }
+    let visible_start = calendar_start + ChronoDuration::weeks(week_start as i64);
+    let grid_x = inner.x.saturating_add(ACTIVITY_WEEKDAY_LABEL_WIDTH);
+    let max_value = values.values().copied().max().unwrap_or(0);
+    let buf = frame.buffer_mut();
+
+    let mut next_free_x = grid_x;
+    for week in 0..weeks_visible {
+        let week_start = visible_start + ChronoDuration::weeks(week as i64);
+        let label_date = if week == 0 {
+            Some(week_start)
+        } else {
+            (0..7)
+                .map(|day| week_start + ChronoDuration::days(day))
+                .find(|date| date.day() == 1)
+        };
+        let label = label_date.map(|date| formatter.abbreviated_month(date.month()));
+        if let Some(label) = label {
+            let x = grid_x.saturating_add((week as u16).saturating_mul(cell_width));
+            if x >= next_free_x {
+                write_text(
+                    buf,
+                    x,
+                    inner.y,
+                    UnicodeWidthStr::width(label.as_str()) as u16,
+                    &label,
+                    Style::default().fg(Color::Gray),
+                );
+                next_free_x = x
+                    .saturating_add(UnicodeWidthStr::width(label.as_str()) as u16)
+                    .saturating_add(1);
+            }
+        }
+    }
+
+    for row in 0..7usize {
+        let y = inner.y.saturating_add(1 + row as u16);
+        write_text(
+            buf,
+            inner.x,
+            y,
+            ACTIVITY_WEEKDAY_LABEL_WIDTH,
+            &activity_weekday_label(first_weekday, row, formatter),
+            Style::default().fg(Color::Gray),
+        );
+        for week in 0..weeks_visible {
+            let date = visible_start
+                + ChronoDuration::weeks(week as i64)
+                + ChronoDuration::days(row as i64);
+            let tokens = values.get(&date).copied().unwrap_or(0);
+            let level = api_stat_color_level(tokens, max_value);
+            let x = grid_x.saturating_add((week as u16).saturating_mul(cell_width));
+            write_activity_cell(buf, x, y, cell_width, level);
+        }
+    }
+
+    let tooltip = state.mouse_position.and_then(|mouse| {
+        if mouse.0 < grid_x
+            || mouse.0 >= grid_x.saturating_add((weeks_visible as u16) * cell_width)
+            || mouse.1 < inner.y.saturating_add(1)
+            || mouse.1 >= inner.y.saturating_add(8)
+        {
+            return None;
+        }
+        let week = usize::from((mouse.0 - grid_x) / cell_width);
+        let row = i64::from(mouse.1 - inner.y - 1);
+        let date = visible_start + ChronoDuration::weeks(week as i64) + ChronoDuration::days(row);
+        let tokens = values.get(&date).copied().unwrap_or(0);
+        Some((
+            mouse,
+            format!(
+                "{} | {} tokens",
+                formatter.format_full_date(date),
+                formatter.format_u64(tokens)
+            ),
+        ))
+    });
+    if let Some((mouse, text)) = tooltip {
+        render_chart_tooltip(frame, inner, mouse, &text);
+    }
+    if let Some(scrollbar_area) = scrollbar_area {
+        render_chart_scrollbar(
+            frame,
+            scrollbar_area,
+            ChartScrollbarAxis::Horizontal,
+            ChartScrollbarViewport {
+                total: weeks_total,
+                visible: week_end.saturating_sub(week_start),
+                offset_from_newest: state.api_stat_period_offset,
+            },
+            ChartScrollbarOwner::ApiStat,
+            state,
+        );
+    }
+}
+
+fn api_stat_color_level(value: u64, max_value: u64) -> usize {
+    if value == 0 || max_value == 0 {
+        return 0;
+    }
+    let level = ((value as f64 / max_value as f64) * ACTIVITY_COLORS.len() as f64).ceil() as usize;
+    level.clamp(1, ACTIVITY_COLORS.len())
+}
+
+fn render_api_daily_chart(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    usage: &crate::codex_rpc::AccountUsage,
+    state: &mut AppState,
+) {
+    let buckets = usage.daily_usage_buckets.as_deref().unwrap_or(&[]);
+    let inner = inset_with_border_and_padding(
+        area,
+        Padding {
+            left: 1,
+            right: 1,
+            top: 1,
+            bottom: 0,
+        },
+    );
+    let visible_capacity = vertical_bar_capacity(inner.width);
+    let (chart_inner, scrollbar_area) = reserve_chart_scrollbar(
+        inner,
+        ChartScrollbarAxis::Horizontal,
+        buckets.len() > visible_capacity,
+    );
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(2), Constraint::Length(1)])
+        .split(chart_inner);
+    let bars_area = chunks[0];
+    let labels_area = chunks[1];
+    let (visible_start, visible_end) =
+        update_api_stat_viewport(state, area, buckets.len(), visible_capacity);
+    let visible = &buckets[visible_start..visible_end];
+    let formatter = state.formatter();
+    let count_label = if buckets.is_empty() {
+        " NO DAILY DATA ".to_string()
+    } else {
+        let range = visible
+            .first()
+            .zip(visible.last())
+            .map(|(first, last)| {
+                let first = NaiveDate::parse_from_str(&first.start_date, "%Y-%m-%d")
+                    .map(|date| formatter.format_full_date(date))
+                    .unwrap_or_else(|_| first.start_date.clone());
+                let last = NaiveDate::parse_from_str(&last.start_date, "%Y-%m-%d")
+                    .map(|date| formatter.format_full_date(date))
+                    .unwrap_or_else(|_| last.start_date.clone());
+                format!(" {first} - {last} ")
+            })
+            .unwrap_or_default();
+        format!(
+            " {} ACTIVE DAYS{range}",
+            viewport_label(buckets.len(), visible_start, visible_end, formatter)
+        )
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .padding(Padding {
+            left: 1,
+            right: 1,
+            top: 1,
+            bottom: 0,
+        })
+        .title(Span::styled(
+            " DAILY_TOKEN_ACTIVITY ",
+            Style::default().fg(Color::Gray),
+        ))
+        .title_top(
+            Line::from(Span::styled(count_label, Style::default().fg(Color::Gray))).right_aligned(),
+        );
+    frame.render_widget(block.clone(), area);
+
+    if buckets.is_empty() || chart_inner.width < 3 || chart_inner.height < 3 {
+        if buckets.is_empty() {
+            frame.render_widget(
+                Paragraph::new("The account service returned no daily usage buckets.")
+                    .style(Style::default().fg(Color::Gray)),
+                chart_inner,
+            );
+        }
+        return;
+    }
+
+    let values = visible
+        .iter()
+        .map(|bucket| bucket.tokens)
+        .collect::<Vec<_>>();
+    let (bar_width, bar_gap) = compute_bar_layout(bars_area, visible.len() as u16);
+    let bar_width = bar_width.max(1);
+    let max_value = values.iter().copied().max().unwrap_or(0).max(1);
+    let hovered = hovered_vertical_bar_index(
+        state.mouse_position,
+        bars_area,
+        bar_width,
+        bar_gap,
+        &values,
+        max_value,
+    );
+    let tooltip = hovered.and_then(|index| {
+        state.mouse_position.map(|mouse| {
+            (
+                mouse,
+                format_vertical_bar_tooltip(
+                    &visible[index].start_date,
+                    visible[index].tokens,
+                    UsageMetric::Tokens,
+                    formatter,
+                ),
+            )
+        })
+    });
+
+    let buf = frame.buffer_mut();
+    let mut previous_month = None;
+    let mut last_label_end = labels_area.x;
+    for (index, bucket) in visible.iter().enumerate() {
+        let x = bars_area
+            .x
+            .saturating_add((index as u16).saturating_mul(bar_width.saturating_add(bar_gap)));
+        let right = bars_area.x.saturating_add(bars_area.width);
+        if x >= right {
+            break;
+        }
+        let width = bar_width.min(right.saturating_sub(x));
+        let fill_bg = if index % 2 == 0 {
+            DARK_BAR_COLOR
+        } else {
+            LIGHT_BAR_COLOR
+        };
+        let filled_height = ((bars_area.height as f64)
+            * (bucket.tokens as f64 / max_value as f64).clamp(0.0, 1.0))
+        .round() as u16;
+        let bottom = bars_area
+            .y
+            .saturating_add(bars_area.height)
+            .saturating_sub(1);
+        let top = bottom.saturating_sub(filled_height.saturating_sub(1));
+        for y in bars_area.y..bars_area.y.saturating_add(bars_area.height) {
+            for cell_x in x..x.saturating_add(width) {
+                if let Some(cell) = buf.cell_mut((cell_x, y)) {
+                    cell.set_char(' ');
+                    if filled_height > 0 && y >= top {
+                        cell.set_style(Style::default().bg(fill_bg));
+                    }
+                }
+            }
+        }
+
+        if width >= 4 && filled_height >= 2 {
+            let value = format_compact_kmb(bucket.tokens, width, formatter);
+            let value = truncate_middle(&value, width as usize);
+            let value_x = x.saturating_add(width.saturating_sub(value.len() as u16) / 2);
+            let value_y = bottom.saturating_sub(1);
+            for (offset, ch) in value.chars().enumerate() {
+                if let Some(cell) = buf.cell_mut((value_x + offset as u16, value_y)) {
+                    cell.set_char(ch).set_style(
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(fill_bg)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                }
+            }
+        }
+
+        let parsed = NaiveDate::parse_from_str(&bucket.start_date, "%Y-%m-%d").ok();
+        let month_key = parsed.map(|date| (date.year(), date.month()));
+        let label = if width >= 5 {
+            parsed.map(|date| formatter.format_short_date(date))
+        } else if month_key != previous_month {
+            parsed.map(|date| formatter.abbreviated_month(date.month()))
+        } else {
+            None
+        };
+        previous_month = month_key;
+        if let Some(label) = label {
+            if x >= last_label_end {
+                let label = truncate_middle(&label, right.saturating_sub(x) as usize);
+                for (offset, ch) in label.chars().enumerate() {
+                    if let Some(cell) = buf.cell_mut((x + offset as u16, labels_area.y)) {
+                        cell.set_char(ch)
+                            .set_style(Style::default().fg(Color::Gray));
+                    }
+                }
+                last_label_end = x.saturating_add(label.len() as u16).saturating_add(1);
+            }
+        }
+    }
+
+    if let Some((mouse, text)) = tooltip {
+        render_chart_tooltip(frame, chart_inner, mouse, &text);
+    }
+    if let Some(scrollbar_area) = scrollbar_area {
+        render_chart_scrollbar(
+            frame,
+            scrollbar_area,
+            ChartScrollbarAxis::Horizontal,
+            ChartScrollbarViewport {
+                total: buckets.len(),
+                visible: visible_end.saturating_sub(visible_start),
+                offset_from_newest: state.api_stat_period_offset,
+            },
+            ChartScrollbarOwner::ApiStat,
+            state,
+        );
+    }
+}
+
 fn footer_hint(screen: ActiveScreen) -> &'static str {
     match screen {
         ActiveScreen::Usage => {
-            "Usage: Statistic [tab] (tokens/time/runs), Timeframe [w] (week/month), Layout [f] (horizontal/vertical), Refresh [r/F5], Switch [s/F2], Help [?], Quit [q]"
+            "Usage: Statistic [tab] (tokens/time/runs), Group [g/w] (day/week/month), Layout [f] (horizontal/vertical), Zone [z/F6] (local/UTC), Scroll [wheel/arrows/PgUp/PgDn/Home/End], Refresh [r/F5], Switch [s/F2], Help [?], Quit [q]"
         }
         ActiveScreen::Activity => {
-            "Activity: Statistic [tab] (tokens/time/runs), Projects [+/-], Refresh [r/F5], Switch [s/F2], Help [?], Quit [q]"
+            "Activity: Statistic [tab] (tokens/time/runs), Projects [+/-], Scroll [wheel/left/right/PgUp/PgDn/Home/End], Refresh [r/F5], Switch [s/F2], Help [?], Quit [q]"
+        }
+        ActiveScreen::ApiStat => {
+            "Codex API stats: View [b] (bars/heat), Group [g] (day/week/month), Layout [f] (vertical/horizontal), Zone: UTC (server), Scroll [wheel/arrows/PgUp/PgDn/Home/End], Refresh [r/F5], Switch [s/F2], Help [?], Quit [q]"
         }
         ActiveScreen::LimitResets => {
             "Limit resets: Refresh [r/F5], Switch [s/F2], Help [?], Quit [q]"
@@ -349,11 +1838,17 @@ fn footer_hint(screen: ActiveScreen) -> &'static str {
 }
 
 fn footer_error(state: &AppState) -> String {
-    let err = state
-        .usage_error
-        .as_deref()
-        .or(state.limits_error.as_deref())
-        .unwrap_or("");
+    let err = match state.active_screen {
+        ActiveScreen::Usage => state
+            .usage_error
+            .as_deref()
+            .or(state.limits_error.as_deref()),
+        ActiveScreen::Activity => state.usage_error.as_deref(),
+        ActiveScreen::ApiStat => state.account_usage_error.as_deref(),
+        ActiveScreen::LimitResets => state.limits_error.as_deref(),
+        ActiveScreen::Read => None,
+    }
+    .unwrap_or("");
     if err.is_empty() {
         String::new()
     } else {
@@ -527,31 +2022,12 @@ fn activity_project_control_spans(project_count: String) -> [Span<'static>; 3] {
     ]
 }
 
-fn render_activity_heatmaps(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+fn render_activity_heatmaps(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     let metric_label = match state.metric {
         UsageMetric::Tokens => "TOKENS",
         UsageMetric::Time => "TIME",
         UsageMetric::Runs => "RUNS",
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .title_top(
-            Line::from(Span::styled(
-                format!(" Last {ACTIVITY_TIMELINE_WEEKS} weeks "),
-                Style::default().fg(Color::Gray),
-            ))
-            .left_aligned(),
-        )
-        .title_top(
-            Line::from(Span::styled(
-                format!(" {metric_label} "),
-                Style::default().add_modifier(Modifier::BOLD),
-            ))
-            .right_aligned(),
-        );
-    frame.render_widget(block, area);
-
     let inner = inset_with_border_and_padding(
         area,
         Padding {
@@ -561,6 +2037,107 @@ fn render_activity_heatmaps(frame: &mut Frame<'_>, area: Rect, state: &AppState)
             bottom: 0,
         },
     );
+    if let Some((indexed, total)) = state
+        .usage
+        .as_ref()
+        .filter(|snapshot| snapshot.scan_pending_files > 0)
+        .map(|snapshot| (snapshot.scan_indexed_files, snapshot.scan_total_files))
+    {
+        state.activity_scroll_area = Some(area);
+        state.activity_total_weeks = 0;
+        state.activity_visible_weeks = 0;
+        state.activity_week_offset = 0;
+        let formatter = state.formatter();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .title_top(
+                Line::from(Span::styled(
+                    format!(
+                        " INDEXING {} / {} ",
+                        formatter.format_usize(indexed),
+                        formatter.format_usize(total)
+                    ),
+                    Style::default().fg(Color::Gray),
+                ))
+                .left_aligned(),
+            )
+            .title_top(
+                Line::from(Span::styled(
+                    format!(" {metric_label} "),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ))
+                .right_aligned(),
+            );
+        frame.render_widget(block, area);
+        render_activity_message(frame, inner, "Indexing local sessions. Please wait.");
+        return;
+    }
+    let grid_width = inner.width.saturating_sub(ACTIVITY_WEEKDAY_LABEL_WIDTH);
+    let cell_width = activity_day_cell_width(grid_width, ACTIVITY_TIMELINE_WEEKS);
+    let weeks_visible = ACTIVITY_TIMELINE_WEEKS.min((grid_width / cell_width.max(1)) as usize);
+    let (chart_inner, scrollbar_area) = reserve_chart_scrollbar(
+        inner,
+        ChartScrollbarAxis::Horizontal,
+        weeks_visible < ACTIVITY_TIMELINE_WEEKS,
+    );
+    state.activity_scroll_area = Some(area);
+    state.activity_total_weeks = ACTIVITY_TIMELINE_WEEKS;
+    state.activity_visible_weeks = weeks_visible;
+    let max_offset = ACTIVITY_TIMELINE_WEEKS.saturating_sub(weeks_visible);
+    state.activity_week_offset = state.activity_week_offset.min(max_offset);
+    let older = if state.activity_week_offset < max_offset {
+        "<"
+    } else {
+        " "
+    };
+    let newer = if state.activity_week_offset > 0 {
+        ">"
+    } else {
+        " "
+    };
+    let range_title = if max_offset == 0 {
+        format!(" Last {ACTIVITY_TIMELINE_WEEKS} weeks ")
+    } else {
+        format!(
+            " {older} Weeks {}-{} of {ACTIVITY_TIMELINE_WEEKS} {newer} ",
+            max_offset
+                .saturating_sub(state.activity_week_offset)
+                .saturating_add(1),
+            max_offset
+                .saturating_sub(state.activity_week_offset)
+                .saturating_add(weeks_visible)
+        )
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .title_top(
+            Line::from(Span::styled(range_title, Style::default().fg(Color::Gray))).left_aligned(),
+        )
+        .title_top(
+            Line::from(Span::styled(
+                format!(" {metric_label} "),
+                Style::default().add_modifier(Modifier::BOLD),
+            ))
+            .right_aligned(),
+        );
+    frame.render_widget(block, area);
+    if let Some(scrollbar_area) = scrollbar_area {
+        render_chart_scrollbar(
+            frame,
+            scrollbar_area,
+            ChartScrollbarAxis::Horizontal,
+            ChartScrollbarViewport {
+                total: ACTIVITY_TIMELINE_WEEKS,
+                visible: weeks_visible,
+                offset_from_newest: state.activity_week_offset,
+            },
+            ChartScrollbarOwner::Activity,
+            state,
+        );
+    }
+    let inner = chart_inner;
 
     let Some(snapshot) = state.usage.as_ref() else {
         render_activity_message(frame, inner, "Loading activity...");
@@ -597,6 +2174,7 @@ fn render_activity_heatmaps(frame: &mut Frame<'_>, area: Rect, state: &AppState)
             state.metric,
             snapshot.activity_first_weekday,
             state.formatter(),
+            state.activity_week_offset,
         );
         y = y.saturating_add(ACTIVITY_PROJECT_STRIDE);
         if y >= inner.y.saturating_add(inner.height) {
@@ -623,6 +2201,7 @@ fn render_project_activity_heatmap(
     metric: UsageMetric,
     first_weekday: Weekday,
     formatter: DisplayFormatter<'_>,
+    week_offset_from_newest: usize,
 ) {
     if area.height < ACTIVITY_PROJECT_HEIGHT || area.width <= ACTIVITY_WEEKDAY_LABEL_WIDTH {
         return;
@@ -638,7 +2217,8 @@ fn render_project_activity_heatmap(
     if weeks_visible == 0 {
         return;
     }
-    let week_offset = weeks_total.saturating_sub(weeks_visible);
+    let max_offset = weeks_total.saturating_sub(weeks_visible);
+    let week_offset = max_offset.saturating_sub(week_offset_from_newest.min(max_offset));
     let grid_x = area.x.saturating_add(ACTIVITY_WEEKDAY_LABEL_WIDTH);
 
     let header = format_activity_project_header(project, metric, area.width as usize, formatter);
@@ -946,10 +2526,13 @@ fn render_usage_controls(
     let tokens = pill("TOKENS", state.metric == UsageMetric::Tokens);
     let time = pill("TIME", state.metric == UsageMetric::Time);
     let runs = pill("RUNS", state.metric == UsageMetric::Runs);
+    let day = pill("DAY", state.range == ChartRange::Day);
     let week = pill("WEEK", state.range == ChartRange::Week);
     let month = pill("MONTH", state.range == ChartRange::Month);
     let vert = pill("VERT", state.orientation == ChartOrientation::Vertical);
     let horz = pill("HORZ", state.orientation == ChartOrientation::Horizontal);
+    let local = pill("LOCAL", state.usage_zone == UsageZone::Local);
+    let utc = pill("UTC", state.usage_zone == UsageZone::Utc);
     let classic = pill("CLASS", state.display_style == DisplayStyle::Classic);
     let system_compact = pill("SCOMP", state.display_style == DisplayStyle::SystemCompact);
     let system_full = pill("SFULL", state.display_style == DisplayStyle::SystemFull);
@@ -963,10 +2546,13 @@ fn render_usage_controls(
             tokens,
             time,
             runs,
+            day,
             week,
             month,
             vert,
             horz,
+            local,
+            utc,
             classic,
             system_compact,
             system_full,
@@ -999,7 +2585,7 @@ fn render_flat_usage_controls(
 ) {
     let row = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Length(92)])
+        .constraints([Constraint::Min(20), Constraint::Length(116)])
         .split(area);
     render_workspace_label(frame, row[0], workspace_label);
 
@@ -1015,6 +2601,7 @@ fn render_flat_usage_controls(
             (" TIME ", Some(UiClickAction::SetMetric(UsageMetric::Time))),
             (" RUNS ", Some(UiClickAction::SetMetric(UsageMetric::Runs))),
             (" GRAPH ", None),
+            (" DAY ", Some(UiClickAction::SetRange(ChartRange::Day))),
             (" WEEK ", Some(UiClickAction::SetRange(ChartRange::Week))),
             (" MONTH ", Some(UiClickAction::SetRange(ChartRange::Month))),
             (" BARS ", None),
@@ -1026,6 +2613,12 @@ fn render_flat_usage_controls(
                 " HORZ ",
                 Some(UiClickAction::SetOrientation(ChartOrientation::Horizontal)),
             ),
+            (" ZONE ", None),
+            (
+                " LOCAL ",
+                Some(UiClickAction::SetUsageZone(UsageZone::Local)),
+            ),
+            (" UTC ", Some(UiClickAction::SetUsageZone(UsageZone::Utc))),
             (" STYLE ", None),
             (
                 " CLASS ",
@@ -1045,11 +2638,13 @@ fn render_flat_usage_controls(
     let mut spans = vec![control_group_label("VIEW")];
     spans.extend(pills[0..3].iter().cloned());
     spans.push(control_group_label("GRAPH"));
-    spans.extend(pills[3..5].iter().cloned());
+    spans.extend(pills[3..6].iter().cloned());
     spans.push(control_group_label("BARS"));
-    spans.extend(pills[5..7].iter().cloned());
+    spans.extend(pills[6..8].iter().cloned());
+    spans.push(control_group_label("ZONE"));
+    spans.extend(pills[8..10].iter().cloned());
     spans.push(control_group_label("STYLE"));
-    spans.extend(pills[7..10].iter().cloned());
+    spans.extend(pills[10..13].iter().cloned());
     frame.render_widget(
         Paragraph::new(Line::from(spans)).alignment(Alignment::Right),
         row[1],
@@ -1151,10 +2746,28 @@ fn limits_card_content(state: &AppState, compact: bool) -> (String, Vec<String>)
 fn usage_card_specs(state: &AppState, card_width: u16) -> Vec<CardSpec> {
     let formatter = state.formatter();
     let snapshot = state.usage.as_ref();
-    let totals = snapshot.map(|snapshot| snapshot.totals_view(state.metric, formatter));
-    let today = snapshot.and_then(|snapshot| snapshot.days.last());
+    let totals = snapshot
+        .map(|snapshot| snapshot.totals_view_for_zone(state.metric, formatter, state.usage_zone));
+    let today = snapshot.and_then(|snapshot| snapshot.days_for_zone(state.usage_zone).last());
     let (limits_value, limits_captions) =
         limits_card_content(state, uses_compact_limit_lines(card_width));
+
+    if let Some(pending) = snapshot.filter(|snapshot| snapshot.scan_pending_files > 0) {
+        let progress = format!(
+            "{} / {} files",
+            formatter.format_usize(pending.scan_indexed_files),
+            formatter.format_usize(pending.scan_total_files)
+        );
+        let mut cards = Vec::with_capacity(6);
+        cards.push(CardSpec::new(limits_value, limits_captions));
+        for _ in 0..5 {
+            cards.push(CardSpec::new(
+                "INDEXING".to_string(),
+                vec![progress.clone(), "Please wait".to_string()],
+            ));
+        }
+        return cards;
+    }
 
     let today_value = today
         .map(|day| {
@@ -1176,14 +2789,20 @@ fn usage_card_specs(state: &AppState, card_width: u16) -> Vec<CardSpec> {
     let last7_runs = snapshot
         .map(|snapshot| {
             snapshot
-                .last7_days()
+                .last7_days_for_zone(state.usage_zone)
                 .iter()
                 .map(|day| day.agent_runs)
                 .sum::<i64>()
         })
         .map(|runs| format!("Runs {}", format_count(runs, formatter)));
     let last30_runs = snapshot
-        .map(|snapshot| snapshot.days.iter().map(|day| day.agent_runs).sum::<i64>())
+        .map(|snapshot| {
+            snapshot
+                .days_for_zone(state.usage_zone)
+                .iter()
+                .map(|day| day.agent_runs)
+                .sum::<i64>()
+        })
         .map(|runs| format!("Runs {}", format_count(runs, formatter)));
 
     let mut cards = Vec::with_capacity(6);
@@ -1301,11 +2920,12 @@ fn usage_card_specs(state: &AppState, card_width: u16) -> Vec<CardSpec> {
                 .map(|totals| totals.peak_sub_label.clone())
                 .unwrap_or_default();
             let avg30 = snapshot
-                .filter(|snapshot| !snapshot.days.is_empty())
+                .filter(|snapshot| !snapshot.days_for_zone(state.usage_zone).is_empty())
                 .map(|snapshot| {
-                    let total_runs = snapshot.days.iter().map(|day| day.agent_runs).sum::<i64>();
+                    let days = snapshot.days_for_zone(state.usage_zone);
+                    let total_runs = days.iter().map(|day| day.agent_runs).sum::<i64>();
                     format_count(
-                        (total_runs as f64 / snapshot.days.len() as f64).round() as i64,
+                        (total_runs as f64 / days.len() as f64).round() as i64,
                         formatter,
                     )
                 })
@@ -1314,7 +2934,10 @@ fn usage_card_specs(state: &AppState, card_width: u16) -> Vec<CardSpec> {
                 .map(|snapshot| {
                     format!(
                         "Tokens {}",
-                        format_tokens_compact(snapshot.totals.last7_days_tokens, formatter)
+                        format_tokens_compact(
+                            snapshot.totals_for_zone(state.usage_zone).last7_days_tokens,
+                            formatter,
+                        )
                     )
                 })
                 .unwrap_or_else(|| "--".to_string());
@@ -1322,14 +2945,19 @@ fn usage_card_specs(state: &AppState, card_width: u16) -> Vec<CardSpec> {
                 .map(|snapshot| {
                     format!(
                         "Tokens {}",
-                        format_tokens_compact(snapshot.totals.last30_days_tokens, formatter)
+                        format_tokens_compact(
+                            snapshot
+                                .totals_for_zone(state.usage_zone)
+                                .last30_days_tokens,
+                            formatter,
+                        )
                     )
                 })
                 .unwrap_or_else(|| "--".to_string());
             let time7 = snapshot
                 .map(|snapshot| {
                     let total_ms = snapshot
-                        .last7_days()
+                        .last7_days_for_zone(state.usage_zone)
                         .iter()
                         .map(|day| day.agent_time_ms)
                         .sum::<i64>();
@@ -1382,7 +3010,11 @@ fn usage_cards_height(state: &AppState, width: u16) -> u16 {
 
 fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let formatter = state.formatter();
-    let today_title = today_card_title(formatter, Local::now().naive_local());
+    let today_now = match state.usage_zone {
+        UsageZone::Local => Local::now().naive_local(),
+        UsageZone::Utc => Utc::now().naive_utc(),
+    };
+    let today_title = today_card_title(formatter, today_now);
     let card_layout = usage_card_layout(area.width);
     let row_heights = usage_card_row_heights(state, area.width);
     let two_rows = row_heights.len() > 1;
@@ -1400,8 +3032,9 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     };
 
     let snapshot = state.usage.as_ref();
-    let totals = snapshot.map(|s| s.totals_view(state.metric, formatter));
-    let today = snapshot.and_then(|s| s.days.last());
+    let totals =
+        snapshot.map(|s| s.totals_view_for_zone(state.metric, formatter, state.usage_zone));
+    let today = snapshot.and_then(|s| s.days_for_zone(state.usage_zone).last());
 
     // LIMITS card (live from Codex app-server).
     let (limits_value, limits_caption1, limits_caption2, limits_caption3): (
@@ -1426,6 +3059,98 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         ("Loading...".to_string(), None, None, None)
     };
 
+    if let Some(pending) = state
+        .usage
+        .as_ref()
+        .filter(|snapshot| snapshot.scan_pending_files > 0)
+    {
+        let progress = format!(
+            "{} / {} files",
+            formatter.format_usize(pending.scan_indexed_files),
+            formatter.format_usize(pending.scan_total_files)
+        );
+        let aux_title = match state.metric {
+            UsageMetric::Tokens => "CACHE_HIT_RATE",
+            UsageMetric::Time => "RUNS",
+            UsageMetric::Runs => "TIME",
+        };
+        let render_pending = |frame: &mut Frame<'_>, title: &str, target: Rect| {
+            frame.render_widget(
+                card(title, "INDEXING", Some(&progress), Some("Please wait")),
+                target,
+            );
+        };
+        if let Some(row1) = row1 {
+            if row2.is_none() {
+                let cards = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Percentage(17),
+                        Constraint::Percentage(17),
+                        Constraint::Percentage(17),
+                        Constraint::Percentage(17),
+                        Constraint::Percentage(16),
+                        Constraint::Percentage(16),
+                    ])
+                    .split(row1);
+                frame.render_widget(
+                    card4(
+                        "LIMITS",
+                        &limits_value,
+                        limits_caption1.as_deref(),
+                        limits_caption2.as_deref(),
+                        limits_caption3.as_deref(),
+                    ),
+                    cards[0],
+                );
+                for (title, target) in [
+                    (today_title.as_str(), cards[1]),
+                    ("LAST_7_DAYS", cards[2]),
+                    ("LAST_30_DAYS", cards[3]),
+                    (aux_title, cards[4]),
+                    ("PEAK_DAY", cards[5]),
+                ] {
+                    render_pending(frame, title, target);
+                }
+            } else {
+                let top = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Percentage(34),
+                        Constraint::Percentage(33),
+                        Constraint::Percentage(33),
+                    ])
+                    .split(row1);
+                frame.render_widget(
+                    card4(
+                        "LIMITS",
+                        &limits_value,
+                        limits_caption1.as_deref(),
+                        limits_caption2.as_deref(),
+                        limits_caption3.as_deref(),
+                    ),
+                    top[0],
+                );
+                render_pending(frame, &today_title, top[1]);
+                render_pending(frame, "LAST_7_DAYS", top[2]);
+            }
+        }
+        if let Some(row2) = row2 {
+            let bottom = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(34),
+                    Constraint::Percentage(33),
+                    Constraint::Percentage(33),
+                ])
+                .split(row2);
+            render_pending(frame, "LAST_30_DAYS", bottom[0]);
+            render_pending(frame, aux_title, bottom[1]);
+            render_pending(frame, "PEAK_DAY", bottom[2]);
+        }
+        return;
+    }
+
     // TODAY card always shows Tokens / Runs / Time.
     let today_value = today
         .map(|d| {
@@ -1443,10 +3168,20 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         .unwrap_or_default();
 
     let last7_runs_sum = snapshot
-        .map(|s| s.last7_days().iter().map(|d| d.agent_runs).sum::<i64>())
+        .map(|s| {
+            s.last7_days_for_zone(state.usage_zone)
+                .iter()
+                .map(|d| d.agent_runs)
+                .sum::<i64>()
+        })
         .unwrap_or(0);
     let last30_runs_sum = snapshot
-        .map(|s| s.days.iter().map(|d| d.agent_runs).sum::<i64>())
+        .map(|s| {
+            s.days_for_zone(state.usage_zone)
+                .iter()
+                .map(|d| d.agent_runs)
+                .sum::<i64>()
+        })
         .unwrap_or(0);
     let last7_runs_caption = if snapshot.is_some() {
         Some(format!("Runs {}", format_count(last7_runs_sum, formatter)))
@@ -1785,11 +3520,12 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
             let avg30 = snapshot
                 .map(|s| {
-                    if s.days.is_empty() {
+                    let days = s.days_for_zone(state.usage_zone);
+                    if days.is_empty() {
                         0
                     } else {
-                        let total_runs = s.days.iter().map(|d| d.agent_runs).sum::<i64>();
-                        (total_runs as f64 / s.days.len() as f64).round() as i64
+                        let total_runs = days.iter().map(|d| d.agent_runs).sum::<i64>();
+                        (total_runs as f64 / days.len() as f64).round() as i64
                     }
                 })
                 .unwrap_or(0);
@@ -1803,7 +3539,10 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                 .map(|s| {
                     format!(
                         "Tokens {}",
-                        format_tokens_compact(s.totals.last7_days_tokens, formatter)
+                        format_tokens_compact(
+                            s.totals_for_zone(state.usage_zone).last7_days_tokens,
+                            formatter,
+                        )
                     )
                 })
                 .unwrap_or_else(|| "--".into());
@@ -1811,13 +3550,20 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                 .map(|s| {
                     format!(
                         "Tokens {}",
-                        format_tokens_compact(s.totals.last30_days_tokens, formatter)
+                        format_tokens_compact(
+                            s.totals_for_zone(state.usage_zone).last30_days_tokens,
+                            formatter,
+                        )
                     )
                 })
                 .unwrap_or_else(|| "--".into());
             let time7 = snapshot
                 .map(|s| {
-                    let ms = s.last7_days().iter().map(|d| d.agent_time_ms).sum::<i64>();
+                    let ms = s
+                        .last7_days_for_zone(state.usage_zone)
+                        .iter()
+                        .map(|d| d.agent_time_ms)
+                        .sum::<i64>();
                     format_duration_compact(ms)
                 })
                 .unwrap_or_else(|| "--".into());
@@ -1938,21 +3684,217 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     }
 }
 
-fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    // Note: We draw bars manually to control label placement and padding.
-    let formatter = state.formatter();
+fn aggregate_usage_days(days: &[UsageDay], grouping: ChartRange) -> Vec<UsageDay> {
+    let mut grouped = BTreeMap::<NaiveDate, UsageDay>::new();
+    for day in days {
+        let Ok(date) = NaiveDate::parse_from_str(&day.day, "%Y-%m-%d") else {
+            continue;
+        };
+        let start = usage_period_start(date, grouping);
+        let entry = grouped.entry(start).or_insert_with(|| UsageDay {
+            day: start.format("%Y-%m-%d").to_string(),
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            total_tokens: 0,
+            agent_time_ms: 0,
+            agent_runs: 0,
+        });
+        entry.input_tokens = entry.input_tokens.saturating_add(day.input_tokens);
+        entry.cached_input_tokens = entry
+            .cached_input_tokens
+            .saturating_add(day.cached_input_tokens);
+        entry.total_tokens = entry.total_tokens.saturating_add(day.total_tokens);
+        entry.agent_time_ms = entry.agent_time_ms.saturating_add(day.agent_time_ms);
+        entry.agent_runs = entry.agent_runs.saturating_add(day.agent_runs);
+    }
+    grouped.into_values().collect()
+}
 
+fn usage_period_start(date: NaiveDate, grouping: ChartRange) -> NaiveDate {
+    match grouping {
+        ChartRange::Day => date,
+        ChartRange::Week => {
+            date - ChronoDuration::days(date.weekday().num_days_from_monday() as i64)
+        }
+        ChartRange::Month => NaiveDate::from_ymd_opt(date.year(), date.month(), 1).unwrap_or(date),
+    }
+}
+
+fn usage_period_end(start: NaiveDate, grouping: ChartRange) -> NaiveDate {
+    match grouping {
+        ChartRange::Day => start,
+        ChartRange::Week => start + ChronoDuration::days(6),
+        ChartRange::Month => {
+            let (year, month) = if start.month() == 12 {
+                (start.year().saturating_add(1), 1)
+            } else {
+                (start.year(), start.month() + 1)
+            };
+            NaiveDate::from_ymd_opt(year, month, 1)
+                .map(|next| next - ChronoDuration::days(1))
+                .unwrap_or(start)
+        }
+    }
+}
+
+fn format_usage_period_label(
+    start: NaiveDate,
+    grouping: ChartRange,
+    formatter: DisplayFormatter<'_>,
+    compact: bool,
+) -> String {
+    match grouping {
+        ChartRange::Day if compact => format!("{:02}", start.day()),
+        ChartRange::Day => {
+            format_day_label_weekday_mmdd(&start.format("%Y-%m-%d").to_string(), formatter)
+        }
+        ChartRange::Week if compact => format!("W{:02}", start.iso_week().week()),
+        ChartRange::Week => {
+            let end = usage_period_end(start, grouping);
+            let range = if start.month() == end.month() {
+                format!(
+                    "{} {}-{}",
+                    formatter.abbreviated_month(start.month()),
+                    start.day(),
+                    end.day()
+                )
+            } else {
+                format!(
+                    "{} {}-{} {}",
+                    formatter.abbreviated_month(start.month()),
+                    start.day(),
+                    formatter.abbreviated_month(end.month()),
+                    end.day()
+                )
+            };
+            format!("W{:02} ({range})", start.iso_week().week())
+        }
+        ChartRange::Month => format!(
+            "{} {}",
+            formatter.abbreviated_month(start.month()),
+            start.year()
+        ),
+    }
+}
+
+fn format_usage_period_tooltip(
+    start: NaiveDate,
+    grouping: ChartRange,
+    formatter: DisplayFormatter<'_>,
+) -> String {
+    if grouping == ChartRange::Day {
+        formatter.format_full_date(start)
+    } else {
+        format!(
+            "{} - {}",
+            formatter.format_full_date(start),
+            formatter.format_full_date(usage_period_end(start, grouping))
+        )
+    }
+}
+
+fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
+    // Note: We draw bars manually to control label placement and padding.
     let range_label = match state.range {
-        ChartRange::Week => "Last 7 days",
-        ChartRange::Month => "Last 30 days",
+        ChartRange::Day => "Usage by day",
+        ChartRange::Week => "Usage by ISO week",
+        ChartRange::Month => "Usage by month",
     };
+    // Inner area: account for borders and provide padding (top padding = 1 line).
+    let inner = inset_with_border_and_padding(
+        area,
+        Padding {
+            left: 2,
+            right: 2,
+            top: 1,
+            bottom: 0,
+        },
+    );
+
+    if let Some(pending) = state
+        .usage
+        .as_ref()
+        .filter(|snapshot| snapshot.scan_pending_files > 0)
+    {
+        state.usage_period_offset = 0;
+        state.usage_visible_periods = 0;
+        state.usage_total_periods = 0;
+        state.usage_scroll_area = Some(area);
+        let formatter = state.formatter();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .title_top(
+                Line::from(Span::styled(
+                    format!(" {range_label} "),
+                    Style::default().fg(Color::Gray),
+                ))
+                .left_aligned(),
+            )
+            .title_top(
+                Line::from(Span::styled(
+                    format!(
+                        " INDEXING {} / {} ",
+                        formatter.format_usize(pending.scan_indexed_files),
+                        formatter.format_usize(pending.scan_total_files)
+                    ),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ))
+                .right_aligned(),
+            );
+        frame.render_widget(block, area);
+        frame.render_widget(
+            Paragraph::new(Text::from(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "INDEXING LOCAL SESSIONS",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from("Please wait. Values appear when the local snapshot is complete."),
+            ]))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
+            inner,
+        );
+        return;
+    }
+
+    let all_days = state
+        .usage
+        .as_ref()
+        .map(|snapshot| aggregate_usage_days(snapshot.days_for_zone(state.usage_zone), state.range))
+        .unwrap_or_default();
+    let visible_capacity = match state.orientation {
+        ChartOrientation::Vertical => vertical_bar_capacity(inner.width),
+        ChartOrientation::Horizontal => {
+            let bar_height = usage_horizontal_bar_height(all_days.len(), inner.height);
+            usize::from((inner.height / bar_height).max(1))
+        }
+    };
+    let scrollbar_axis = match state.orientation {
+        ChartOrientation::Vertical => ChartScrollbarAxis::Horizontal,
+        ChartOrientation::Horizontal => ChartScrollbarAxis::Vertical,
+    };
+    let (chart_inner, scrollbar_area) =
+        reserve_chart_scrollbar(inner, scrollbar_axis, all_days.len() > visible_capacity);
+    let (start, end) = update_usage_viewport(state, area, all_days.len(), visible_capacity);
+    let days = &all_days[start..end];
+    let formatter = state.formatter();
     let metric_label = usage_chart_metric_label(state.metric);
+    let range_title = if all_days.len() == days.len() {
+        range_label.to_string()
+    } else {
+        format!(
+            "{range_label} :: {}",
+            viewport_label(all_days.len(), start, end, formatter)
+        )
+    };
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .title_top(
             Line::from(Span::styled(
-                format!(" {range_label} "),
+                format!(" {range_title} "),
                 Style::default().fg(Color::Gray),
             ))
             .left_aligned(),
@@ -1969,50 +3911,35 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     }
     frame.render_widget(block, area);
 
-    let snapshot = state.usage.as_ref();
-    let days = snapshot
-        .map(|s| match state.range {
-            ChartRange::Week => s.last7_days(),
-            ChartRange::Month => s.last_n_days(30),
-        })
-        .unwrap_or_default();
-
-    // Inner area: account for borders and provide padding (top padding = 1 line).
-    let inner = inset_with_border_and_padding(
-        area,
-        Padding {
-            left: 2,
-            right: 2,
-            top: 1,
-            bottom: 0,
-        },
-    );
+    let inner = chart_inner;
 
     if inner.height < 2 {
         return;
     }
 
     let mut labels: Vec<String> = Vec::with_capacity(days.len());
+    let mut tooltip_labels: Vec<String> = Vec::with_capacity(days.len());
     let mut values: Vec<u64> = Vec::with_capacity(days.len());
     let mut token_out_of_cache_values: Vec<u64> = Vec::with_capacity(days.len());
-    for day in &days {
-        let label = match state.orientation {
-            ChartOrientation::Horizontal => format_day_label_weekday_mmdd(&day.day, formatter),
-            ChartOrientation::Vertical => match state.range {
-                ChartRange::Week => day.short_label(formatter),
-                ChartRange::Month => {
-                    // Prefer compact day-of-month labels for dense charts.
-                    if day.day.len() == 10 {
-                        day.day[8..10].to_string()
-                    } else {
-                        day.short_label(formatter)
-                    }
-                }
-            },
-        };
+    for day in days {
+        let date = NaiveDate::parse_from_str(&day.day, "%Y-%m-%d").ok();
+        let label = date
+            .map(|date| {
+                format_usage_period_label(
+                    date,
+                    state.range,
+                    formatter,
+                    state.orientation == ChartOrientation::Vertical,
+                )
+            })
+            .unwrap_or_else(|| day.day.clone());
+        let tooltip = date
+            .map(|date| format_usage_period_tooltip(date, state.range, formatter))
+            .unwrap_or_else(|| day.day.clone());
         labels.push(label);
+        tooltip_labels.push(tooltip);
     }
-    for day in &days {
+    for day in days {
         let value = match state.metric {
             UsageMetric::Tokens => day.total_tokens.max(0) as u64,
             UsageMetric::Time => (day.agent_time_ms.max(0) as u64) / 60_000,
@@ -2036,7 +3963,7 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             let bars_area = chunks[0];
             let labels_area = chunks[1];
 
-            let (bar_width, bar_gap) = compute_bar_layout(bars_area, values.len() as u16, 0);
+            let (bar_width, bar_gap) = compute_bar_layout(bars_area, values.len() as u16);
             let bw = bar_width.max(1);
 
             let max_value = values.iter().copied().max().unwrap_or(0).max(1);
@@ -2053,7 +3980,7 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                     (
                         mouse,
                         format_vertical_bar_tooltip(
-                            &days[index].day,
+                            &tooltip_labels[index],
                             values[index],
                             state.metric,
                             formatter,
@@ -2208,7 +4135,10 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             for l in visible_labels {
                 max_label_len = max_label_len.max(l.len());
             }
-            let label_w = (max_label_len as u16).saturating_add(1).clamp(4, 14);
+            let label_w = (max_label_len as u16)
+                .saturating_add(1)
+                .min(inner.width.saturating_sub(12).max(4))
+                .max(4);
 
             let value_gap: u16 = 1; // spaces between bar and value
             let min_bar_w: u16 = 10;
@@ -2358,6 +4288,20 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                 }
             }
         }
+    }
+    if let Some(scrollbar_area) = scrollbar_area {
+        render_chart_scrollbar(
+            frame,
+            scrollbar_area,
+            scrollbar_axis,
+            ChartScrollbarViewport {
+                total: all_days.len(),
+                visible: end.saturating_sub(start),
+                offset_from_newest: state.usage_period_offset,
+            },
+            ChartScrollbarOwner::Usage,
+            state,
+        );
     }
 }
 
@@ -2604,15 +4548,28 @@ fn format_minutes_hhmm(total_minutes: u64) -> String {
 
 fn render_top_models(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let formatter = state.formatter();
-    let snapshot = state.usage.as_ref();
-    let models = snapshot.map(|s| s.top_models.clone()).unwrap_or_default();
+    let snapshot = state
+        .usage
+        .as_ref()
+        .filter(|snapshot| snapshot.scan_pending_files == 0);
+    let models = snapshot
+        .map(|s| s.top_models_for_zone(state.usage_zone).to_vec())
+        .unwrap_or_default();
 
     let mut spans: Vec<Span<'static>> = vec![Span::styled(
         "TOP_MODELS  ",
         Style::default().fg(Color::Gray),
     )];
     if models.is_empty() {
-        spans.push(Span::raw("--"));
+        if state
+            .usage
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.scan_pending_files > 0)
+        {
+            spans.push(Span::raw("INDEXING... PLEASE WAIT"));
+        } else {
+            spans.push(Span::raw("--"));
+        }
     } else {
         for (idx, m) in models.iter().enumerate() {
             if idx > 0 {
@@ -2633,7 +4590,7 @@ fn render_top_models(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
 fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) {
     let w = area.width.min(60);
-    let h = area.height.min(14);
+    let h = area.height.min(17);
     let popup = centered_rect(w, h, area);
     frame.render_widget(Clear, popup);
 
@@ -2655,8 +4612,10 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
         ActiveScreen::Usage => Text::from(vec![
             Line::from("Keys:"),
             Line::from("  Tab  - toggle statistic (Tokens/Time/Runs)"),
-            Line::from("  w    - toggle timeframe (Week/Month)"),
+            Line::from("  g/w  - group by day/ISO week/month"),
             Line::from("  f    - toggle layout (Horz/Vert)"),
+            Line::from("  z/F6 - toggle calendar zone (Local/UTC)"),
+            Line::from("  Wheel/arrows/PgUp/PgDn/Home/End - scroll periods"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
             Line::from("  Mouse - click tabs/controls/format/quit"),
             Line::from("  r/F5 - refresh usage + limits"),
@@ -2669,9 +4628,25 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
             Line::from("  Tab  - toggle statistic (Tokens/Time/Runs)"),
             Line::from("  +/=  - show more projects"),
             Line::from("  -    - show fewer projects"),
+            Line::from("  Left/Right or wheel - scroll weeks"),
+            Line::from("  PgUp/PgDn/Home/End - jump through weeks"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
             Line::from("  Mouse - click tabs/view/projects/quit"),
             Line::from("  r/F5 - refresh usage + limits"),
+            Line::from("  s/F2 - switch screen"),
+            Line::from("  ?    - toggle help"),
+            Line::from("  q    - quit (confirm)"),
+        ]),
+        ActiveScreen::ApiStat => Text::from(vec![
+            Line::from("Keys:"),
+            Line::from("  g    - group bars by day/week/month"),
+            Line::from("  b    - toggle bars/heatmap"),
+            Line::from("  f    - toggle vertical/horizontal bars"),
+            Line::from("  Zone - UTC from the server"),
+            Line::from("  Wheel/arrows/PgUp/PgDn/Home/End - scroll periods"),
+            Line::from("  r/F5 - refresh Codex account statistics"),
+            Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
+            Line::from("  Mouse - click tabs; hover a daily bar for its exact value"),
             Line::from("  s/F2 - switch screen"),
             Line::from("  ?    - toggle help"),
             Line::from("  q    - quit (confirm)"),
@@ -3685,22 +5660,40 @@ fn apply_margin(area: Rect, margin: Margin) -> Rect {
     }
 }
 
-fn compute_bar_layout(area: Rect, bars: u16, padding_x: u16) -> (u16, u16) {
+fn preferred_vertical_bar_width(area_width: u16) -> u16 {
+    match area_width {
+        0..=47 => 1,
+        48..=119 => 2,
+        _ => 3,
+    }
+}
+
+fn vertical_bar_capacity(area_width: u16) -> usize {
+    let bar_width = preferred_vertical_bar_width(area_width);
+    let slot_width = bar_width.saturating_add(1);
+    usize::from(
+        area_width
+            .saturating_add(1)
+            .checked_div(slot_width)
+            .unwrap_or(1)
+            .max(1),
+    )
+}
+
+fn compute_bar_layout(area: Rect, bars: u16) -> (u16, u16) {
     if bars == 0 {
         return (1, 1);
     }
-    // Roughly account for the chart border + padding.
-    let inner_width = area
-        .width
-        .saturating_sub(2)
-        .saturating_sub(padding_x.saturating_mul(2));
 
     // Prefer a gap of 1, but fall back to 0 if bars would be too cramped.
     let mut gap = 1u16;
-    let mut width = (inner_width.saturating_sub(gap.saturating_mul(bars.saturating_sub(1)))) / bars;
+    let mut width = area
+        .width
+        .saturating_sub(gap.saturating_mul(bars.saturating_sub(1)))
+        / bars;
     if width == 0 {
         gap = 0;
-        width = inner_width / bars;
+        width = area.width / bars;
     }
     if width == 0 {
         width = 1;
@@ -3735,6 +5728,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn viewport_bounds_move_from_newest_to_older_periods() {
+        assert_eq!(viewport_bounds(30, 10, 0), (20, 30));
+        assert_eq!(viewport_bounds(30, 10, 1), (19, 29));
+        assert_eq!(viewport_bounds(30, 10, 99), (0, 10));
+        assert_eq!(viewport_bounds(5, 10, 3), (0, 5));
+        assert_eq!(viewport_bounds(0, 10, 0), (0, 0));
+    }
+
+    #[test]
     fn right_aligned_control_targets_follow_rendered_segments() {
         let targets = right_aligned_targets(
             Rect::new(10, 3, 30, 1),
@@ -3767,18 +5769,39 @@ mod tests {
 
     #[test]
     fn navigation_tabs_are_clickable_on_the_outer_border() {
-        let (title, targets) = navigation_title(Rect::new(4, 2, 60, 20), ActiveScreen::Activity);
+        let (title, targets) = navigation_title(Rect::new(4, 2, 80, 20), ActiveScreen::Activity);
 
-        assert_eq!(title.width(), 35);
-        assert_eq!(targets.len(), 4);
-        assert_eq!(targets[0].area, Rect::new(29, 2, 7, 1));
+        assert_eq!(title.width(), 44);
+        assert_eq!(targets.len(), 5);
+        assert_eq!(targets[0].area, Rect::new(40, 2, 7, 1));
         assert_eq!(
             targets[0].action,
             UiClickAction::SetScreen(ActiveScreen::Usage)
         );
-        assert_eq!(targets[1].area, Rect::new(36, 2, 10, 1));
-        assert_eq!(targets[2].area, Rect::new(46, 2, 8, 1));
-        assert_eq!(targets[3].area, Rect::new(54, 2, 9, 1));
+        assert_eq!(targets[1].area, Rect::new(47, 2, 10, 1));
+        assert_eq!(targets[2].area, Rect::new(57, 2, 9, 1));
+        assert_eq!(
+            targets[2].action,
+            UiClickAction::SetScreen(ActiveScreen::ApiStat)
+        );
+        assert_eq!(targets[3].area, Rect::new(66, 2, 8, 1));
+        assert_eq!(targets[4].area, Rect::new(74, 2, 9, 1));
+    }
+
+    #[test]
+    fn api_stats_outer_title_identifies_openai_as_the_source() {
+        assert_eq!(
+            app_title(ActiveScreen::ApiStat),
+            format!(" comon :: {} :: SOURCE OPENAI ", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            app_title(ActiveScreen::Usage),
+            format!(" comon :: {} ", env!("CARGO_PKG_VERSION"))
+        );
+        let (navigation, targets) =
+            navigation_title(Rect::new(0, 0, 80, 24), ActiveScreen::ApiStat);
+        assert_eq!(navigation.width(), 44);
+        assert_eq!(targets.len(), 5);
     }
 
     #[test]
@@ -3796,6 +5819,171 @@ mod tests {
             let formatter = DisplayFormatter::new(style, &system_locale);
             assert_eq!(today_card_title(formatter, now), "TODAY_07/22/2026_14:35");
         }
+    }
+
+    #[test]
+    fn api_stats_summary_respects_display_style() {
+        let system_locale = crate::locale::SystemLocale::default();
+        let classic = DisplayFormatter::new(DisplayStyle::Classic, &system_locale);
+        let compact = DisplayFormatter::new(DisplayStyle::SystemCompact, &system_locale);
+        let full = DisplayFormatter::new(DisplayStyle::SystemFull, &system_locale);
+
+        assert_eq!(
+            format_optional_account_tokens(Some(8_206_591_409), classic),
+            "8,206,591,409"
+        );
+        assert_eq!(
+            format_optional_account_tokens(Some(8_206_591_409), compact),
+            "8.21B"
+        );
+        assert_eq!(
+            format_optional_account_tokens(Some(8_206_591_409), full),
+            "8 206 591 409"
+        );
+        assert_eq!(format_account_duration(42_168), "11h 42m 48s");
+    }
+
+    #[test]
+    fn api_stats_grouping_sums_reported_days_by_local_period() {
+        let buckets = vec![
+            crate::codex_rpc::DailyUsageBucket {
+                start_date: "2026-07-31".to_string(),
+                tokens: 10,
+            },
+            crate::codex_rpc::DailyUsageBucket {
+                start_date: "2026-08-01".to_string(),
+                tokens: 20,
+            },
+            crate::codex_rpc::DailyUsageBucket {
+                start_date: "2026-08-03".to_string(),
+                tokens: 30,
+            },
+        ];
+
+        let days = aggregate_api_stat_points(&buckets, ApiStatGrouping::Day, Weekday::Mon);
+        assert_eq!(days.len(), 3);
+        let weeks = aggregate_api_stat_points(&buckets, ApiStatGrouping::Week, Weekday::Mon);
+        assert_eq!(weeks.len(), 2);
+        assert_eq!(weeks[0].start.to_string(), "2026-07-27");
+        assert_eq!(weeks[0].end.to_string(), "2026-08-02");
+        assert_eq!(weeks[0].tokens, 30);
+        assert_eq!(weeks[0].active_days, 2);
+        assert_eq!(weeks[1].tokens, 30);
+
+        let months = aggregate_api_stat_points(&buckets, ApiStatGrouping::Month, Weekday::Mon);
+        assert_eq!(months.len(), 2);
+        assert_eq!(months[0].start.to_string(), "2026-07-01");
+        assert_eq!(months[0].end.to_string(), "2026-07-31");
+        assert_eq!(months[0].tokens, 10);
+        assert_eq!(months[1].tokens, 50);
+    }
+
+    #[test]
+    fn api_stats_week_grouping_is_always_iso_monday() {
+        let buckets = vec![crate::codex_rpc::DailyUsageBucket {
+            start_date: "2026-08-02".to_string(),
+            tokens: 42,
+        }];
+        let monday = aggregate_api_stat_points(&buckets, ApiStatGrouping::Week, Weekday::Mon);
+        let sunday = aggregate_api_stat_points(&buckets, ApiStatGrouping::Week, Weekday::Sun);
+        assert_eq!(monday[0].start.to_string(), "2026-07-27");
+        assert_eq!(sunday[0].start.to_string(), "2026-07-27");
+    }
+
+    #[test]
+    fn api_stats_week_label_keeps_both_months() {
+        let locale = crate::locale::SystemLocale::default();
+        let formatter = DisplayFormatter::new(DisplayStyle::Classic, &locale);
+        let point = ApiStatPoint {
+            start: NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+            end: NaiveDate::from_ymd_opt(2026, 4, 5).unwrap(),
+            tokens: 42,
+            active_days: 1,
+        };
+
+        assert_eq!(
+            format_api_stat_point_label(&point, ApiStatGrouping::Week, formatter),
+            "W14 (Mar 30-Apr 5)"
+        );
+    }
+
+    #[test]
+    fn usage_week_grouping_uses_iso_week_number_and_range() {
+        let days = vec![
+            UsageDay {
+                day: "2026-04-05".to_string(),
+                input_tokens: 10,
+                cached_input_tokens: 2,
+                total_tokens: 12,
+                agent_time_ms: 100,
+                agent_runs: 1,
+            },
+            UsageDay {
+                day: "2026-04-06".to_string(),
+                input_tokens: 20,
+                cached_input_tokens: 3,
+                total_tokens: 24,
+                agent_time_ms: 200,
+                agent_runs: 2,
+            },
+        ];
+        let grouped = aggregate_usage_days(&days, ChartRange::Week);
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].day, "2026-03-30");
+        assert_eq!(grouped[1].day, "2026-04-06");
+
+        let locale = crate::locale::SystemLocale::default();
+        let formatter = DisplayFormatter::new(DisplayStyle::Classic, &locale);
+        let label = format_usage_period_label(
+            NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+            ChartRange::Week,
+            formatter,
+            false,
+        );
+        assert_eq!(label, "W14 (Mar 30-Apr 5)");
+    }
+
+    #[test]
+    fn chart_scrollbar_reserves_only_the_requested_edge() {
+        let area = Rect::new(10, 20, 40, 12);
+        assert_eq!(
+            reserve_chart_scrollbar(area, ChartScrollbarAxis::Vertical, true),
+            (Rect::new(10, 20, 38, 12), Some(Rect::new(49, 20, 1, 12)))
+        );
+        assert_eq!(
+            reserve_chart_scrollbar(area, ChartScrollbarAxis::Horizontal, true),
+            (Rect::new(10, 20, 40, 10), Some(Rect::new(10, 31, 40, 1)))
+        );
+        assert_eq!(
+            reserve_chart_scrollbar(area, ChartScrollbarAxis::Vertical, false),
+            (area, None)
+        );
+    }
+
+    #[test]
+    fn scrollbar_thumbs_use_inverted_spaces() {
+        let (horizontal_char, horizontal_style) = chart_scrollbar_cell(true);
+        assert_eq!(horizontal_char, ' ');
+        assert_eq!(horizontal_style.bg, Some(Color::White));
+
+        let (vertical_char, vertical_style) = chart_scrollbar_cell(true);
+        assert_eq!(vertical_char, ' ');
+        assert_eq!(vertical_style.bg, Some(Color::White));
+
+        let (track_char, track_style) = chart_scrollbar_cell(false);
+        assert_eq!(track_char, '.');
+        assert_eq!(track_style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn vertical_bar_capacity_prefers_wider_columns() {
+        assert_eq!(preferred_vertical_bar_width(40), 1);
+        assert_eq!(preferred_vertical_bar_width(80), 2);
+        assert_eq!(preferred_vertical_bar_width(160), 3);
+        assert_eq!(vertical_bar_capacity(40), 20);
+        assert_eq!(vertical_bar_capacity(80), 27);
+        assert_eq!(vertical_bar_capacity(160), 40);
+        assert_eq!(compute_bar_layout(Rect::new(0, 0, 160, 10), 40), (3, 1));
     }
 
     #[test]

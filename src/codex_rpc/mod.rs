@@ -79,6 +79,28 @@ pub struct AccountRateLimits {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountUsageSummary {
+    pub lifetime_tokens: Option<u64>,
+    pub peak_daily_tokens: Option<u64>,
+    pub longest_running_turn_sec: Option<u64>,
+    pub current_streak_days: Option<u64>,
+    pub longest_streak_days: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DailyUsageBucket {
+    pub start_date: String,
+    pub tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountUsage {
+    pub summary: AccountUsageSummary,
+    /// `None` means the backend did not return the optional daily activity series.
+    pub daily_usage_buckets: Option<Vec<DailyUsageBucket>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppServerCommand {
     program: PathBuf,
     args: Vec<String>,
@@ -356,6 +378,17 @@ impl CodexRpc {
 
         let result = value.get("result").cloned().unwrap_or(Value::Null);
         parse_account_rate_limits_result(&result)
+    }
+
+    pub async fn read_account_usage(&self) -> Result<AccountUsage> {
+        let value = self.send_request("account/usage/read", Value::Null).await?;
+
+        if let Some(err) = value.get("error") {
+            return Err(anyhow!("account/usage/read error: {err}"));
+        }
+
+        let result = value.get("result").cloned().unwrap_or(Value::Null);
+        parse_account_usage_result(&result)
     }
 
     pub async fn recv_notification(&self) -> Option<Value> {
@@ -636,6 +669,53 @@ fn parse_account_rate_limits_result(result: &Value) -> Result<AccountRateLimits>
     Ok(limits)
 }
 
+fn parse_account_usage_result(result: &Value) -> Result<AccountUsage> {
+    let result = result
+        .as_object()
+        .ok_or_else(|| anyhow!("account usage result missing"))?;
+    let summary = result.get("summary").and_then(Value::as_object);
+    let read_summary_u64 = |camel: &str, snake: &str| {
+        summary
+            .and_then(|value| value.get(camel).or_else(|| value.get(snake)))
+            .and_then(as_u64_maybe_float)
+    };
+
+    let mut daily_usage_buckets = result
+        .get("dailyUsageBuckets")
+        .or_else(|| result.get("daily_usage_buckets"))
+        .and_then(Value::as_array)
+        .map(|buckets| {
+            buckets
+                .iter()
+                .filter_map(parse_daily_usage_bucket)
+                .collect::<Vec<_>>()
+        });
+    if let Some(buckets) = daily_usage_buckets.as_mut() {
+        buckets.sort_by(|left, right| left.start_date.cmp(&right.start_date));
+    }
+
+    Ok(AccountUsage {
+        summary: AccountUsageSummary {
+            lifetime_tokens: read_summary_u64("lifetimeTokens", "lifetime_tokens"),
+            peak_daily_tokens: read_summary_u64("peakDailyTokens", "peak_daily_tokens"),
+            longest_running_turn_sec: read_summary_u64(
+                "longestRunningTurnSec",
+                "longest_running_turn_sec",
+            ),
+            current_streak_days: read_summary_u64("currentStreakDays", "current_streak_days"),
+            longest_streak_days: read_summary_u64("longestStreakDays", "longest_streak_days"),
+        },
+        daily_usage_buckets,
+    })
+}
+
+fn parse_daily_usage_bucket(value: &Value) -> Option<DailyUsageBucket> {
+    let value = value.as_object()?;
+    let start_date = read_string(value.get("startDate").or_else(|| value.get("start_date")))?;
+    let tokens = value.get("tokens").and_then(as_u64_maybe_float)?;
+    Some(DailyUsageBucket { start_date, tokens })
+}
+
 fn parse_rate_limits(value: &Value) -> Result<AccountRateLimits> {
     let snapshot =
         parse_rate_limit_snapshot(value).ok_or_else(|| anyhow!("rate limits missing"))?;
@@ -785,6 +865,19 @@ fn as_i64_maybe_float(value: &Value) -> Option<i64> {
         .or_else(|| value.as_str().and_then(|s| s.parse::<i64>().ok()))
 }
 
+fn as_u64_maybe_float(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|number| u64::try_from(number).ok()))
+        .or_else(|| value.as_str().and_then(|number| number.parse::<u64>().ok()))
+        .or_else(|| {
+            value.as_f64().and_then(|number| {
+                (number.is_finite() && number >= 0.0 && number <= u64::MAX as f64)
+                    .then(|| number.round() as u64)
+            })
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -889,6 +982,50 @@ mod tests {
             limits.buckets[1].limit_name.as_deref(),
             Some("GPT-5.3-Codex-Spark")
         );
+    }
+
+    #[test]
+    fn parse_account_usage_result_accepts_summary_and_sorts_daily_buckets() {
+        let value = json!({
+            "summary": {
+                "lifetimeTokens": 8_206_591_409_u64,
+                "peakDailyTokens": 773_124_581_u64,
+                "longestRunningTurnSec": 42_168,
+                "currentStreakDays": 2,
+                "longestStreakDays": 21
+            },
+            "dailyUsageBuckets": [
+                { "startDate": "2026-07-23", "tokens": 97_465_847 },
+                { "startDate": "2026-07-22", "tokens": 215_392_194 }
+            ]
+        });
+
+        let usage = parse_account_usage_result(&value).expect("parse account usage");
+        assert_eq!(usage.summary.lifetime_tokens, Some(8_206_591_409));
+        assert_eq!(usage.summary.peak_daily_tokens, Some(773_124_581));
+        assert_eq!(usage.summary.longest_running_turn_sec, Some(42_168));
+        assert_eq!(usage.summary.current_streak_days, Some(2));
+        assert_eq!(usage.summary.longest_streak_days, Some(21));
+        let buckets = usage.daily_usage_buckets.expect("daily buckets");
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].start_date, "2026-07-22");
+        assert_eq!(buckets[1].tokens, 97_465_847);
+    }
+
+    #[test]
+    fn parse_account_usage_result_preserves_nullable_optional_fields() {
+        let value = json!({
+            "summary": {
+                "lifetimeTokens": null,
+                "peak_daily_tokens": 1234
+            },
+            "dailyUsageBuckets": null
+        });
+
+        let usage = parse_account_usage_result(&value).expect("parse account usage");
+        assert_eq!(usage.summary.lifetime_tokens, None);
+        assert_eq!(usage.summary.peak_daily_tokens, Some(1234));
+        assert_eq!(usage.daily_usage_buckets, None);
     }
 
     #[test]

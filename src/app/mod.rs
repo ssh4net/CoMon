@@ -1,7 +1,7 @@
-use crate::codex_rpc::{AccountRateLimits, CodexRpc};
+use crate::codex_rpc::{AccountRateLimits, AccountUsage, CodexRpc};
 use crate::locale::{DisplayFormatter, DisplayStyle, SystemLocale};
 use crate::read;
-use crate::usage::{ChartRange, LocalUsageSnapshot, UsageMetric};
+use crate::usage::{ChartRange, LocalUsageSnapshot, UsageMetric, UsageZone};
 use anyhow::{anyhow, Context, Result};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::backend::CrosstermBackend;
@@ -46,12 +46,42 @@ pub(crate) enum ChartOrientation {
     Horizontal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApiStatGrouping {
+    Day,
+    Week,
+    Month,
+}
+
+impl ApiStatGrouping {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Day => Self::Week,
+            Self::Week => Self::Month,
+            Self::Month => Self::Day,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApiStatGraph {
+    Bars,
+    Heat,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum UsageCommand {
     RefreshAll,
     ToggleMetric,
     ToggleRange,
+    ToggleZone,
     ToggleOrientation,
+    ScrollOlder,
+    ScrollNewer,
+    PageOlder,
+    PageNewer,
+    ScrollOldest,
+    ScrollNewest,
     ToggleHelp,
     ConfirmContinue,
 }
@@ -60,13 +90,15 @@ enum UsageCommand {
 enum AppEvent {
     UsageUpdated(Result<LocalUsageSnapshot>),
     LimitsUpdated(Result<AccountRateLimits>),
-    LimitsUnavailable { message: String, is_error: bool },
+    AccountUsageUpdated(Result<AccountUsage>),
+    AccountApiUnavailable { message: String, is_error: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ActiveScreen {
     Usage,
     Activity,
+    ApiStat,
     LimitResets,
     Read,
 }
@@ -77,7 +109,20 @@ pub(crate) enum UiClickAction {
     SetDisplayStyle(DisplayStyle),
     SetMetric(UsageMetric),
     SetRange(ChartRange),
+    SetUsageZone(UsageZone),
     SetOrientation(ChartOrientation),
+    SetApiStatGrouping(ApiStatGrouping),
+    SetApiStatGraph(ApiStatGraph),
+    SetApiStatOrientation(ChartOrientation),
+    ScrollUsageOlder,
+    ScrollUsageNewer,
+    SetUsageScrollOffset(usize),
+    ScrollApiStatOlder,
+    ScrollApiStatNewer,
+    SetApiStatScrollOffset(usize),
+    ScrollActivityOlder,
+    ScrollActivityNewer,
+    SetActivityScrollOffset(usize),
     DecreaseProjects,
     IncreaseProjects,
     PromptQuit,
@@ -116,6 +161,12 @@ enum ActivityCommand {
     ToggleMetric,
     IncreaseProjects,
     DecreaseProjects,
+    ScrollOlder,
+    ScrollNewer,
+    PageOlder,
+    PageNewer,
+    ScrollOldest,
+    ScrollNewest,
     ToggleHelp,
 }
 
@@ -125,10 +176,26 @@ enum LimitResetCommand {
     ToggleHelp,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ApiStatCommand {
+    Refresh,
+    ToggleGrouping,
+    ToggleGraph,
+    ToggleOrientation,
+    ScrollOlder,
+    ScrollNewer,
+    PageOlder,
+    PageNewer,
+    ScrollOldest,
+    ScrollNewest,
+    ToggleHelp,
+}
+
 fn next_active_screen(screen: ActiveScreen) -> ActiveScreen {
     match screen {
         ActiveScreen::Usage => ActiveScreen::Activity,
-        ActiveScreen::Activity => ActiveScreen::LimitResets,
+        ActiveScreen::Activity => ActiveScreen::ApiStat,
+        ActiveScreen::ApiStat => ActiveScreen::LimitResets,
         ActiveScreen::LimitResets => ActiveScreen::Read,
         ActiveScreen::Read => ActiveScreen::Usage,
     }
@@ -139,8 +206,24 @@ pub(crate) struct AppState {
     pub(crate) active_screen: ActiveScreen,
     pub(crate) metric: UsageMetric,
     pub(crate) range: ChartRange,
+    pub(crate) usage_zone: UsageZone,
     pub(crate) orientation: ChartOrientation,
+    pub(crate) api_stat_grouping: ApiStatGrouping,
+    pub(crate) api_stat_graph: ApiStatGraph,
+    pub(crate) api_stat_orientation: ChartOrientation,
+    pub(crate) usage_period_offset: usize,
+    pub(crate) usage_visible_periods: usize,
+    pub(crate) usage_total_periods: usize,
+    pub(crate) usage_scroll_area: Option<Rect>,
+    pub(crate) api_stat_period_offset: usize,
+    pub(crate) api_stat_visible_periods: usize,
+    pub(crate) api_stat_total_periods: usize,
+    pub(crate) api_stat_scroll_area: Option<Rect>,
     pub(crate) activity_project_limit: usize,
+    pub(crate) activity_week_offset: usize,
+    pub(crate) activity_visible_weeks: usize,
+    pub(crate) activity_total_weeks: usize,
+    pub(crate) activity_scroll_area: Option<Rect>,
     pub(crate) show_help: bool,
     pub(crate) workspace_path: Option<std::path::PathBuf>,
     pub(crate) no_sessions_confirm_open: bool,
@@ -163,6 +246,12 @@ pub(crate) struct AppState {
     pub(crate) limits_error: Option<String>,
     pub(crate) limits_notice: Option<String>,
     pub(crate) limits_enabled: bool,
+
+    pub(crate) account_usage: Option<AccountUsage>,
+    pub(crate) account_usage_updated_at: Option<Instant>,
+    pub(crate) account_usage_error: Option<String>,
+    pub(crate) account_usage_notice: Option<String>,
+    pub(crate) account_usage_enabled: bool,
     pub(crate) read_sessions_dir: PathBuf,
     pub(crate) read_browser: crate::read::tui::BrowserState,
 }
@@ -184,7 +273,11 @@ enum LimitsWake {
 struct PersistedUiState {
     metric: UsageMetric,
     range: ChartRange,
+    usage_zone: UsageZone,
     orientation: ChartOrientation,
+    api_stat_grouping: ApiStatGrouping,
+    api_stat_graph: ApiStatGraph,
+    api_stat_orientation: ChartOrientation,
     activity_project_limit: usize,
     workspace_path: Option<PathBuf>,
     no_sessions_confirm_dismissed: bool,
@@ -196,8 +289,12 @@ impl PersistedUiState {
     fn default_for_workspace(workspace_path: Option<PathBuf>) -> Self {
         Self {
             metric: UsageMetric::Tokens,
-            range: ChartRange::Week,
+            range: ChartRange::Day,
+            usage_zone: UsageZone::Local,
             orientation: ChartOrientation::Horizontal,
+            api_stat_grouping: ApiStatGrouping::Day,
+            api_stat_graph: ApiStatGraph::Bars,
+            api_stat_orientation: ChartOrientation::Vertical,
             activity_project_limit: DEFAULT_ACTIVITY_PROJECT_LIMIT,
             workspace_path,
             no_sessions_confirm_dismissed: false,
@@ -210,7 +307,11 @@ impl PersistedUiState {
         Self {
             metric: state.metric,
             range: state.range,
+            usage_zone: state.usage_zone,
             orientation: state.orientation,
+            api_stat_grouping: state.api_stat_grouping,
+            api_stat_graph: state.api_stat_graph,
+            api_stat_orientation: state.api_stat_orientation,
             activity_project_limit: state.activity_project_limit,
             workspace_path: state.workspace_path.clone(),
             no_sessions_confirm_dismissed: state.no_sessions_confirm_dismissed,
@@ -243,7 +344,11 @@ impl Default for StateStore {
 struct StoredGlobalState {
     metric: Option<String>,
     range: Option<String>,
+    usage_zone: Option<String>,
     orientation: Option<String>,
+    api_stat_grouping: Option<String>,
+    api_stat_graph: Option<String>,
+    api_stat_orientation: Option<String>,
     activity_project_limit: Option<usize>,
     display_style: Option<String>,
     #[serde(default)]
@@ -301,37 +406,25 @@ async fn run_inner(
         let mut usage_refresh_rx = usage_refresh_rx;
         let mut shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(refresh);
-            // Immediate first run
-            let first = tokio::task::spawn_blocking({
-                let codex_home = codex_home.clone();
-                let workspace_path = workspace_path.clone();
-                let scan_cache_db_path = scan_cache_db_path.clone();
-                move || {
-                    crate::usage::compute_snapshot(
-                        usage_days,
-                        &codex_home,
-                        workspace_path.as_deref(),
-                        usage_scan_limits,
-                        Some(scan_cache_db_path.as_path()),
-                    )
-                }
-            })
-            .await
-            .unwrap_or_else(|err| Err(anyhow!("usage snapshot task failed: {err}")));
-            if evt_tx.send(AppEvent::UsageUpdated(first)).await.is_err() {
-                return;
-            }
-            // Consume the immediate first tick so the next one waits `refresh`.
-            interval.tick().await;
+            let mut first_run = true;
+            let mut rapid_catch_up = false;
+            let mut previous_scan_progress: Option<(usize, u64)> = None;
             loop {
-                tokio::select! {
-                    _ = shutdown_rx.changed() => break,
-                    _ = interval.tick() => {}
-                    recv = usage_refresh_rx.recv() => {
-                        if recv.is_none() { break; }
+                if !first_run {
+                    let wait = if rapid_catch_up {
+                        Duration::from_millis(75)
+                    } else {
+                        refresh
+                    };
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => break,
+                        _ = tokio::time::sleep(wait) => {}
+                        recv = usage_refresh_rx.recv() => {
+                            if recv.is_none() { break; }
+                        }
                     }
                 }
+                first_run = false;
                 let snapshot = tokio::task::spawn_blocking({
                     let codex_home = codex_home.clone();
                     let workspace_path = workspace_path.clone();
@@ -348,6 +441,24 @@ async fn run_inner(
                 })
                 .await
                 .unwrap_or_else(|err| Err(anyhow!("usage snapshot task failed: {err}")));
+
+                // Keep filling a fresh/incomplete cache without waiting for the normal
+                // five-minute refresh. Stop the rapid loop as soon as a pass makes no
+                // file-level progress; an unresolved fork must not cause a CPU spin.
+                rapid_catch_up = snapshot.as_ref().is_ok_and(|current| {
+                    should_continue_scan_catch_up(
+                        current.scan_pending_files,
+                        current.scan_indexed_files,
+                        current.scan_processed_bytes,
+                        previous_scan_progress,
+                    )
+                });
+                if let Ok(current) = snapshot.as_ref() {
+                    previous_scan_progress =
+                        Some((current.scan_indexed_files, current.scan_processed_bytes));
+                } else {
+                    previous_scan_progress = None;
+                }
                 if evt_tx.send(AppEvent::UsageUpdated(snapshot)).await.is_err() {
                     break;
                 }
@@ -368,8 +479,8 @@ async fn run_inner(
         tokio::spawn(async move {
             if live_limits_mode == LiveLimitsMode::Off {
                 let _ = evt_tx
-                    .send(AppEvent::LimitsUnavailable {
-                        message: "Live limits disabled (--live-limits off).".to_string(),
+                    .send(AppEvent::AccountApiUnavailable {
+                        message: "Codex account API disabled (--live-limits off).".to_string(),
                         is_error: false,
                     })
                     .await;
@@ -380,7 +491,7 @@ async fn run_inner(
                 crate::codex_rpc::resolve_app_server_command(codex_bin, app_server_bin)
             else {
                 let _ = evt_tx
-                    .send(AppEvent::LimitsUnavailable {
+                    .send(AppEvent::AccountApiUnavailable {
                         message: missing_app_server_message().to_string(),
                         is_error: live_limits_mode == LiveLimitsMode::On,
                     })
@@ -393,7 +504,7 @@ async fn run_inner(
                 Ok(rpc) => rpc,
                 Err(err) => {
                     let _ = evt_tx
-                        .send(AppEvent::LimitsUnavailable {
+                        .send(AppEvent::AccountApiUnavailable {
                             message: err.to_string(),
                             is_error: live_limits_mode == LiveLimitsMode::On
                                 || app_server_is_explicit,
@@ -407,6 +518,15 @@ async fn run_inner(
             // Immediate first poll
             let first = rpc.read_account_rate_limits().await;
             if evt_tx.send(AppEvent::LimitsUpdated(first)).await.is_err() {
+                rpc.kill().await;
+                return;
+            }
+            let first = rpc.read_account_usage().await;
+            if evt_tx
+                .send(AppEvent::AccountUsageUpdated(first))
+                .await
+                .is_err()
+            {
                 rpc.kill().await;
                 return;
             }
@@ -444,6 +564,15 @@ async fn run_inner(
                 }
                 let res = rpc.read_account_rate_limits().await;
                 if evt_tx.send(AppEvent::LimitsUpdated(res)).await.is_err() {
+                    rpc.kill().await;
+                    break;
+                }
+                let res = rpc.read_account_usage().await;
+                if evt_tx
+                    .send(AppEvent::AccountUsageUpdated(res))
+                    .await
+                    .is_err()
+                {
                     rpc.kill().await;
                     break;
                 }
@@ -490,8 +619,24 @@ async fn run_inner(
         },
         metric: restored_ui_state.metric,
         range: restored_ui_state.range,
+        usage_zone: restored_ui_state.usage_zone,
         orientation: restored_ui_state.orientation,
+        api_stat_grouping: restored_ui_state.api_stat_grouping,
+        api_stat_graph: restored_ui_state.api_stat_graph,
+        api_stat_orientation: restored_ui_state.api_stat_orientation,
+        usage_period_offset: 0,
+        usage_visible_periods: 0,
+        usage_total_periods: 0,
+        usage_scroll_area: None,
+        api_stat_period_offset: 0,
+        api_stat_visible_periods: 0,
+        api_stat_total_periods: 0,
+        api_stat_scroll_area: None,
         activity_project_limit: restored_ui_state.activity_project_limit,
+        activity_week_offset: 0,
+        activity_visible_weeks: 0,
+        activity_total_weeks: crate::usage::ACTIVITY_TIMELINE_WEEKS,
+        activity_scroll_area: None,
         show_help: false,
         workspace_path: restored_ui_state.workspace_path.clone(),
         no_sessions_confirm_open: false,
@@ -512,6 +657,11 @@ async fn run_inner(
         limits_error: None,
         limits_notice: None,
         limits_enabled: true,
+        account_usage: None,
+        account_usage_updated_at: None,
+        account_usage_error: None,
+        account_usage_notice: None,
+        account_usage_enabled: true,
         read_sessions_dir: config.read_sessions_dir.clone(),
         read_browser,
     };
@@ -582,6 +732,16 @@ async fn run_inner(
     let _ = save_persisted_ui_state(&config.comon_home, &final_ui_state);
 
     Ok(())
+}
+
+fn should_continue_scan_catch_up(
+    pending_files: usize,
+    indexed_files: usize,
+    processed_bytes: u64,
+    previous: Option<(usize, u64)>,
+) -> bool {
+    pending_files > 0
+        && previous.is_none_or(|(files, bytes)| indexed_files > files || processed_bytes > bytes)
 }
 
 fn clear_scan_cache_files(path: &Path) -> Result<()> {
@@ -719,7 +879,59 @@ fn handle_input_event(
         if state.show_help || state.no_sessions_confirm_open {
             return Ok(InputOutcome::Continue(false));
         }
-        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+        let wheel_direction = match mouse.kind {
+            MouseEventKind::ScrollUp => Some(true),
+            MouseEventKind::ScrollDown => Some(false),
+            _ => None,
+        };
+        if let Some(older) = wheel_direction {
+            let changed = match state.active_screen {
+                ActiveScreen::Usage
+                    if state
+                        .usage_scroll_area
+                        .is_some_and(|area| rect_contains(area, mouse.column, mouse.row)) =>
+                {
+                    let command = if older {
+                        UsageCommand::ScrollOlder
+                    } else {
+                        UsageCommand::ScrollNewer
+                    };
+                    handle_usage_command(state, command, usage_refresh_tx, limits_refresh_tx)
+                }
+                ActiveScreen::Activity
+                    if state
+                        .activity_scroll_area
+                        .is_some_and(|area| rect_contains(area, mouse.column, mouse.row)) =>
+                {
+                    let command = if older {
+                        ActivityCommand::ScrollOlder
+                    } else {
+                        ActivityCommand::ScrollNewer
+                    };
+                    handle_activity_command(state, command, usage_refresh_tx, limits_refresh_tx)
+                }
+                ActiveScreen::ApiStat
+                    if state
+                        .api_stat_scroll_area
+                        .is_some_and(|area| rect_contains(area, mouse.column, mouse.row)) =>
+                {
+                    let command = if older {
+                        ApiStatCommand::ScrollOlder
+                    } else {
+                        ApiStatCommand::ScrollNewer
+                    };
+                    handle_api_stat_command(state, command, limits_refresh_tx)
+                }
+                _ => false,
+            };
+            if changed {
+                return Ok(InputOutcome::Continue(true));
+            }
+        }
+        if matches!(
+            mouse.kind,
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)
+        ) {
             if let Some(action) = ui_click_action_at(&state.ui_hit_targets, mouse.column, mouse.row)
             {
                 if action == UiClickAction::ConfirmQuit
@@ -793,6 +1005,13 @@ fn handle_input_event(
                 handle_activity_command(state, command, usage_refresh_tx, limits_refresh_tx);
             Ok(InputOutcome::Continue(dirty))
         }
+        ActiveScreen::ApiStat => {
+            let Some(command) = map_event_to_api_stat_cmd(event) else {
+                return Ok(InputOutcome::Continue(false));
+            };
+            let dirty = handle_api_stat_command(state, command, limits_refresh_tx);
+            Ok(InputOutcome::Continue(dirty))
+        }
         ActiveScreen::LimitResets => {
             let Some(command) = map_event_to_limit_reset_cmd(event) else {
                 return Ok(InputOutcome::Continue(false));
@@ -812,6 +1031,13 @@ fn ui_click_action_at(targets: &[UiHitTarget], column: u16, row: u16) -> Option<
         .iter()
         .find(|target| target.contains(column, row))
         .map(|target| target.action)
+}
+
+fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
 }
 
 fn apply_ui_click_action(state: &mut AppState, action: UiClickAction) -> bool {
@@ -834,11 +1060,85 @@ fn apply_ui_click_action(state: &mut AppState, action: UiClickAction) -> bool {
         UiClickAction::SetRange(range) => {
             let changed = state.range != range;
             state.range = range;
+            if changed {
+                state.usage_period_offset = 0;
+            }
+            changed
+        }
+        UiClickAction::SetUsageZone(zone) => {
+            let changed = state.usage_zone != zone;
+            state.usage_zone = zone;
+            if changed {
+                state.usage_period_offset = 0;
+            }
             changed
         }
         UiClickAction::SetOrientation(orientation) => {
             let changed = state.orientation != orientation;
             state.orientation = orientation;
+            if changed {
+                state.usage_period_offset = 0;
+            }
+            changed
+        }
+        UiClickAction::SetApiStatGrouping(grouping) => {
+            let changed = state.api_stat_grouping != grouping;
+            state.api_stat_grouping = grouping;
+            if changed {
+                state.api_stat_period_offset = 0;
+            }
+            changed
+        }
+        UiClickAction::SetApiStatGraph(graph) => {
+            let changed = state.api_stat_graph != graph;
+            state.api_stat_graph = graph;
+            if changed {
+                state.api_stat_period_offset = 0;
+            }
+            changed
+        }
+        UiClickAction::SetApiStatOrientation(orientation) => {
+            let changed = state.api_stat_orientation != orientation;
+            state.api_stat_orientation = orientation;
+            if changed {
+                state.api_stat_period_offset = 0;
+            }
+            changed
+        }
+        UiClickAction::ScrollUsageOlder => scroll_usage_periods(state, 1, true),
+        UiClickAction::ScrollUsageNewer => scroll_usage_periods(state, 1, false),
+        UiClickAction::SetUsageScrollOffset(offset) => {
+            let next = offset.min(
+                state
+                    .usage_total_periods
+                    .saturating_sub(state.usage_visible_periods),
+            );
+            let changed = state.usage_period_offset != next;
+            state.usage_period_offset = next;
+            changed
+        }
+        UiClickAction::ScrollApiStatOlder => scroll_api_stat_periods(state, 1, true),
+        UiClickAction::ScrollApiStatNewer => scroll_api_stat_periods(state, 1, false),
+        UiClickAction::SetApiStatScrollOffset(offset) => {
+            let next = offset.min(
+                state
+                    .api_stat_total_periods
+                    .saturating_sub(state.api_stat_visible_periods),
+            );
+            let changed = state.api_stat_period_offset != next;
+            state.api_stat_period_offset = next;
+            changed
+        }
+        UiClickAction::ScrollActivityOlder => scroll_activity_weeks(state, 1, true),
+        UiClickAction::ScrollActivityNewer => scroll_activity_weeks(state, 1, false),
+        UiClickAction::SetActivityScrollOffset(offset) => {
+            let next = offset.min(
+                state
+                    .activity_total_weeks
+                    .saturating_sub(state.activity_visible_weeks),
+            );
+            let changed = state.activity_week_offset != next;
+            state.activity_week_offset = next;
             changed
         }
         UiClickAction::DecreaseProjects => {
@@ -903,8 +1203,20 @@ fn map_event_to_usage_cmd(event: Event) -> Option<UsageCommand> {
             match (key.code, key.modifiers) {
                 (KeyCode::Char('r'), _) | (KeyCode::F(5), _) => Some(UsageCommand::RefreshAll),
                 (KeyCode::Tab, _) => Some(UsageCommand::ToggleMetric),
-                (KeyCode::Char('w'), _) => Some(UsageCommand::ToggleRange),
+                (KeyCode::Char('g'), _)
+                | (KeyCode::Char('G'), _)
+                | (KeyCode::Char('w'), _)
+                | (KeyCode::Char('W'), _) => Some(UsageCommand::ToggleRange),
+                (KeyCode::Char('z'), _) | (KeyCode::Char('Z'), _) | (KeyCode::F(6), _) => {
+                    Some(UsageCommand::ToggleZone)
+                }
                 (KeyCode::Char('f'), _) => Some(UsageCommand::ToggleOrientation),
+                (KeyCode::Left, _) | (KeyCode::Up, _) => Some(UsageCommand::ScrollOlder),
+                (KeyCode::Right, _) | (KeyCode::Down, _) => Some(UsageCommand::ScrollNewer),
+                (KeyCode::PageUp, _) => Some(UsageCommand::PageOlder),
+                (KeyCode::PageDown, _) => Some(UsageCommand::PageNewer),
+                (KeyCode::Home, _) => Some(UsageCommand::ScrollOldest),
+                (KeyCode::End, _) => Some(UsageCommand::ScrollNewest),
                 (KeyCode::Char('?'), _) => Some(UsageCommand::ToggleHelp),
                 (KeyCode::Enter, _) => Some(UsageCommand::ConfirmContinue),
                 (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
@@ -932,6 +1244,12 @@ fn map_event_to_activity_cmd(event: Event) -> Option<ActivityCommand> {
                 (KeyCode::Char('-'), _) | (KeyCode::Char('['), _) => {
                     Some(ActivityCommand::DecreaseProjects)
                 }
+                (KeyCode::Left, _) => Some(ActivityCommand::ScrollOlder),
+                (KeyCode::Right, _) => Some(ActivityCommand::ScrollNewer),
+                (KeyCode::PageUp, _) => Some(ActivityCommand::PageOlder),
+                (KeyCode::PageDown, _) => Some(ActivityCommand::PageNewer),
+                (KeyCode::Home, _) => Some(ActivityCommand::ScrollOldest),
+                (KeyCode::End, _) => Some(ActivityCommand::ScrollNewest),
                 (KeyCode::Char('?'), _) => Some(ActivityCommand::ToggleHelp),
                 _ => None,
             }
@@ -954,6 +1272,30 @@ fn map_event_to_limit_reset_cmd(event: Event) -> Option<LimitResetCommand> {
                 _ => None,
             }
         }
+        _ => None,
+    }
+}
+
+fn map_event_to_api_stat_cmd(event: Event) -> Option<ApiStatCommand> {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => match (key.code, key.modifiers) {
+            (KeyCode::Char('r'), _) | (KeyCode::F(5), _) => Some(ApiStatCommand::Refresh),
+            (KeyCode::Char('g'), _) | (KeyCode::Char('G'), _) => {
+                Some(ApiStatCommand::ToggleGrouping)
+            }
+            (KeyCode::Char('b'), _) | (KeyCode::Char('B'), _) => Some(ApiStatCommand::ToggleGraph),
+            (KeyCode::Char('f'), _) | (KeyCode::Char('F'), _) => {
+                Some(ApiStatCommand::ToggleOrientation)
+            }
+            (KeyCode::Left, _) | (KeyCode::Up, _) => Some(ApiStatCommand::ScrollOlder),
+            (KeyCode::Right, _) | (KeyCode::Down, _) => Some(ApiStatCommand::ScrollNewer),
+            (KeyCode::PageUp, _) => Some(ApiStatCommand::PageOlder),
+            (KeyCode::PageDown, _) => Some(ApiStatCommand::PageNewer),
+            (KeyCode::Home, _) => Some(ApiStatCommand::ScrollOldest),
+            (KeyCode::End, _) => Some(ApiStatCommand::ScrollNewest),
+            (KeyCode::Char('?'), _) => Some(ApiStatCommand::ToggleHelp),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -989,10 +1331,13 @@ fn handle_usage_command(
             true
         }
         UsageCommand::ToggleRange => {
-            state.range = match state.range {
-                ChartRange::Week => ChartRange::Month,
-                ChartRange::Month => ChartRange::Week,
-            };
+            state.range = state.range.toggled();
+            state.usage_period_offset = 0;
+            true
+        }
+        UsageCommand::ToggleZone => {
+            state.usage_zone = state.usage_zone.toggled();
+            state.usage_period_offset = 0;
             true
         }
         UsageCommand::ToggleOrientation => {
@@ -1000,13 +1345,63 @@ fn handle_usage_command(
                 ChartOrientation::Horizontal => ChartOrientation::Vertical,
                 ChartOrientation::Vertical => ChartOrientation::Horizontal,
             };
+            state.usage_period_offset = 0;
             true
+        }
+        UsageCommand::ScrollOlder => scroll_usage_periods(state, 1, true),
+        UsageCommand::ScrollNewer => scroll_usage_periods(state, 1, false),
+        UsageCommand::PageOlder => {
+            scroll_usage_periods(state, state.usage_visible_periods.max(1), true)
+        }
+        UsageCommand::PageNewer => {
+            scroll_usage_periods(state, state.usage_visible_periods.max(1), false)
+        }
+        UsageCommand::ScrollOldest => {
+            let next = state
+                .usage_total_periods
+                .saturating_sub(state.usage_visible_periods);
+            let changed = state.usage_period_offset != next;
+            state.usage_period_offset = next;
+            changed
+        }
+        UsageCommand::ScrollNewest => {
+            let changed = state.usage_period_offset != 0;
+            state.usage_period_offset = 0;
+            changed
         }
         UsageCommand::RefreshAll => {
             let _ = usage_refresh_tx.try_send(());
             let _ = limits_refresh_tx.try_send(());
             true
         }
+    }
+}
+
+fn scroll_usage_periods(state: &mut AppState, amount: usize, older: bool) -> bool {
+    let next = scrolled_period_offset(
+        state.usage_period_offset,
+        state.usage_total_periods,
+        state.usage_visible_periods,
+        amount,
+        older,
+    );
+    let changed = next != state.usage_period_offset;
+    state.usage_period_offset = next;
+    changed
+}
+
+fn scrolled_period_offset(
+    current: usize,
+    total: usize,
+    visible: usize,
+    amount: usize,
+    older: bool,
+) -> usize {
+    let max_offset = total.saturating_sub(visible);
+    if older {
+        current.saturating_add(amount).min(max_offset)
+    } else {
+        current.saturating_sub(amount)
     }
 }
 
@@ -1047,12 +1442,50 @@ fn handle_activity_command(
             state.activity_project_limit = next;
             changed
         }
+        ActivityCommand::ScrollOlder => scroll_activity_weeks(state, 1, true),
+        ActivityCommand::ScrollNewer => scroll_activity_weeks(state, 1, false),
+        ActivityCommand::PageOlder => {
+            scroll_activity_weeks(state, state.activity_visible_weeks.max(1), true)
+        }
+        ActivityCommand::PageNewer => {
+            scroll_activity_weeks(state, state.activity_visible_weeks.max(1), false)
+        }
+        ActivityCommand::ScrollOldest => {
+            let next = state
+                .activity_total_weeks
+                .saturating_sub(state.activity_visible_weeks);
+            let changed = next != state.activity_week_offset;
+            state.activity_week_offset = next;
+            changed
+        }
+        ActivityCommand::ScrollNewest => {
+            let changed = state.activity_week_offset != 0;
+            state.activity_week_offset = 0;
+            changed
+        }
         ActivityCommand::RefreshAll => {
             let _ = usage_refresh_tx.try_send(());
             let _ = limits_refresh_tx.try_send(());
             true
         }
     }
+}
+
+fn scroll_activity_weeks(state: &mut AppState, amount: usize, older: bool) -> bool {
+    let max_offset = state
+        .activity_total_weeks
+        .saturating_sub(state.activity_visible_weeks);
+    let next = if older {
+        state
+            .activity_week_offset
+            .saturating_add(amount)
+            .min(max_offset)
+    } else {
+        state.activity_week_offset.saturating_sub(amount)
+    };
+    let changed = next != state.activity_week_offset;
+    state.activity_week_offset = next;
+    changed
 }
 
 fn handle_limit_reset_command(
@@ -1070,6 +1503,84 @@ fn handle_limit_reset_command(
             true
         }
     }
+}
+
+fn handle_api_stat_command(
+    state: &mut AppState,
+    cmd: ApiStatCommand,
+    account_refresh_tx: &mpsc::Sender<()>,
+) -> bool {
+    match cmd {
+        ApiStatCommand::ToggleHelp => {
+            state.show_help = !state.show_help;
+            true
+        }
+        ApiStatCommand::Refresh => {
+            let _ = account_refresh_tx.try_send(());
+            true
+        }
+        ApiStatCommand::ToggleGrouping => {
+            if state.api_stat_graph == ApiStatGraph::Heat {
+                return false;
+            }
+            state.api_stat_grouping = state.api_stat_grouping.toggled();
+            state.api_stat_period_offset = 0;
+            true
+        }
+        ApiStatCommand::ToggleGraph => {
+            state.api_stat_graph = match state.api_stat_graph {
+                ApiStatGraph::Bars => ApiStatGraph::Heat,
+                ApiStatGraph::Heat => ApiStatGraph::Bars,
+            };
+            state.api_stat_period_offset = 0;
+            true
+        }
+        ApiStatCommand::ToggleOrientation => {
+            if state.api_stat_graph == ApiStatGraph::Heat {
+                return false;
+            }
+            state.api_stat_orientation = match state.api_stat_orientation {
+                ChartOrientation::Vertical => ChartOrientation::Horizontal,
+                ChartOrientation::Horizontal => ChartOrientation::Vertical,
+            };
+            state.api_stat_period_offset = 0;
+            true
+        }
+        ApiStatCommand::ScrollOlder => scroll_api_stat_periods(state, 1, true),
+        ApiStatCommand::ScrollNewer => scroll_api_stat_periods(state, 1, false),
+        ApiStatCommand::PageOlder => {
+            scroll_api_stat_periods(state, state.api_stat_visible_periods.max(1), true)
+        }
+        ApiStatCommand::PageNewer => {
+            scroll_api_stat_periods(state, state.api_stat_visible_periods.max(1), false)
+        }
+        ApiStatCommand::ScrollOldest => {
+            let next = state
+                .api_stat_total_periods
+                .saturating_sub(state.api_stat_visible_periods);
+            let changed = state.api_stat_period_offset != next;
+            state.api_stat_period_offset = next;
+            changed
+        }
+        ApiStatCommand::ScrollNewest => {
+            let changed = state.api_stat_period_offset != 0;
+            state.api_stat_period_offset = 0;
+            changed
+        }
+    }
+}
+
+fn scroll_api_stat_periods(state: &mut AppState, amount: usize, older: bool) -> bool {
+    let next = scrolled_period_offset(
+        state.api_stat_period_offset,
+        state.api_stat_total_periods,
+        state.api_stat_visible_periods,
+        amount,
+        older,
+    );
+    let changed = next != state.api_stat_period_offset;
+    state.api_stat_period_offset = next;
+    changed
 }
 
 fn handle_app_event(state: &mut AppState, evt: AppEvent) -> bool {
@@ -1093,14 +1604,19 @@ fn handle_app_event(state: &mut AppState, evt: AppEvent) -> bool {
             }
             true
         }
-        AppEvent::LimitsUnavailable { message, is_error } => {
+        AppEvent::AccountApiUnavailable { message, is_error } => {
             state.limits_enabled = false;
+            state.account_usage_enabled = false;
             if is_error {
-                state.limits_error = Some(message);
+                state.limits_error = Some(message.clone());
                 state.limits_notice = None;
+                state.account_usage_error = Some(message);
+                state.account_usage_notice = None;
             } else {
                 state.limits_error = None;
-                state.limits_notice = Some(message);
+                state.limits_notice = Some(message.clone());
+                state.account_usage_error = None;
+                state.account_usage_notice = Some(message);
             }
             true
         }
@@ -1115,6 +1631,21 @@ fn handle_app_event(state: &mut AppState, evt: AppEvent) -> bool {
                 }
                 Err(err) => {
                     state.limits_error = Some(err.to_string());
+                }
+            }
+            true
+        }
+        AppEvent::AccountUsageUpdated(res) => {
+            match res {
+                Ok(usage) => {
+                    state.account_usage_enabled = true;
+                    state.account_usage = Some(usage);
+                    state.account_usage_error = None;
+                    state.account_usage_notice = None;
+                    state.account_usage_updated_at = Some(Instant::now());
+                }
+                Err(err) => {
+                    state.account_usage_error = Some(err.to_string());
                 }
             }
             true
@@ -1144,9 +1675,29 @@ fn load_persisted_ui_state(
             state.range = range;
         }
     }
+    if let Some(zone_text) = store.global.usage_zone.as_deref() {
+        if let Some(zone) = usage_zone_from_store(zone_text) {
+            state.usage_zone = zone;
+        }
+    }
     if let Some(orientation_text) = store.global.orientation.as_deref() {
         if let Some(orientation) = chart_orientation_from_store(orientation_text) {
             state.orientation = orientation;
+        }
+    }
+    if let Some(grouping_text) = store.global.api_stat_grouping.as_deref() {
+        if let Some(grouping) = api_stat_grouping_from_store(grouping_text) {
+            state.api_stat_grouping = grouping;
+        }
+    }
+    if let Some(graph_text) = store.global.api_stat_graph.as_deref() {
+        if let Some(graph) = api_stat_graph_from_store(graph_text) {
+            state.api_stat_graph = graph;
+        }
+    }
+    if let Some(orientation_text) = store.global.api_stat_orientation.as_deref() {
+        if let Some(orientation) = chart_orientation_from_store(orientation_text) {
+            state.api_stat_orientation = orientation;
         }
     }
     if let Some(limit) = store.global.activity_project_limit {
@@ -1180,7 +1731,13 @@ fn save_persisted_ui_state(comon_home: &Path, state: &PersistedUiState) -> Resul
 
     store.global.metric = Some(usage_metric_to_store(state.metric).to_string());
     store.global.range = Some(chart_range_to_store(state.range).to_string());
+    store.global.usage_zone = Some(usage_zone_to_store(state.usage_zone).to_string());
     store.global.orientation = Some(chart_orientation_to_store(state.orientation).to_string());
+    store.global.api_stat_grouping =
+        Some(api_stat_grouping_to_store(state.api_stat_grouping).to_string());
+    store.global.api_stat_graph = Some(api_stat_graph_to_store(state.api_stat_graph).to_string());
+    store.global.api_stat_orientation =
+        Some(chart_orientation_to_store(state.api_stat_orientation).to_string());
     store.global.activity_project_limit = Some(
         state
             .activity_project_limit
@@ -1251,6 +1808,7 @@ fn usage_metric_from_store(value: &str) -> Option<UsageMetric> {
 
 fn chart_range_to_store(range: ChartRange) -> &'static str {
     match range {
+        ChartRange::Day => "day",
         ChartRange::Week => "week",
         ChartRange::Month => "month",
     }
@@ -1258,8 +1816,24 @@ fn chart_range_to_store(range: ChartRange) -> &'static str {
 
 fn chart_range_from_store(value: &str) -> Option<ChartRange> {
     match value {
+        "day" => Some(ChartRange::Day),
         "week" => Some(ChartRange::Week),
         "month" => Some(ChartRange::Month),
+        _ => None,
+    }
+}
+
+fn usage_zone_to_store(zone: UsageZone) -> &'static str {
+    match zone {
+        UsageZone::Local => "local",
+        UsageZone::Utc => "utc",
+    }
+}
+
+fn usage_zone_from_store(value: &str) -> Option<UsageZone> {
+    match value {
+        "local" => Some(UsageZone::Local),
+        "utc" => Some(UsageZone::Utc),
         _ => None,
     }
 }
@@ -1275,6 +1849,38 @@ fn chart_orientation_from_store(value: &str) -> Option<ChartOrientation> {
     match value {
         "vertical" => Some(ChartOrientation::Vertical),
         "horizontal" => Some(ChartOrientation::Horizontal),
+        _ => None,
+    }
+}
+
+fn api_stat_grouping_to_store(grouping: ApiStatGrouping) -> &'static str {
+    match grouping {
+        ApiStatGrouping::Day => "day",
+        ApiStatGrouping::Week => "week",
+        ApiStatGrouping::Month => "month",
+    }
+}
+
+fn api_stat_grouping_from_store(value: &str) -> Option<ApiStatGrouping> {
+    match value {
+        "day" => Some(ApiStatGrouping::Day),
+        "week" => Some(ApiStatGrouping::Week),
+        "month" => Some(ApiStatGrouping::Month),
+        _ => None,
+    }
+}
+
+fn api_stat_graph_to_store(graph: ApiStatGraph) -> &'static str {
+    match graph {
+        ApiStatGraph::Bars => "bars",
+        ApiStatGraph::Heat => "heat",
+    }
+}
+
+fn api_stat_graph_from_store(value: &str) -> Option<ApiStatGraph> {
+    match value {
+        "bars" => Some(ApiStatGraph::Bars),
+        "heat" => Some(ApiStatGraph::Heat),
         _ => None,
     }
 }
@@ -1298,6 +1904,11 @@ impl AppState {
 
     pub(crate) fn limits_updated_label(&self) -> Option<String> {
         let updated_at = self.limits_updated_at?;
+        Some(crate::ui::format_updated_label(updated_at))
+    }
+
+    pub(crate) fn account_usage_updated_label(&self) -> Option<String> {
+        let updated_at = self.account_usage_updated_at?;
         Some(crate::ui::format_updated_label(updated_at))
     }
 }
@@ -1328,6 +1939,39 @@ mod tests {
         assert_eq!(ui_click_action_at(&targets, 10, 7), None);
     }
 
+    #[test]
+    fn period_scrolling_clamps_at_oldest_and_newest() {
+        assert_eq!(scrolled_period_offset(0, 30, 10, 1, true), 1);
+        assert_eq!(scrolled_period_offset(19, 30, 10, 5, true), 20);
+        assert_eq!(scrolled_period_offset(3, 30, 10, 2, false), 1);
+        assert_eq!(scrolled_period_offset(1, 30, 10, 5, false), 0);
+        assert_eq!(scrolled_period_offset(4, 5, 10, 1, true), 0);
+    }
+
+    #[test]
+    fn rapid_scan_catch_up_stops_when_pending_work_cannot_advance() {
+        assert!(should_continue_scan_catch_up(4, 10, 1_000, None));
+        assert!(should_continue_scan_catch_up(
+            3,
+            11,
+            1_000,
+            Some((10, 1_000))
+        ));
+        assert!(should_continue_scan_catch_up(
+            3,
+            10,
+            1_500,
+            Some((10, 1_000))
+        ));
+        assert!(!should_continue_scan_catch_up(
+            1,
+            10,
+            1_000,
+            Some((10, 1_000))
+        ));
+        assert!(!should_continue_scan_catch_up(0, 10, 1_000, Some((9, 900))));
+    }
+
     fn make_temp_dir(prefix: &str) -> PathBuf {
         let unique = format!(
             "{}-{}-{}",
@@ -1345,13 +1989,17 @@ mod tests {
     }
 
     #[test]
-    fn screen_cycle_includes_limit_resets() {
+    fn screen_cycle_includes_api_stats_and_limit_resets() {
         assert_eq!(
             next_active_screen(ActiveScreen::Usage),
             ActiveScreen::Activity
         );
         assert_eq!(
             next_active_screen(ActiveScreen::Activity),
+            ActiveScreen::ApiStat
+        );
+        assert_eq!(
+            next_active_screen(ActiveScreen::ApiStat),
             ActiveScreen::LimitResets
         );
         assert_eq!(
@@ -1418,6 +2066,38 @@ mod tests {
         save_persisted_ui_state(&comon_home, &state).expect("save persisted ui state");
         let loaded = load_persisted_ui_state(&comon_home, None).expect("load persisted ui state");
         assert_eq!(loaded.display_style, DisplayStyle::SystemFull);
+
+        let _ = std::fs::remove_dir_all(comon_home);
+    }
+
+    #[test]
+    fn api_stat_controls_round_trip_through_state_store() {
+        let comon_home = make_temp_dir("api-stat-controls");
+        let mut state = PersistedUiState::default_for_workspace(None);
+        state.api_stat_grouping = ApiStatGrouping::Month;
+        state.api_stat_graph = ApiStatGraph::Heat;
+        state.api_stat_orientation = ChartOrientation::Horizontal;
+
+        save_persisted_ui_state(&comon_home, &state).expect("save persisted ui state");
+        let loaded = load_persisted_ui_state(&comon_home, None).expect("load persisted ui state");
+        assert_eq!(loaded.api_stat_grouping, ApiStatGrouping::Month);
+        assert_eq!(loaded.api_stat_graph, ApiStatGraph::Heat);
+        assert_eq!(loaded.api_stat_orientation, ChartOrientation::Horizontal);
+
+        let _ = std::fs::remove_dir_all(comon_home);
+    }
+
+    #[test]
+    fn usage_grouping_and_zone_round_trip_through_state_store() {
+        let comon_home = make_temp_dir("usage-zone-controls");
+        let mut state = PersistedUiState::default_for_workspace(None);
+        state.range = ChartRange::Month;
+        state.usage_zone = UsageZone::Utc;
+
+        save_persisted_ui_state(&comon_home, &state).expect("save persisted ui state");
+        let loaded = load_persisted_ui_state(&comon_home, None).expect("load persisted ui state");
+        assert_eq!(loaded.range, ChartRange::Month);
+        assert_eq!(loaded.usage_zone, UsageZone::Utc);
 
         let _ = std::fs::remove_dir_all(comon_home);
     }

@@ -1,6 +1,6 @@
 use crate::locale::{DisplayFormatter, DisplayStyle};
 use anyhow::{Context, Result};
-use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Utc, Weekday};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, TimeZone, Utc, Weekday};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -18,7 +18,7 @@ const DEFAULT_MAX_SESSION_FILES_SCANNED: usize = 10_000;
 const DEFAULT_MAX_JSONL_LINE_BYTES: usize = 512 * 1024;
 const DEFAULT_SCAN_TIME_BUDGET_MS: u64 = 1500;
 const MAX_DISTINCT_MODELS: usize = 5_000;
-const SCAN_CACHE_DB_SCHEMA_VERSION: i64 = 4;
+const SCAN_CACHE_DB_SCHEMA_VERSION: i64 = 6;
 const FORK_REPLAY_END_GAP_MS: i64 = 1_000;
 const FORK_REPLAY_NO_TOKEN_GRACE_MS: i64 = 2_000;
 pub const DEFAULT_SCAN_CACHE_MAX_ENTRIES: usize = 50_000;
@@ -59,8 +59,34 @@ pub enum UsageMetric {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChartRange {
+    Day,
     Week,
     Month,
+}
+
+impl ChartRange {
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Day => Self::Week,
+            Self::Week => Self::Month,
+            Self::Month => Self::Day,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageZone {
+    Local,
+    Utc,
+}
+
+impl UsageZone {
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Local => Self::Utc,
+            Self::Utc => Self::Local,
+        }
+    }
 }
 
 pub fn format_compact_kmb(value: u64, max_width: u16, formatter: DisplayFormatter<'_>) -> String {
@@ -201,11 +227,18 @@ pub struct LocalUsageSnapshot {
     pub days: Vec<UsageDay>,
     pub totals: UsageTotalsTokens,
     pub top_models: Vec<LocalUsageModel>,
+    pub utc_days: Vec<UsageDay>,
+    pub utc_totals: UsageTotalsTokens,
+    pub utc_top_models: Vec<LocalUsageModel>,
     pub activity_first_weekday: Weekday,
     pub project_activity: Vec<ProjectActivity>,
     // Number of session files that were identified as belonging to the selected workspace filter.
     // When no workspace filter is used, this is 0.
     pub matched_session_files: u32,
+    pub scan_total_files: usize,
+    pub scan_indexed_files: usize,
+    pub scan_pending_files: usize,
+    pub scan_processed_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -221,20 +254,33 @@ pub struct UsageTotalsView {
 }
 
 impl LocalUsageSnapshot {
-    pub fn last7_days(&self) -> Vec<UsageDay> {
-        self.days
-            .iter()
-            .rev()
-            .take(7)
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect()
+    pub fn days_for_zone(&self, zone: UsageZone) -> &[UsageDay] {
+        match zone {
+            UsageZone::Local => &self.days,
+            UsageZone::Utc => &self.utc_days,
+        }
     }
 
-    pub fn last_n_days(&self, n: usize) -> Vec<UsageDay> {
-        self.days
+    pub fn totals_for_zone(&self, zone: UsageZone) -> &UsageTotalsTokens {
+        match zone {
+            UsageZone::Local => &self.totals,
+            UsageZone::Utc => &self.utc_totals,
+        }
+    }
+
+    pub fn top_models_for_zone(&self, zone: UsageZone) -> &[LocalUsageModel] {
+        match zone {
+            UsageZone::Local => &self.top_models,
+            UsageZone::Utc => &self.utc_top_models,
+        }
+    }
+
+    pub fn last7_days_for_zone(&self, zone: UsageZone) -> Vec<UsageDay> {
+        self.last_n_days_for_zone(zone, 7)
+    }
+
+    pub fn last_n_days_for_zone(&self, zone: UsageZone, n: usize) -> Vec<UsageDay> {
+        self.days_for_zone(zone)
             .iter()
             .rev()
             .take(n)
@@ -245,21 +291,23 @@ impl LocalUsageSnapshot {
             .collect()
     }
 
-    pub fn totals_view(
+    pub fn totals_view_for_zone(
         &self,
         metric: UsageMetric,
         formatter: DisplayFormatter<'_>,
+        zone: UsageZone,
     ) -> UsageTotalsView {
-        let last7 = self.last7_days();
+        let totals = self.totals_for_zone(zone);
+        let last7 = self.last7_days_for_zone(zone);
+        let last30 = self.last_n_days_for_zone(zone, 30);
         let last7_agent_ms: i64 = last7.iter().map(|d| d.agent_time_ms).sum();
-        let last30_agent_ms: i64 = self.days.iter().map(|d| d.agent_time_ms).sum();
+        let last30_agent_ms: i64 = last30.iter().map(|d| d.agent_time_ms).sum();
         let last7_runs: i64 = last7.iter().map(|d| d.agent_runs).sum();
-        let last30_runs: i64 = self.days.iter().map(|d| d.agent_runs).sum();
+        let last30_runs: i64 = last30.iter().map(|d| d.agent_runs).sum();
 
         let (peak_day, _peak_value, peak_sub) = match metric {
             UsageMetric::Tokens => {
-                let peak = self
-                    .days
+                let peak = last30
                     .iter()
                     .max_by_key(|d| d.total_tokens)
                     .filter(|d| d.total_tokens > 0);
@@ -271,8 +319,7 @@ impl LocalUsageSnapshot {
                 (peak_day, peak_tokens, sub)
             }
             UsageMetric::Time => {
-                let peak = self
-                    .days
+                let peak = last30
                     .iter()
                     .max_by_key(|d| d.agent_time_ms)
                     .filter(|d| d.agent_time_ms > 0);
@@ -284,8 +331,7 @@ impl LocalUsageSnapshot {
                 (peak_day, peak_ms, sub)
             }
             UsageMetric::Runs => {
-                let peak = self
-                    .days
+                let peak = last30
                     .iter()
                     .max_by_key(|d| d.agent_runs)
                     .filter(|d| d.agent_runs > 0);
@@ -302,31 +348,28 @@ impl LocalUsageSnapshot {
             UsageMetric::Tokens => UsageTotalsView {
                 last7_primary_label: format!(
                     "{} tokens",
-                    format_tokens_compact(self.totals.last7_days_tokens, formatter)
+                    format_tokens_compact(totals.last7_days_tokens, formatter)
                 ),
                 last30_primary_label: format!(
                     "{} tokens",
-                    format_tokens_compact(self.totals.last30_days_tokens, formatter)
+                    format_tokens_compact(totals.last30_days_tokens, formatter)
                 ),
-                avg_primary_label: format_tokens_compact(
-                    self.totals.average_daily_tokens,
-                    formatter,
-                ),
+                avg_primary_label: format_tokens_compact(totals.average_daily_tokens, formatter),
                 cache_label: format!(
                     "{}%",
-                    formatter.format_one_decimal(self.totals.cache_hit_rate_percent)
+                    formatter.format_one_decimal(totals.cache_hit_rate_percent)
                 ),
-                total_label: format_tokens_overview(self.totals.last30_days_tokens, formatter),
+                total_label: format_tokens_overview(totals.last30_days_tokens, formatter),
                 runs_label: format!("{} runs", format_count(last7_runs, formatter)),
                 peak_day_label: self
-                    .totals
+                    .totals_for_zone(zone)
                     .peak_day
                     .as_deref()
                     .map(|day| format_day_short(day, formatter))
                     .unwrap_or(peak_day),
                 peak_sub_label: format!(
                     "{} tokens",
-                    format_tokens_compact(self.totals.peak_day_tokens, formatter)
+                    format_tokens_compact(totals.peak_day_tokens, formatter)
                 ),
             },
             UsageMetric::Time => {
@@ -383,6 +426,12 @@ struct UsageTotals {
     output: i64,
 }
 
+impl UsageTotals {
+    fn any_positive(self) -> bool {
+        self.input > 0 || self.cached > 0 || self.output > 0
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ParserState {
     #[serde(default)]
@@ -395,6 +444,12 @@ struct ParserState {
     first_session_meta_seen: bool,
     #[serde(default)]
     fork_replay: ForkReplayState,
+    #[serde(default)]
+    fork_parent_id: Option<String>,
+    #[serde(default)]
+    fork_baseline: Option<UsageTotals>,
+    #[serde(default)]
+    fork_live_started: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
@@ -442,6 +497,23 @@ struct FileScanSummary {
     fully_parsed: bool,
     daily: HashMap<String, DailyTotals>,
     model_totals_by_day: HashMap<String, HashMap<String, i64>>,
+    unresolved_fork: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ForkResolution {
+    parent_id: Option<String>,
+    baseline: Option<UsageTotals>,
+}
+
+impl ForkResolution {
+    fn is_fork(&self) -> bool {
+        self.parent_id.is_some()
+    }
+
+    fn unresolved(&self) -> bool {
+        self.is_fork() && self.baseline.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -493,13 +565,16 @@ pub fn compute_snapshot(
     let days = days.clamp(1, 90);
 
     let sessions_root = codex_home.join("sessions");
-    let chart_day_keys = make_day_keys(days);
-    let chart_day_filter: HashSet<String> = chart_day_keys.iter().cloned().collect();
+    // The configured window controls summary cards and model shares. Charts are
+    // expanded to the complete indexed history after cached rows are applied.
+    let summary_day_keys = make_day_keys_for_zone(days, UsageZone::Local);
+    let utc_summary_day_keys = make_day_keys_for_zone(days, UsageZone::Utc);
+    let summary_day_filter: HashSet<String> = summary_day_keys.iter().cloned().collect();
+    let utc_summary_day_filter: HashSet<String> = utc_summary_day_keys.iter().cloned().collect();
     let activity_first_weekday = system_first_weekday();
     let activity_day_keys = make_activity_day_keys(activity_first_weekday);
-    let activity_oldest_day = activity_day_keys.first().cloned();
     let mut scan_day_keys = activity_day_keys.clone();
-    for day_key in &chart_day_keys {
+    for day_key in &summary_day_keys {
         if !scan_day_keys.contains(day_key) {
             scan_day_keys.push(day_key.clone());
         }
@@ -508,18 +583,30 @@ pub fn compute_snapshot(
         .iter()
         .map(|key| (key.clone(), DailyTotals::default()))
         .collect();
+    let mut utc_daily: HashMap<String, DailyTotals> = utc_summary_day_keys
+        .iter()
+        .map(|key| (key.clone(), DailyTotals::default()))
+        .collect();
     let mut model_totals: HashMap<String, i64> = HashMap::new();
+    let mut utc_model_totals: HashMap<String, i64> = HashMap::new();
     let mut project_activity: HashMap<String, ProjectActivityBuilder> = HashMap::new();
 
     if !sessions_root.exists() {
         return Ok(build_snapshot(
-            chart_day_keys,
+            summary_day_keys,
             daily,
             model_totals,
+            utc_summary_day_keys,
+            utc_daily,
+            utc_model_totals,
             0,
             activity_first_weekday,
             activity_day_keys,
             project_activity,
+            0,
+            0,
+            0,
+            0,
         ));
     }
 
@@ -532,54 +619,6 @@ pub fn compute_snapshot(
             .then_with(|| a.len.cmp(&b.len))
     });
 
-    // Prefer scanning by file mtime instead of directory date: long-running sessions can live in an
-    // older day folder but still accrue usage today.
-    let cutoff_epoch_secs = if limits.full_scan {
-        None
-    } else {
-        activity_oldest_day
-            .as_deref()
-            .and_then(epoch_secs_for_local_day_start)
-            .or_else(|| {
-                SystemTime::now()
-                    .checked_sub(StdDuration::from_secs(
-                        (ACTIVITY_TIMELINE_DAYS as u64).saturating_mul(24 * 60 * 60),
-                    ))
-                    .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
-                    .map(|duration| duration.as_secs())
-            })
-    };
-
-    let force_reparse_all = limits.full_scan && limits.scan_time_budget_ms == 0;
-    let mut planned_indices: Vec<usize> = Vec::new();
-    let mut planned_total_bytes: u64 = 0;
-    let mut planned_files: usize = 0;
-    for (idx, candidate) in candidates.iter().enumerate() {
-        if let (Some(cutoff), Some(modified)) = (cutoff_epoch_secs, candidate.modified_epoch_secs) {
-            if modified < cutoff {
-                continue;
-            }
-        }
-        if limits.full_scan {
-            planned_indices.push(idx);
-            continue;
-        }
-        if planned_files >= limits.max_session_files_scanned
-            || planned_total_bytes >= limits.max_session_total_bytes
-        {
-            break;
-        }
-        let candidate_weight = candidate.len.min(limits.max_session_file_bytes.max(1));
-        if planned_files > 0
-            && planned_total_bytes.saturating_add(candidate_weight) > limits.max_session_total_bytes
-        {
-            continue;
-        }
-        planned_indices.push(idx);
-        planned_files += 1;
-        planned_total_bytes = planned_total_bytes.saturating_add(candidate_weight);
-    }
-
     let mut matched_session_files: u32 = 0;
     let mut scan_cache_db = scan_cache_db_path
         .map(open_or_init_scan_cache_db)
@@ -588,17 +627,10 @@ pub fn compute_snapshot(
         .iter()
         .map(|candidate| candidate.path.to_string_lossy().to_string())
         .collect();
-    let planned_set: HashSet<usize> = planned_indices.iter().copied().collect();
     let (mut scan_cache_store, mut removed_cache_paths) = if let Some(db) = scan_cache_db.as_ref() {
         load_scan_cache_store(db)?
     } else {
         (ScanCacheStore::default(), HashSet::new())
-    };
-    let mut dirty_cache_paths: HashSet<String> = HashSet::new();
-    let scan_deadline = if limits.scan_time_budget_ms == 0 {
-        None
-    } else {
-        Instant::now().checked_add(StdDuration::from_millis(limits.scan_time_budget_ms))
     };
 
     if scan_cache_db.is_some() {
@@ -611,7 +643,91 @@ pub fn compute_snapshot(
             }
             keep
         });
+    }
 
+    let force_reparse_all = limits.full_scan && limits.scan_time_budget_ms == 0;
+    // Index every local session eventually. The normal scan budgets keep each
+    // refresh bounded; `full_scan` still processes the whole backlog at once.
+    let eligible_indices: Vec<usize> = (0..candidates.len()).collect();
+    let mut work_indices: Vec<usize> = eligible_indices
+        .iter()
+        .copied()
+        .filter(|idx| {
+            if force_reparse_all {
+                return true;
+            }
+            let key = &candidate_paths[*idx];
+            scan_cache_store
+                .entries
+                .get(key)
+                .is_none_or(|entry| !cache_entry_matches_candidate(entry, &candidates[*idx]))
+        })
+        .collect();
+
+    // Changed or partially parsed files are latency-sensitive. Uncached files form a
+    // deterministic backlog: once one is cached it drops out of this list, so later
+    // refreshes naturally advance instead of rescanning the same newest files forever.
+    work_indices.sort_by_key(|idx| {
+        let key = &candidate_paths[*idx];
+        match scan_cache_store.entries.get(key) {
+            // Appended live sessions first, then brand-new sessions. Large or
+            // unresolved partial files rotate only after current usage has had
+            // a chance to enter the cache.
+            Some(entry) if entry.fully_parsed => (0_u8, entry.updated_at),
+            None => (1_u8, i64::MIN),
+            Some(entry) => (2_u8, entry.updated_at),
+        }
+    });
+
+    let mut planned_indices: Vec<usize> = Vec::new();
+    let mut planned_total_bytes: u64 = 0;
+    for idx in work_indices {
+        if limits.full_scan {
+            planned_indices.push(idx);
+            continue;
+        }
+        if planned_indices.len() >= limits.max_session_files_scanned
+            || planned_total_bytes >= limits.max_session_total_bytes
+        {
+            break;
+        }
+        let candidate = &candidates[idx];
+        let already_read = scan_cache_store
+            .entries
+            .get(&candidate_paths[idx])
+            .map(|entry| entry.file_offset.min(candidate.len))
+            .unwrap_or(0);
+        let remaining = candidate.len.saturating_sub(already_read).max(1);
+        let candidate_weight = remaining.min(limits.max_session_file_bytes.max(1));
+        if !planned_indices.is_empty()
+            && planned_total_bytes.saturating_add(candidate_weight) > limits.max_session_total_bytes
+        {
+            continue;
+        }
+        planned_indices.push(idx);
+        planned_total_bytes = planned_total_bytes.saturating_add(candidate_weight);
+    }
+    let planned_set: HashSet<usize> = planned_indices.iter().copied().collect();
+    let fork_resolutions = resolve_fork_baselines(
+        &candidates,
+        &candidate_paths,
+        &planned_indices,
+        &scan_cache_store,
+        limits.max_jsonl_line_bytes,
+    );
+    // Parent baseline discovery is bounded by the planned fork set and runs in
+    // the background usage worker. Start the incremental file-parse budget only
+    // after it, otherwise a large parent can consume every refresh before even
+    // one cache row advances.
+    let scan_deadline = if limits.scan_time_budget_ms == 0 {
+        None
+    } else {
+        Instant::now().checked_add(StdDuration::from_millis(limits.scan_time_budget_ms))
+    };
+    let mut dirty_cache_paths: HashSet<String> = HashSet::new();
+    let mut uncached_indexed_files = 0usize;
+
+    if scan_cache_db.is_some() {
         for (idx, candidate) in candidates.iter().enumerate() {
             let candidate_key = &candidate_paths[idx];
             let cached_entry = scan_cache_store.entries.get(candidate_key).cloned();
@@ -636,7 +752,10 @@ pub fn compute_snapshot(
                                     workspace_path,
                                     &mut daily,
                                     &mut model_totals,
-                                    &chart_day_filter,
+                                    &summary_day_filter,
+                                    &mut utc_daily,
+                                    &mut utc_model_totals,
+                                    &utc_summary_day_filter,
                                     &mut project_activity,
                                     &mut matched_session_files,
                                 );
@@ -650,6 +769,10 @@ pub fn compute_snapshot(
                         limits.max_jsonl_line_bytes,
                         cached_entry.as_ref(),
                         scan_deadline,
+                        fork_resolutions
+                            .get(candidate_key)
+                            .cloned()
+                            .unwrap_or_default(),
                     ) {
                         Ok(parsed) => parsed,
                         Err(_) => {
@@ -659,7 +782,10 @@ pub fn compute_snapshot(
                                     workspace_path,
                                     &mut daily,
                                     &mut model_totals,
-                                    &chart_day_filter,
+                                    &summary_day_filter,
+                                    &mut utc_daily,
+                                    &mut utc_model_totals,
+                                    &utc_summary_day_filter,
                                     &mut project_activity,
                                     &mut matched_session_files,
                                 );
@@ -670,8 +796,12 @@ pub fn compute_snapshot(
                     let entry = CachedFileScanEntry {
                         size: candidate.len,
                         modified_epoch_secs: candidate.modified_epoch_secs,
-                        file_offset: parsed.file_offset.min(candidate.len),
-                        fully_parsed: parsed.fully_parsed,
+                        file_offset: if parsed.unresolved_fork {
+                            0
+                        } else {
+                            parsed.file_offset.min(candidate.len)
+                        },
+                        fully_parsed: parsed.fully_parsed && !parsed.unresolved_fork,
                         session_cwd: parsed.session_cwd,
                         parser_state: parsed.parser_state,
                         daily: parsed.daily,
@@ -689,7 +819,10 @@ pub fn compute_snapshot(
                     workspace_path,
                     &mut daily,
                     &mut model_totals,
-                    &chart_day_filter,
+                    &summary_day_filter,
+                    &mut utc_daily,
+                    &mut utc_model_totals,
+                    &utc_summary_day_filter,
                     &mut project_activity,
                     &mut matched_session_files,
                 );
@@ -702,7 +835,10 @@ pub fn compute_snapshot(
                     workspace_path,
                     &mut daily,
                     &mut model_totals,
-                    &chart_day_filter,
+                    &summary_day_filter,
+                    &mut utc_daily,
+                    &mut utc_model_totals,
+                    &utc_summary_day_filter,
                     &mut project_activity,
                     &mut matched_session_files,
                 );
@@ -715,7 +851,10 @@ pub fn compute_snapshot(
                     workspace_path,
                     &mut daily,
                     &mut model_totals,
-                    &chart_day_filter,
+                    &summary_day_filter,
+                    &mut utc_daily,
+                    &mut utc_model_totals,
+                    &utc_summary_day_filter,
                     &mut project_activity,
                     &mut matched_session_files,
                 );
@@ -724,25 +863,43 @@ pub fn compute_snapshot(
     } else {
         for idx in planned_indices {
             let candidate = &candidates[idx];
-            let parsed =
-                parse_file_summary(&candidate.path, limits.max_jsonl_line_bytes, None, None)?;
+            let parsed = parse_file_summary(
+                &candidate.path,
+                limits.max_jsonl_line_bytes,
+                None,
+                None,
+                fork_resolutions
+                    .get(&candidate_paths[idx])
+                    .cloned()
+                    .unwrap_or_default(),
+            )?;
             let entry = CachedFileScanEntry {
                 size: candidate.len,
                 modified_epoch_secs: candidate.modified_epoch_secs,
-                file_offset: parsed.file_offset.min(candidate.len),
-                fully_parsed: parsed.fully_parsed,
+                file_offset: if parsed.unresolved_fork {
+                    0
+                } else {
+                    parsed.file_offset.min(candidate.len)
+                },
+                fully_parsed: parsed.fully_parsed && !parsed.unresolved_fork,
                 session_cwd: parsed.session_cwd,
                 parser_state: parsed.parser_state,
                 daily: parsed.daily,
                 model_totals_by_day: parsed.model_totals_by_day,
                 updated_at: unix_time_seconds(),
             };
+            if cache_entry_matches_candidate(&entry, candidate) {
+                uncached_indexed_files = uncached_indexed_files.saturating_add(1);
+            }
             apply_cached_file_entry(
                 &entry,
                 workspace_path,
                 &mut daily,
                 &mut model_totals,
-                &chart_day_filter,
+                &summary_day_filter,
+                &mut utc_daily,
+                &mut utc_model_totals,
+                &utc_summary_day_filter,
                 &mut project_activity,
                 &mut matched_session_files,
             );
@@ -764,14 +921,50 @@ pub fn compute_snapshot(
         );
     }
 
+    let scan_total_files = eligible_indices.len();
+    let scan_indexed_files = if scan_cache_db.is_some() {
+        eligible_indices
+            .iter()
+            .filter(|idx| {
+                scan_cache_store
+                    .entries
+                    .get(&candidate_paths[**idx])
+                    .is_some_and(|entry| cache_entry_matches_candidate(entry, &candidates[**idx]))
+            })
+            .count()
+    } else {
+        uncached_indexed_files
+    };
+    let scan_pending_files = scan_total_files.saturating_sub(scan_indexed_files);
+    let scan_processed_bytes = eligible_indices
+        .iter()
+        .filter_map(|idx| {
+            scan_cache_store
+                .entries
+                .get(&candidate_paths[*idx])
+                .map(|entry| entry.file_offset.min(candidates[*idx].len))
+        })
+        .fold(0_u64, u64::saturating_add);
+
+    let chart_day_keys = make_complete_chart_day_keys(&daily, UsageZone::Local, &summary_day_keys);
+    let utc_chart_day_keys =
+        make_complete_chart_day_keys(&utc_daily, UsageZone::Utc, &utc_summary_day_keys);
+
     Ok(build_snapshot(
         chart_day_keys,
         daily,
         model_totals,
+        utc_chart_day_keys,
+        utc_daily,
+        utc_model_totals,
         matched_session_files,
         activity_first_weekday,
         activity_day_keys,
         project_activity,
+        scan_total_files,
+        scan_indexed_files,
+        scan_pending_files,
+        scan_processed_bytes,
     ))
 }
 
@@ -833,6 +1026,196 @@ fn collect_session_file_candidates(sessions_root: &Path) -> Vec<SessionFileCandi
     out
 }
 
+fn session_id_from_path(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let tail = stem;
+    if tail.len() < 36 {
+        return None;
+    }
+    let candidate = &tail[tail.len() - 36..];
+    let valid = candidate.chars().enumerate().all(|(idx, ch)| match idx {
+        8 | 13 | 18 | 23 => ch == '-',
+        _ => ch.is_ascii_hexdigit(),
+    });
+    valid.then(|| candidate.to_string())
+}
+
+fn read_fork_metadata(path: &Path, max_jsonl_line_bytes: usize) -> Option<(String, i64)> {
+    let file = File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let bytes = reader.read_line(&mut line).ok()?;
+    if bytes == 0 || line.len() > max_jsonl_line_bytes {
+        return None;
+    }
+    let value = serde_json::from_str::<Value>(&line).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let payload = value.get("payload")?.as_object()?;
+    let parent_id = payload.get("forked_from_id")?.as_str()?.to_string();
+    let timestamp_ms = read_timestamp_ms(&value)
+        .or_else(|| payload.get("timestamp").and_then(parse_timestamp_value_ms))?;
+    Some((parent_id, timestamp_ms))
+}
+
+fn resolve_fork_baselines(
+    candidates: &[SessionFileCandidate],
+    candidate_paths: &[String],
+    planned_indices: &[usize],
+    cache: &ScanCacheStore,
+    max_jsonl_line_bytes: usize,
+) -> HashMap<String, ForkResolution> {
+    let id_to_path: HashMap<String, &Path> = candidates
+        .iter()
+        .filter_map(|candidate| {
+            session_id_from_path(&candidate.path).map(|id| (id, candidate.path.as_path()))
+        })
+        .collect();
+    let mut resolutions = HashMap::<String, ForkResolution>::new();
+    let mut requests = HashMap::<String, Vec<(String, i64)>>::new();
+
+    for idx in planned_indices {
+        let candidate = &candidates[*idx];
+        let key = candidate_paths[*idx].clone();
+        let Some((parent_id, fork_timestamp_ms)) =
+            read_fork_metadata(&candidate.path, max_jsonl_line_bytes)
+        else {
+            continue;
+        };
+        let cached_baseline = cache.entries.get(&key).and_then(|entry| {
+            (entry.parser_state.fork_parent_id.as_deref() == Some(parent_id.as_str()))
+                .then_some(entry.parser_state.fork_baseline)
+                .flatten()
+        });
+        resolutions.insert(
+            key.clone(),
+            ForkResolution {
+                parent_id: Some(parent_id.clone()),
+                baseline: cached_baseline,
+            },
+        );
+        if cached_baseline.is_none() {
+            requests
+                .entry(parent_id)
+                .or_default()
+                .push((key, fork_timestamp_ms));
+        }
+    }
+
+    for (parent_id, mut parent_requests) in requests {
+        let Some(parent_path) = id_to_path.get(&parent_id).copied() else {
+            continue;
+        };
+        parent_requests.sort_by_key(|(_, timestamp_ms)| *timestamp_ms);
+        let resolved = scan_parent_baselines(parent_path, &parent_requests, max_jsonl_line_bytes);
+        for (child_path, baseline) in resolved {
+            if let Some(resolution) = resolutions.get_mut(&child_path) {
+                resolution.baseline = baseline;
+            }
+        }
+    }
+
+    resolutions
+}
+
+fn scan_parent_baselines(
+    parent_path: &Path,
+    requests: &[(String, i64)],
+    max_jsonl_line_bytes: usize,
+) -> Vec<(String, Option<UsageTotals>)> {
+    let mut out = Vec::with_capacity(requests.len());
+    let Ok(file) = File::open(parent_path) else {
+        return requests
+            .iter()
+            .map(|(child, _)| (child.clone(), None))
+            .collect();
+    };
+    let mut reader = BufReader::new(file);
+    let mut request_idx = 0usize;
+    let mut totals: Option<UsageTotals> = None;
+    let mut line = String::new();
+    let mut reached_eof = false;
+
+    loop {
+        line.clear();
+        let Ok(bytes) = reader.read_line(&mut line) else {
+            break;
+        };
+        if bytes == 0 {
+            reached_eof = true;
+            break;
+        }
+        if line.len() > max_jsonl_line_bytes || !line.contains("token_count") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(timestamp_ms) = read_timestamp_ms(&value) else {
+            continue;
+        };
+        while request_idx < requests.len() && requests[request_idx].1 < timestamp_ms {
+            out.push((
+                requests[request_idx].0.clone(),
+                Some(totals.unwrap_or_default()),
+            ));
+            request_idx += 1;
+        }
+        let payload = value.get("payload").and_then(Value::as_object);
+        if payload
+            .and_then(|payload| payload.get("type"))
+            .and_then(Value::as_str)
+            != Some("token_count")
+        {
+            continue;
+        }
+        let info = payload
+            .and_then(|payload| payload.get("info"))
+            .and_then(Value::as_object);
+        let Some(info) = info else {
+            continue;
+        };
+        if let Some(total) = find_usage_map(info, &["total_token_usage", "totalTokenUsage"]) {
+            totals = Some(UsageTotals {
+                input: read_i64(total, &["input_tokens", "inputTokens"]),
+                cached: read_i64(
+                    total,
+                    &[
+                        "cached_input_tokens",
+                        "cache_read_input_tokens",
+                        "cachedInputTokens",
+                        "cacheReadInputTokens",
+                    ],
+                ),
+                output: read_i64(total, &["output_tokens", "outputTokens"]),
+            });
+        } else if let Some(last) = find_usage_map(info, &["last_token_usage", "lastTokenUsage"]) {
+            let current = totals.get_or_insert_with(UsageTotals::default);
+            current.input += read_i64(last, &["input_tokens", "inputTokens"]);
+            current.cached += read_i64(
+                last,
+                &[
+                    "cached_input_tokens",
+                    "cache_read_input_tokens",
+                    "cachedInputTokens",
+                    "cacheReadInputTokens",
+                ],
+            );
+            current.output += read_i64(last, &["output_tokens", "outputTokens"]);
+        }
+    }
+
+    while request_idx < requests.len() {
+        out.push((
+            requests[request_idx].0.clone(),
+            reached_eof.then_some(totals.unwrap_or_default()),
+        ));
+        request_idx += 1;
+    }
+    out
+}
+
 fn cache_entry_matches_candidate(
     entry: &CachedFileScanEntry,
     candidate: &SessionFileCandidate,
@@ -843,22 +1226,54 @@ fn cache_entry_matches_candidate(
         && entry.file_offset >= candidate.len
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_snapshot(
     day_keys: Vec<String>,
     daily: HashMap<String, DailyTotals>,
     model_totals: HashMap<String, i64>,
+    utc_day_keys: Vec<String>,
+    utc_daily: HashMap<String, DailyTotals>,
+    utc_model_totals: HashMap<String, i64>,
     matched_session_files: u32,
     activity_first_weekday: Weekday,
     activity_day_keys: Vec<String>,
     project_activity: HashMap<String, ProjectActivityBuilder>,
+    scan_total_files: usize,
+    scan_indexed_files: usize,
+    scan_pending_files: usize,
+    scan_processed_bytes: u64,
 ) -> LocalUsageSnapshot {
+    let (days, totals, top_models) = build_zone_snapshot(day_keys, daily, model_totals);
+    let (utc_days, utc_totals, utc_top_models) =
+        build_zone_snapshot(utc_day_keys, utc_daily, utc_model_totals);
+
+    LocalUsageSnapshot {
+        days,
+        totals,
+        top_models,
+        utc_days,
+        utc_totals,
+        utc_top_models,
+        activity_first_weekday,
+        project_activity: build_project_activity(activity_day_keys, project_activity),
+        matched_session_files,
+        scan_total_files,
+        scan_indexed_files,
+        scan_pending_files,
+        scan_processed_bytes,
+    }
+}
+
+fn build_zone_snapshot(
+    day_keys: Vec<String>,
+    daily: HashMap<String, DailyTotals>,
+    model_totals: HashMap<String, i64>,
+) -> (Vec<UsageDay>, UsageTotalsTokens, Vec<LocalUsageModel>) {
     let mut days: Vec<UsageDay> = Vec::with_capacity(day_keys.len());
-    let mut total_tokens = 0i64;
 
     for day_key in &day_keys {
         let totals = daily.get(day_key).copied().unwrap_or_default();
         let total = totals.input + totals.output;
-        total_tokens += total;
         days.push(UsageDay {
             day: day_key.clone(),
             input_tokens: totals.input,
@@ -869,7 +1284,9 @@ fn build_snapshot(
         });
     }
 
+    let last30 = days.iter().rev().take(30).cloned().collect::<Vec<_>>();
     let last7 = days.iter().rev().take(7).cloned().collect::<Vec<_>>();
+    let total_tokens: i64 = last30.iter().map(|day| day.total_tokens).sum();
     let last7_tokens: i64 = last7.iter().map(|day| day.total_tokens).sum();
     let last7_input: i64 = last7.iter().map(|day| day.input_tokens).sum();
     let last7_cached: i64 = last7.iter().map(|day| day.cached_input_tokens).sum();
@@ -886,7 +1303,7 @@ fn build_snapshot(
         0.0
     };
 
-    let peak = days
+    let peak = last30
         .iter()
         .max_by_key(|day| day.total_tokens)
         .filter(|day| day.total_tokens > 0);
@@ -906,12 +1323,12 @@ fn build_snapshot(
             },
         })
         .collect();
-    top_models.sort_by(|a, b| b.tokens.cmp(&a.tokens));
+    top_models.sort_by_key(|model| std::cmp::Reverse(model.tokens));
     top_models.truncate(4);
 
-    LocalUsageSnapshot {
+    (
         days,
-        totals: UsageTotalsTokens {
+        UsageTotalsTokens {
             last7_days_tokens: last7_tokens,
             last30_days_tokens: total_tokens,
             average_daily_tokens,
@@ -920,10 +1337,7 @@ fn build_snapshot(
             peak_day_tokens,
         },
         top_models,
-        activity_first_weekday,
-        project_activity: build_project_activity(activity_day_keys, project_activity),
-        matched_session_files,
-    }
+    )
 }
 
 fn build_project_activity(
@@ -1003,12 +1417,16 @@ fn add_model_tokens_limited(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_cached_file_entry(
     entry: &CachedFileScanEntry,
     workspace_path: Option<&Path>,
     daily: &mut HashMap<String, DailyTotals>,
     model_totals: &mut HashMap<String, i64>,
     chart_day_filter: &HashSet<String>,
+    utc_daily: &mut HashMap<String, DailyTotals>,
+    utc_model_totals: &mut HashMap<String, i64>,
+    utc_chart_day_filter: &HashSet<String>,
     project_activity: &mut HashMap<String, ProjectActivityBuilder>,
     matched_session_files: &mut u32,
 ) {
@@ -1028,22 +1446,35 @@ fn apply_cached_file_entry(
         *matched_session_files = matched_session_files.saturating_add(1);
     }
 
-    for (day_key, totals) in &entry.daily {
-        if let Some(dst) = daily.get_mut(day_key) {
-            dst.input += totals.input;
-            dst.cached += totals.cached;
-            dst.output += totals.output;
-            dst.agent_ms += totals.agent_ms;
-            dst.agent_runs += totals.agent_runs;
-        }
+    for (cache_key, totals) in &entry.daily {
+        let Some((zone, day_key)) = split_cache_day_key(cache_key) else {
+            continue;
+        };
+        let target = match zone {
+            UsageZone::Local => &mut *daily,
+            UsageZone::Utc => &mut *utc_daily,
+        };
+        let dst = target.entry(day_key.to_string()).or_default();
+        dst.input += totals.input;
+        dst.cached += totals.cached;
+        dst.output += totals.output;
+        dst.agent_ms += totals.agent_ms;
+        dst.agent_runs += totals.agent_runs;
     }
 
-    for (day_key, per_day_models) in &entry.model_totals_by_day {
-        if !chart_day_filter.contains(day_key) {
+    for (cache_key, per_day_models) in &entry.model_totals_by_day {
+        let Some((zone, day_key)) = split_cache_day_key(cache_key) else {
+            continue;
+        };
+        let (filter, target) = match zone {
+            UsageZone::Local => (chart_day_filter, &mut *model_totals),
+            UsageZone::Utc => (utc_chart_day_filter, &mut *utc_model_totals),
+        };
+        if !filter.contains(day_key) {
             continue;
         }
         for (model, tokens) in per_day_models {
-            add_model_tokens_limited(model_totals, model.clone(), *tokens);
+            add_model_tokens_limited(target, model.clone(), *tokens);
         }
     }
 
@@ -1074,11 +1505,14 @@ fn apply_project_activity(
         builder.display_path = cwd.to_string();
     }
 
-    for (day_key, totals) in entry_daily {
+    for (cache_key, totals) in entry_daily {
+        let Some((UsageZone::Local, day_key)) = split_cache_day_key(cache_key) else {
+            continue;
+        };
         if !day_filter.contains_key(day_key) {
             continue;
         }
-        let dst = builder.daily.entry(day_key.clone()).or_default();
+        let dst = builder.daily.entry(day_key.to_string()).or_default();
         dst.input += totals.input;
         dst.cached += totals.cached;
         dst.output += totals.output;
@@ -1092,6 +1526,7 @@ fn parse_file_summary(
     max_jsonl_line_bytes: usize,
     existing: Option<&CachedFileScanEntry>,
     deadline: Option<Instant>,
+    fork_resolution: ForkResolution,
 ) -> Result<FileScanSummary> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
@@ -1162,12 +1597,26 @@ fn parse_file_summary(
     } else {
         ParserState::default()
     };
+    if fork_resolution.is_fork() {
+        parser_state.fork_parent_id = fork_resolution.parent_id.clone();
+        parser_state.fork_baseline = fork_resolution.baseline;
+    }
+    if fork_resolution.unresolved() {
+        return Ok(FileScanSummary {
+            parser_state,
+            unresolved_fork: true,
+            ..FileScanSummary::default()
+        });
+    }
     let mut reader = BufReader::new(file);
     let mut previous_totals: Option<UsageTotals> = parser_state.previous_totals;
     let mut current_model: Option<String> = parser_state.current_model.clone();
     let mut last_activity_ms: Option<i64> = parser_state.last_activity_ms;
     let mut first_session_meta_seen = parser_state.first_session_meta_seen;
     let mut fork_replay = parser_state.fork_replay;
+    let uses_parent_baseline = fork_resolution.is_fork();
+    let parent_baseline = fork_resolution.baseline;
+    let mut fork_live_started = parser_state.fork_live_started;
     let mut seen_runs: HashSet<i64> = HashSet::new();
     let mut line = String::new();
     let mut fully_parsed = true;
@@ -1213,11 +1662,17 @@ fn parse_file_summary(
         };
 
         let event_timestamp_ms = read_timestamp_ms(&value);
-        let skip_fork_replay = started_fork_replay
-            || fork_replay_should_skip_event(&mut fork_replay, event_timestamp_ms);
+        let skip_fork_replay = if uses_parent_baseline {
+            !fork_live_started
+                && (started_fork_replay
+                    || fork_replay_should_skip_event(&mut fork_replay, event_timestamp_ms))
+        } else {
+            started_fork_replay
+                || fork_replay_should_skip_event(&mut fork_replay, event_timestamp_ms)
+        };
 
         if entry_type == "turn_context" {
-            if !skip_fork_replay {
+            if uses_parent_baseline || !skip_fork_replay {
                 if let Some(model) = extract_model_from_turn_context(&value) {
                     current_model = Some(model);
                 }
@@ -1242,9 +1697,7 @@ fn parse_file_summary(
             if payload_type == Some("agent_message") {
                 if let Some(timestamp_ms) = event_timestamp_ms {
                     if seen_runs.insert(timestamp_ms) {
-                        if let Some(day_key) = day_key_for_timestamp_ms(timestamp_ms) {
-                            daily.entry(day_key).or_default().agent_runs += 1;
-                        }
+                        add_agent_run(&mut daily, timestamp_ms);
                     }
                     track_activity(&mut daily, &mut last_activity_ms, timestamp_ms);
                 }
@@ -1314,25 +1767,47 @@ fn parse_file_summary(
 
             if used_total {
                 let prev = previous_totals.unwrap_or_default();
-                delta = UsageTotals {
-                    input: (input - prev.input).max(0),
-                    cached: (cached - prev.cached).max(0),
-                    output: (output - prev.output).max(0),
-                };
-                previous_totals = Some(UsageTotals {
+                let current = UsageTotals {
                     input,
                     cached,
                     output,
-                });
+                };
+                delta = if let Some(baseline) = parent_baseline {
+                    UsageTotals {
+                        input: (input - prev.input.max(baseline.input)).max(0),
+                        cached: (cached - prev.cached.max(baseline.cached)).max(0),
+                        output: (output - prev.output.max(baseline.output)).max(0),
+                    }
+                } else {
+                    UsageTotals {
+                        input: (input - prev.input).max(0),
+                        cached: (cached - prev.cached).max(0),
+                        output: (output - prev.output).max(0),
+                    }
+                };
+                previous_totals = Some(current);
             } else {
-                let mut next = previous_totals.unwrap_or_default();
+                let prev = previous_totals.unwrap_or_default();
+                let mut next = prev;
                 next.input += delta.input;
                 next.cached += delta.cached;
                 next.output += delta.output;
+                if let Some(baseline) = parent_baseline {
+                    delta = UsageTotals {
+                        input: (next.input - prev.input.max(baseline.input)).max(0),
+                        cached: (next.cached - prev.cached.max(baseline.cached)).max(0),
+                        output: (next.output - prev.output.max(baseline.output)).max(0),
+                    };
+                }
                 previous_totals = Some(next);
             }
 
-            if skip_fork_replay {
+            if uses_parent_baseline && delta.any_positive() {
+                fork_live_started = true;
+            }
+            if (uses_parent_baseline && !fork_live_started)
+                || (!uses_parent_baseline && skip_fork_replay)
+            {
                 note_fork_replay_token(&mut fork_replay);
                 continue;
             }
@@ -1342,19 +1817,28 @@ fn parse_file_summary(
             }
 
             let timestamp_ms = event_timestamp_ms;
-            if let Some(day_key) = timestamp_ms.and_then(day_key_for_timestamp_ms) {
-                let entry = daily.entry(day_key.clone()).or_default();
-                let cached_clamped = delta.cached.min(delta.input);
-                entry.input += delta.input;
-                entry.cached += cached_clamped;
-                entry.output += delta.output;
-
+            if let Some(timestamp_ms) = timestamp_ms {
                 let model = current_model
                     .clone()
                     .or_else(|| extract_model_from_token_count(&value))
                     .unwrap_or_else(|| "unknown".to_string());
-                let per_day_models = model_totals_by_day.entry(day_key).or_default();
-                add_model_tokens_limited(per_day_models, model, delta.input + delta.output);
+                for zone in [UsageZone::Local, UsageZone::Utc] {
+                    let Some(day_key) = cache_day_key_for_timestamp_ms(timestamp_ms, zone) else {
+                        continue;
+                    };
+                    let entry = daily.entry(day_key.clone()).or_default();
+                    let cached_clamped = delta.cached.min(delta.input);
+                    entry.input += delta.input;
+                    entry.cached += cached_clamped;
+                    entry.output += delta.output;
+
+                    let per_day_models = model_totals_by_day.entry(day_key).or_default();
+                    add_model_tokens_limited(
+                        per_day_models,
+                        model.clone(),
+                        delta.input + delta.output,
+                    );
+                }
             }
 
             if let Some(timestamp_ms) = timestamp_ms {
@@ -1380,9 +1864,7 @@ fn parse_file_summary(
             if role == "assistant" {
                 if let Some(timestamp_ms) = event_timestamp_ms {
                     if seen_runs.insert(timestamp_ms) {
-                        if let Some(day_key) = day_key_for_timestamp_ms(timestamp_ms) {
-                            daily.entry(day_key).or_default().agent_runs += 1;
-                        }
+                        add_agent_run(&mut daily, timestamp_ms);
                     }
                     track_activity(&mut daily, &mut last_activity_ms, timestamp_ms);
                 }
@@ -1399,6 +1881,7 @@ fn parse_file_summary(
     parser_state.last_activity_ms = last_activity_ms;
     parser_state.first_session_meta_seen = first_session_meta_seen;
     parser_state.fork_replay = fork_replay;
+    parser_state.fork_live_started = fork_live_started;
 
     Ok(FileScanSummary {
         session_cwd,
@@ -1407,6 +1890,7 @@ fn parse_file_summary(
         fully_parsed: fully_parsed && file_offset >= file_len,
         daily,
         model_totals_by_day,
+        unresolved_fork: false,
     })
 }
 
@@ -1497,6 +1981,17 @@ fn open_or_init_scan_cache_db(path: &Path) -> Result<ScanCacheDb> {
     if schema_version < 4 {
         invalidate_forked_session_cache_rows(&conn, path)?;
     }
+    if schema_version < 5 {
+        // v5 stores both local and UTC day buckets (L:/U: prefixes). Old
+        // unqualified rows cannot be converted without replaying timestamps.
+        conn.execute("DELETE FROM file_cache;", [])
+            .with_context(|| format!("Unable to rebuild v5 day buckets in {}", path.display()))?;
+    } else if schema_version < 6 {
+        // v6 applies replay-boundary detection even when a parent cumulative
+        // baseline is available. Reparse only fork rows so the first live
+        // response after the copied prefix contributes to run/activity data.
+        invalidate_forked_session_cache_rows(&conn, path)?;
+    }
     if schema_version < SCAN_CACHE_DB_SCHEMA_VERSION {
         conn.execute(
             "UPDATE cache_meta SET value = ?1 WHERE key = 'schema_version';",
@@ -1582,9 +2077,8 @@ fn migrate_scan_cache_db_v1_to_v2(conn: &Connection, path: &Path) -> Result<()> 
 }
 
 fn invalidate_forked_session_cache_rows(conn: &Connection, path: &Path) -> Result<()> {
-    // v3 and v4 change forked-session accounting semantics. Reusing older fork rows
-    // would keep inflated totals, but non-forked cache rows are still valid. One pass
-    // is sufficient even when upgrading across multiple schema versions at once.
+    // Fork replay/accounting semantics changed in v3, v4, and v6. Reusing older
+    // fork rows would preserve stale aggregates, while non-fork rows remain valid.
     let mut stmt = conn
         .prepare("SELECT file_path FROM file_cache;")
         .with_context(|| {
@@ -2274,25 +2768,46 @@ fn track_activity(
     if let Some(prev_ms) = *last_activity_ms {
         let delta = timestamp_ms - prev_ms;
         if delta > 0 && delta <= MAX_ACTIVITY_GAP_MS {
-            if let Some(day_key) = day_key_for_timestamp_ms(timestamp_ms) {
-                daily.entry(day_key).or_default().agent_ms += delta;
+            for zone in [UsageZone::Local, UsageZone::Utc] {
+                if let Some(day_key) = cache_day_key_for_timestamp_ms(timestamp_ms, zone) {
+                    daily.entry(day_key).or_default().agent_ms += delta;
+                }
             }
         }
     }
     *last_activity_ms = Some(timestamp_ms);
 }
 
-fn day_key_for_timestamp_ms(timestamp_ms: i64) -> Option<String> {
-    let utc = Utc.timestamp_millis_opt(timestamp_ms).single()?;
-    Some(utc.with_timezone(&Local).format("%Y-%m-%d").to_string())
+fn add_agent_run(daily: &mut HashMap<String, DailyTotals>, timestamp_ms: i64) {
+    for zone in [UsageZone::Local, UsageZone::Utc] {
+        if let Some(day_key) = cache_day_key_for_timestamp_ms(timestamp_ms, zone) {
+            daily.entry(day_key).or_default().agent_runs += 1;
+        }
+    }
 }
 
-fn epoch_secs_for_local_day_start(day_key: &str) -> Option<u64> {
-    let day = chrono::NaiveDate::parse_from_str(day_key, "%Y-%m-%d").ok()?;
-    let local = Local
-        .with_ymd_and_hms(day.year(), day.month(), day.day(), 0, 0, 0)
-        .single()?;
-    u64::try_from(local.timestamp()).ok()
+fn display_day_key_for_timestamp_ms(timestamp_ms: i64, zone: UsageZone) -> Option<String> {
+    let utc = Utc.timestamp_millis_opt(timestamp_ms).single()?;
+    Some(match zone {
+        UsageZone::Local => utc.with_timezone(&Local).format("%Y-%m-%d").to_string(),
+        UsageZone::Utc => utc.format("%Y-%m-%d").to_string(),
+    })
+}
+
+fn cache_day_key_for_timestamp_ms(timestamp_ms: i64, zone: UsageZone) -> Option<String> {
+    let day = display_day_key_for_timestamp_ms(timestamp_ms, zone)?;
+    Some(match zone {
+        UsageZone::Local => format!("L:{day}"),
+        UsageZone::Utc => format!("U:{day}"),
+    })
+}
+
+fn split_cache_day_key(value: &str) -> Option<(UsageZone, &str)> {
+    if let Some(day) = value.strip_prefix("L:") {
+        Some((UsageZone::Local, day))
+    } else {
+        value.strip_prefix("U:").map(|day| (UsageZone::Utc, day))
+    }
 }
 
 fn extract_cwd(value: &Value) -> Option<String> {
@@ -2320,8 +2835,11 @@ fn normalize_project_key(path: &str) -> String {
     path.trim().to_lowercase()
 }
 
-fn make_day_keys(days: u32) -> Vec<String> {
-    let today = Local::now().date_naive();
+fn make_day_keys_for_zone(days: u32, zone: UsageZone) -> Vec<String> {
+    let today = match zone {
+        UsageZone::Local => Local::now().date_naive(),
+        UsageZone::Utc => Utc::now().date_naive(),
+    };
     (0..days)
         .rev()
         .map(|offset| {
@@ -2329,6 +2847,48 @@ fn make_day_keys(days: u32) -> Vec<String> {
             day.format("%Y-%m-%d").to_string()
         })
         .collect()
+}
+
+fn make_complete_chart_day_keys(
+    daily: &HashMap<String, DailyTotals>,
+    zone: UsageZone,
+    fallback: &[String],
+) -> Vec<String> {
+    let mut active_dates = daily.iter().filter_map(|(day, totals)| {
+        daily_has_activity(*totals)
+            .then(|| NaiveDate::parse_from_str(day, "%Y-%m-%d").ok())
+            .flatten()
+    });
+    let Some(mut first) = active_dates.next() else {
+        return fallback.to_vec();
+    };
+    let mut last = first;
+    for date in active_dates {
+        first = first.min(date);
+        last = last.max(date);
+    }
+
+    let today = match zone {
+        UsageZone::Local => Local::now().date_naive(),
+        UsageZone::Utc => Utc::now().date_naive(),
+    };
+    last = last.max(today);
+
+    let mut keys = Vec::with_capacity(
+        last.signed_duration_since(first)
+            .num_days()
+            .max(0)
+            .saturating_add(1) as usize,
+    );
+    let mut date = first;
+    while date <= last {
+        keys.push(date.format("%Y-%m-%d").to_string());
+        let Some(next) = date.checked_add_signed(Duration::days(1)) else {
+            break;
+        };
+        date = next;
+    }
+    keys
 }
 
 pub fn system_first_weekday() -> Weekday {
@@ -2775,7 +3335,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_snapshot_ignores_forked_session_replay_without_cache() {
+    fn compute_snapshot_marks_missing_fork_parent_partial_without_cache() {
         let root = make_temp_dir("fork-replay-no-cache");
         let codex_home = root.join("codex");
         let sessions_root = codex_home.join("sessions");
@@ -2790,20 +3350,18 @@ mod tests {
 
         let snapshot = compute_snapshot(30, &codex_home, None, default_test_limits(false), None)
             .expect("snapshot");
-        assert_eq!(
-            snapshot.totals.last30_days_tokens, 220,
-            "only token deltas after the fork replay should count"
-        );
+        assert_eq!(snapshot.totals.last30_days_tokens, 0);
+        assert_eq!(snapshot.scan_pending_files, 1);
         assert_eq!(
             snapshot.days.iter().map(|day| day.agent_runs).sum::<i64>(),
-            1
+            0
         );
 
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn compute_snapshot_ignores_forked_session_replay_with_cache() {
+    fn compute_snapshot_keeps_missing_fork_parent_partial_with_cache() {
         let root = make_temp_dir("fork-replay-cache");
         let codex_home = root.join("codex");
         let sessions_root = codex_home.join("sessions");
@@ -2825,7 +3383,8 @@ mod tests {
             Some(cache_db_path.as_path()),
         )
         .expect("first snapshot");
-        assert_eq!(first.totals.last30_days_tokens, 220);
+        assert_eq!(first.totals.last30_days_tokens, 0);
+        assert_eq!(first.scan_pending_files, 1);
 
         let cached = compute_snapshot(
             30,
@@ -2835,14 +3394,183 @@ mod tests {
             Some(cache_db_path.as_path()),
         )
         .expect("cached snapshot");
-        assert_eq!(cached.totals.last30_days_tokens, 220);
-        assert_eq!(cached.days.iter().map(|day| day.agent_runs).sum::<i64>(), 1);
+        assert_eq!(cached.totals.last30_days_tokens, 0);
+        assert_eq!(cached.scan_pending_files, 1);
+        assert_eq!(cached.days.iter().map(|day| day.agent_runs).sum::<i64>(), 0);
 
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn compute_snapshot_ignores_delayed_fork_metadata_replay() {
+    fn compute_snapshot_uses_parent_totals_as_fork_baseline() {
+        let root = make_temp_dir("fork-parent-baseline");
+        let codex_home = root.join("codex");
+        let sessions_root = codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions root");
+
+        let parent_id = "11111111-1111-4111-8111-111111111111";
+        let child_id = "22222222-2222-4222-8222-222222222222";
+        let parent_path = sessions_root.join(format!("rollout-parent-{parent_id}.jsonl"));
+        let child_path = sessions_root.join(format!("rollout-child-{child_id}.jsonl"));
+        let fork_ms = Utc::now().timestamp_millis() - Duration::hours(1).num_milliseconds();
+        append_session_meta_line(&parent_path, fork_ms - 1_000, "/tmp/forked-project");
+        append_total_token_line(&parent_path, fork_ms - 100, 1_500, 1_300, 130);
+
+        append_json_line(
+            &child_path,
+            serde_json::json!({
+                "type": "session_meta",
+                "timestamp": Utc.timestamp_millis_opt(fork_ms).single().unwrap().to_rfc3339(),
+                "payload": {
+                    "id": child_id,
+                    "forked_from_id": parent_id,
+                    "timestamp": Utc.timestamp_millis_opt(fork_ms).single().unwrap().to_rfc3339(),
+                    "cwd": "/tmp/forked-project"
+                }
+            }),
+        );
+        // Copied replay response: it is inside the replay burst and must not
+        // become a new run in the child.
+        append_agent_message_line(&child_path, fork_ms + 50);
+        append_total_token_line(&child_path, fork_ms + 100, 1_500, 1_300, 130);
+        // Real child response precedes its token_count event. The one-second
+        // gap ends the copied replay prefix, so this must count as one run.
+        append_agent_message_line(&child_path, fork_ms + 1_500);
+        append_total_token_line(&child_path, fork_ms + 1_600, 1_700, 1_400, 150);
+
+        let snapshot = compute_snapshot(30, &codex_home, None, default_test_limits(false), None)
+            .expect("snapshot");
+        assert_eq!(snapshot.totals.last30_days_tokens, 1_850);
+        assert_eq!(snapshot.utc_totals.last30_days_tokens, 1_850);
+        assert_eq!(
+            snapshot.days.iter().map(|day| day.agent_runs).sum::<i64>(),
+            1
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cached_scanner_advances_through_backlog_across_refreshes() {
+        let root = make_temp_dir("scan-backlog");
+        let codex_home = root.join("codex");
+        let sessions_root = codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions root");
+        let now_ms = Utc::now().timestamp_millis();
+        for index in 0..3 {
+            write_token_file(
+                &sessions_root.join(format!("session-{index}.jsonl")),
+                now_ms + index,
+                100 + index,
+                20,
+            );
+        }
+        let mut limits = default_test_limits(false);
+        limits.max_session_files_scanned = 1;
+        let cache_db_path = root.join("comon.db");
+
+        let first = compute_snapshot(30, &codex_home, None, limits, Some(&cache_db_path))
+            .expect("first snapshot");
+        assert_eq!(first.scan_indexed_files, 1);
+        assert_eq!(first.scan_pending_files, 2);
+        assert!(first.scan_processed_bytes > 0);
+        let second = compute_snapshot(30, &codex_home, None, limits, Some(&cache_db_path))
+            .expect("second snapshot");
+        assert_eq!(second.scan_indexed_files, 2);
+        assert!(second.scan_processed_bytes > first.scan_processed_bytes);
+        let third = compute_snapshot(30, &codex_home, None, limits, Some(&cache_db_path))
+            .expect("third snapshot");
+        assert_eq!(third.scan_indexed_files, 3);
+        assert_eq!(third.scan_pending_files, 0);
+        assert!(third.scan_processed_bytes > second.scan_processed_bytes);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unresolved_partial_fork_does_not_starve_new_session() {
+        let root = make_temp_dir("scan-partial-priority");
+        let codex_home = root.join("codex");
+        let sessions_root = codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions root");
+        let now_ms = Utc::now().timestamp_millis();
+        let fork_path = sessions_root.join("forked.jsonl");
+        write_forked_replay_file(&fork_path, now_ms);
+
+        let mut limits = default_test_limits(false);
+        limits.max_session_files_scanned = 1;
+        let cache_db_path = root.join("comon.db");
+        let first = compute_snapshot(30, &codex_home, None, limits, Some(&cache_db_path))
+            .expect("first snapshot");
+        assert_eq!(first.totals.last30_days_tokens, 0);
+        assert_eq!(first.scan_pending_files, 1);
+
+        let normal_path = sessions_root.join("normal.jsonl");
+        write_token_file(&normal_path, now_ms + 1_000, 100, 20);
+
+        let second = compute_snapshot(30, &codex_home, None, limits, Some(&cache_db_path))
+            .expect("second snapshot");
+        assert_eq!(second.totals.last30_days_tokens, 120);
+        assert_eq!(second.scan_indexed_files, 1);
+        assert_eq!(second.scan_pending_files, 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compute_snapshot_populates_local_and_utc_projections() {
+        let root = make_temp_dir("usage-zones");
+        let codex_home = root.join("codex");
+        let sessions_root = codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions root");
+        let now_ms = Utc::now().timestamp_millis();
+        write_token_file(&sessions_root.join("session.jsonl"), now_ms, 100, 20);
+
+        let snapshot = compute_snapshot(30, &codex_home, None, default_test_limits(false), None)
+            .expect("snapshot");
+        assert_eq!(snapshot.totals.last30_days_tokens, 120);
+        assert_eq!(snapshot.utc_totals.last30_days_tokens, 120);
+        assert_eq!(snapshot.days.len(), snapshot.utc_days.len());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compute_snapshot_charts_all_indexed_days_but_keeps_thirty_day_summary() {
+        let root = make_temp_dir("usage-full-chart-history");
+        let codex_home = root.join("codex");
+        let sessions_root = codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions root");
+        let now_ms = Utc::now().timestamp_millis();
+        let old_ms = now_ms - Duration::days(45).num_milliseconds();
+        write_token_file(&sessions_root.join("old.jsonl"), old_ms, 1_000, 20);
+        write_token_file(&sessions_root.join("recent.jsonl"), now_ms, 100, 20);
+
+        let snapshot = compute_snapshot(30, &codex_home, None, default_test_limits(false), None)
+            .expect("snapshot");
+        let old_day = Utc
+            .timestamp_millis_opt(old_ms)
+            .single()
+            .expect("old timestamp")
+            .format("%Y-%m-%d")
+            .to_string();
+        assert!(snapshot.utc_days.len() >= 46);
+        assert_eq!(
+            snapshot
+                .utc_days
+                .iter()
+                .find(|day| day.day == old_day)
+                .map(|day| day.total_tokens),
+            Some(1_020)
+        );
+        assert_eq!(snapshot.utc_totals.last30_days_tokens, 120);
+        assert_eq!(snapshot.utc_totals.peak_day_tokens, 120);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compute_snapshot_keeps_delayed_missing_parent_partial() {
         let root = make_temp_dir("fork-replay-delayed-metadata");
         let codex_home = root.join("codex");
         let sessions_root = codex_home.join("sessions");
@@ -2857,18 +3585,19 @@ mod tests {
 
         let snapshot = compute_snapshot(30, &codex_home, None, default_test_limits(false), None)
             .expect("snapshot");
-        assert_eq!(snapshot.totals.last30_days_tokens, 220);
+        assert_eq!(snapshot.totals.last30_days_tokens, 0);
+        assert_eq!(snapshot.scan_pending_files, 1);
         assert_eq!(
             snapshot.days.iter().map(|day| day.agent_runs).sum::<i64>(),
-            1,
-            "the delayed outer session timestamp must not expose compressed replay runs"
+            0,
+            "an unresolved parent must not expose compressed replay runs"
         );
 
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn compute_snapshot_resumes_active_delayed_fork_replay_from_cache() {
+    fn compute_snapshot_does_not_guess_missing_parent_after_append() {
         let root = make_temp_dir("fork-replay-delayed-resume");
         let codex_home = root.join("codex");
         let sessions_root = codex_home.join("sessions");
@@ -2908,10 +3637,11 @@ mod tests {
             Some(cache_db_path.as_path()),
         )
         .expect("resumed snapshot");
-        assert_eq!(resumed.totals.last30_days_tokens, 220);
+        assert_eq!(resumed.totals.last30_days_tokens, 0);
+        assert_eq!(resumed.scan_pending_files, 1);
         assert_eq!(
             resumed.days.iter().map(|day| day.agent_runs).sum::<i64>(),
-            1
+            0
         );
 
         let cached = compute_snapshot(
@@ -2922,8 +3652,9 @@ mod tests {
             Some(cache_db_path.as_path()),
         )
         .expect("cached resumed snapshot");
-        assert_eq!(cached.totals.last30_days_tokens, 220);
-        assert_eq!(cached.days.iter().map(|day| day.agent_runs).sum::<i64>(), 1);
+        assert_eq!(cached.totals.last30_days_tokens, 0);
+        assert_eq!(cached.scan_pending_files, 1);
+        assert_eq!(cached.days.iter().map(|day| day.agent_runs).sum::<i64>(), 0);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3363,7 +4094,7 @@ mod tests {
     }
 
     #[test]
-    fn open_or_init_scan_cache_db_v3_migration_preserves_nonforked_rows() {
+    fn open_or_init_scan_cache_db_rebuilds_v2_day_buckets() {
         let root = make_temp_dir("cache-migrate-v3");
         let sessions_root = root.join("sessions");
         std::fs::create_dir_all(&sessions_root).expect("create sessions root");
@@ -3414,16 +4145,13 @@ mod tests {
 
         let db = open_or_init_scan_cache_db(&db_path).expect("open and migrate");
         let (store, _) = load_scan_cache_store(&db).expect("load migrated cache");
-        let keep_key = keep_path.to_string_lossy().to_string();
-        let forked_key = forked_path.to_string_lossy().to_string();
-        assert!(store.entries.contains_key(&keep_key));
-        assert!(!store.entries.contains_key(&forked_key));
+        assert!(store.entries.is_empty());
 
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn open_or_init_scan_cache_db_v4_reparses_only_forked_rows() {
+    fn open_or_init_scan_cache_db_rebuilds_v3_day_buckets() {
         let root = make_temp_dir("cache-migrate-v4");
         let sessions_root = root.join("sessions");
         std::fs::create_dir_all(&sessions_root).expect("create sessions root");
@@ -3473,10 +4201,7 @@ mod tests {
 
         let db = open_or_init_scan_cache_db(&db_path).expect("open and migrate");
         let (store, _) = load_scan_cache_store(&db).expect("load migrated cache");
-        let keep_key = keep_path.to_string_lossy().to_string();
-        let forked_key = forked_path.to_string_lossy().to_string();
-        assert!(store.entries.contains_key(&keep_key));
-        assert!(!store.entries.contains_key(&forked_key));
+        assert!(store.entries.is_empty());
 
         let schema_version: i64 = db
             .conn
@@ -3486,7 +4211,68 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("read schema version");
-        assert_eq!(schema_version, 4);
+        assert_eq!(schema_version, SCAN_CACHE_DB_SCHEMA_VERSION);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn open_or_init_scan_cache_db_v6_reparses_only_v5_fork_rows() {
+        let root = make_temp_dir("cache-migrate-v6");
+        let sessions_root = root.join("sessions");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions root");
+        let keep_path = sessions_root.join("keep.jsonl");
+        let forked_path = sessions_root.join("forked.jsonl");
+        let now_ms = Utc::now().timestamp_millis();
+        write_token_file(&keep_path, now_ms, 10, 5);
+        write_forked_replay_file(&forked_path, now_ms);
+
+        let db_path = root.join("comon.db");
+        let conn = Connection::open(&db_path).expect("open v5 db");
+        conn.execute_batch(
+            "
+            CREATE TABLE cache_meta (
+                key TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            );
+            INSERT INTO cache_meta(key, value) VALUES('schema_version', 5);
+            CREATE TABLE file_cache (
+                file_path TEXT PRIMARY KEY,
+                file_size INTEGER NOT NULL,
+                file_mtime INTEGER,
+                file_offset INTEGER NOT NULL DEFAULT 0,
+                fully_parsed INTEGER NOT NULL DEFAULT 1,
+                session_cwd TEXT,
+                parser_state_json TEXT NOT NULL DEFAULT '{}',
+                daily_json TEXT NOT NULL,
+                model_daily_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            ",
+        )
+        .expect("create v5 schema");
+        for path in [&keep_path, &forked_path] {
+            conn.execute(
+                "
+                INSERT INTO file_cache(
+                    file_path, file_size, file_mtime, file_offset, fully_parsed,
+                    session_cwd, parser_state_json, daily_json, model_daily_json, updated_at
+                ) VALUES(?1, 1, 1, 1, 1, '/tmp', '{}', '{}', '{}', 1);
+                ",
+                rusqlite::params![path.to_string_lossy().to_string()],
+            )
+            .expect("insert cache row");
+        }
+        drop(conn);
+
+        let db = open_or_init_scan_cache_db(&db_path).expect("open and migrate");
+        let (store, _) = load_scan_cache_store(&db).expect("load migrated cache");
+        assert!(store
+            .entries
+            .contains_key(&keep_path.to_string_lossy().to_string()));
+        assert!(!store
+            .entries
+            .contains_key(&forked_path.to_string_lossy().to_string()));
 
         let _ = std::fs::remove_dir_all(root);
     }

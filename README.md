@@ -61,7 +61,7 @@ Common flags:
 - `--live-limits <auto|on|off>`: `auto` tries App Server if found, `on` requires it, `off` disables live limits (default: `auto`)
 - `--cwd <path>`: directory to launch Codex App Server in (default: current directory; does not change usage scope)
 - `--project <path>` / `--workspace <path>`: filter usage stats to a specific project/workspace (also becomes default `--cwd` if `--cwd` not set)
-- `--usage-days <n>`: days to scan for usage (clamped 1..=90; default from config)
+- `--usage-days <n>`: summary/model-share window (clamped 1..=90; default from config); charts index the complete local history
 - `--refresh-usage-secs <n>`: usage refresh interval in seconds (default from config)
 - `--refresh-limits-secs <n>`: limits refresh interval in seconds (default from config)
 - `--max-session-file-mib <n>`: per-file planning weight (MiB) for scan budget (default from config)
@@ -69,7 +69,7 @@ Common flags:
 - `--max-session-files <n>`: max number of session files to scan per refresh (default from config)
 - `--max-jsonl-line-kib <n>`: max parsed JSONL line size in KiB (default from config)
 - `--scan-time-budget-ms <n>`: max parse time budget per refresh in ms (`0` disables budget)
-- `--full-scan`: scan all files under `CODEX_HOME/sessions`, including old months (ignores mtime cutoff and file/byte planning caps)
+- `--full-scan`: process the complete pending session backlog in one refresh (ignores file/byte planning caps)
 - `--no-full-scan`: disable full scan for this run (overrides config)
 - `--scan-cache-max-entries <n>`: max entries kept in cache database (`comon.db`) (default from config)
 - `--rebuild-cache-on-start`: delete local scan cache DB files (`comon.db`, `comon.db-wal`, `comon.db-shm`) before first usage scan
@@ -130,9 +130,11 @@ comon --scan-time-budget-ms 1500 --max-jsonl-line-kib 512
 ## Key bindings
 
 - `Tab` Toggle data (Tokens/Time/Runs)
-- `w` Toggle timeframe (Week/Month)
+- `g` / `w` Toggle grouping (Day/Week/Month)
 - `f` Toggle layout (Horz/Vert)
+- `z` / `F6` Toggle Usage zone (Local/UTC); APISTAT always uses server UTC
 - `n` Cycle display formatting (Classic/System Compact/System Full)
+- Mouse wheel or arrow keys Scroll chart history (`PgUp`/`PgDn`, `Home`/`End` also work)
 - Mouse: click the top tabs, Usage/Activity controls (including the Usage style selector), or the bottom-right Quit action
 - Mouse: hover a filled vertical chart bar to see its exact date and full locale-aware value
 - `s` / `F2` Switch between Usage and Session history
@@ -341,6 +343,8 @@ CI also runs this check on each push and pull request via `.github/workflows/asc
 ## Notes
 
 - Usage stats are derived from Codex session JSONL logs. If you have no session data yet, values will be empty.
+- Usage charts index the complete local session history and cache completed work incrementally. Until the initial backlog is complete, CoMon shows an indexing status instead of partial totals.
+- APISTAT displays the server-owned UTC buckets returned by Codex App Server. USAGE reconstructs local estimates from session logs, so small differences can remain even when the date range and UTC grouping match.
 - Limits/credits require Codex App Server to start successfully (auth, environment, and a usable working directory). CoMon auto-detects `codex` on `PATH` and common Windows Codex App bundle locations; use `--codex-bin` or `--app-server-bin` when needed.
 - comon stores local app state in `~/.comon/state.json` by default (or `$COMON_HOME`, or `--comon-home`).
 - Display formatting starts in Classic mode; press `n` or use `STYLE CLASS/SCOMP/SFULL` in the Usage controls to choose Classic, System Compact, or System Full. Both System modes use the operating system locale for dates, times, decimals, and calendar labels; Compact uses the detected thousands separator and abbreviates dashboard token values, while Full groups expanded integers with regular spaces. The choice is saved in `state.json` without changing stored data.

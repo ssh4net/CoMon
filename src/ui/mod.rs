@@ -2725,6 +2725,7 @@ fn render_history_style_controls(frame: &mut Frame<'_>, area: Rect, state: &mut 
         return;
     }
     let segments = [
+        ("  ", None),
         (" STYLE ", None),
         (
             " CLASS ",
@@ -2740,6 +2741,7 @@ fn render_history_style_controls(frame: &mut Frame<'_>, area: Rect, state: &mut 
         ),
     ];
     let spans = vec![
+        Span::raw("  "),
         control_group_label("STYLE"),
         pill("CLASS", state.display_style == DisplayStyle::Classic),
         pill("SCOMP", state.display_style == DisplayStyle::SystemCompact),

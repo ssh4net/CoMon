@@ -17,6 +17,7 @@ use ratatui::{
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthStr;
 
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 
@@ -419,11 +420,18 @@ fn render_header(
         width: line_area.width.saturating_sub(controls.width),
         ..line_area
     };
-    let show_summary = content_area.width >= 62;
+    let summary = format!(
+        "{} projects  {} files  {} skipped",
+        formatter.format_usize(state.catalog.projects.len()),
+        formatter.format_usize(state.catalog.files_scanned),
+        formatter.format_usize(state.catalog.files_skipped)
+    );
+    let summary_width = u16::try_from(UnicodeWidthStr::width(summary.as_str())).unwrap_or(u16::MAX);
+    let show_summary = content_area.width >= 32u16.saturating_add(summary_width);
     let row = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(if show_summary {
-            [Constraint::Min(32), Constraint::Length(30)]
+            [Constraint::Min(32), Constraint::Length(summary_width)]
         } else {
             [Constraint::Min(0), Constraint::Length(0)]
         })
@@ -441,12 +449,6 @@ fn render_header(
         row[0],
     );
 
-    let summary = format!(
-        "{} projects  {} files  {} skipped",
-        formatter.format_usize(state.catalog.projects.len()),
-        formatter.format_usize(state.catalog.files_scanned),
-        formatter.format_usize(state.catalog.files_skipped)
-    );
     if show_summary {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -468,7 +470,7 @@ fn header_line_area(area: Rect) -> Rect {
 }
 
 pub(crate) fn history_style_controls_area(area: Rect) -> Rect {
-    const WIDTH: u16 = 28;
+    const WIDTH: u16 = 30;
     let line = header_line_area(area);
     if line.width < WIDTH {
         return Rect::default();
@@ -978,7 +980,7 @@ mod tests {
     fn history_style_controls_use_right_side_of_header_line() {
         assert_eq!(
             history_style_controls_area(Rect::new(2, 1, 100, 3)),
-            Rect::new(74, 2, 28, 1)
+            Rect::new(72, 2, 30, 1)
         );
         assert_eq!(
             history_style_controls_area(Rect::new(2, 1, 20, 3)),

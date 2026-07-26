@@ -18,8 +18,9 @@ const DEFAULT_MAX_SESSION_FILES_SCANNED: usize = 10_000;
 const DEFAULT_MAX_JSONL_LINE_BYTES: usize = 512 * 1024;
 const DEFAULT_SCAN_TIME_BUDGET_MS: u64 = 1500;
 const MAX_DISTINCT_MODELS: usize = 5_000;
-const SCAN_CACHE_DB_SCHEMA_VERSION: i64 = 9;
+const SCAN_CACHE_DB_SCHEMA_VERSION: i64 = 11;
 pub(crate) const PROJECT_IDENTITY_LINE_LIMIT: usize = 128;
+const MAX_PROJECTS_PER_SESSION: usize = 256;
 const FORK_REPLAY_END_GAP_MS: i64 = 1_000;
 const FORK_REPLAY_NO_TOKEN_GRACE_MS: i64 = 2_000;
 pub const DEFAULT_SCAN_CACHE_MAX_ENTRIES: usize = 50_000;
@@ -231,6 +232,7 @@ pub struct ProjectUsageSummary {
     pub agent_time_ms: i64,
     pub agent_runs: i64,
     pub indexed_files: usize,
+    pub session_files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -475,6 +477,16 @@ struct ParserState {
     project_cwd_counts: HashMap<String, u32>,
     #[serde(default)]
     project_identity_lines_seen: u32,
+    #[serde(default)]
+    active_project_cwd: Option<String>,
+    #[serde(default)]
+    pending_project_cwd_counts: HashMap<String, u32>,
+    #[serde(default)]
+    project_daily: HashMap<String, HashMap<String, DailyTotals>>,
+    #[serde(default)]
+    project_model_totals_by_day: HashMap<String, HashMap<String, HashMap<String, i64>>>,
+    #[serde(default)]
+    project_last_activity_ms: HashMap<String, i64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
@@ -555,6 +567,7 @@ struct ProjectUsageBuilder {
     agent_time_ms: i64,
     agent_runs: i64,
     indexed_files: usize,
+    session_files: Vec<PathBuf>,
 }
 
 fn default_true() -> bool {
@@ -1401,55 +1414,92 @@ fn build_project_usage_summaries(
         if !cache_entry_matches_candidate(entry, candidate) {
             continue;
         }
-        let Some(cwd) = entry
-            .session_cwd
-            .as_deref()
-            .filter(|cwd| !cwd.trim().is_empty())
-        else {
-            continue;
-        };
-        let key = normalize_project_key(cwd);
-        if key.is_empty() {
-            continue;
+        for cwd in entry_project_paths(entry) {
+            let key = normalize_project_key(&cwd);
+            let project = projects.entry(key).or_default();
+            prefer_project_display_path(&mut project.display_path, &cwd);
+            project.indexed_files = project.indexed_files.saturating_add(1);
+            project.session_files.push(candidate.path.clone());
         }
 
-        let project = projects.entry(key).or_default();
-        if project.display_path.is_empty()
-            || cwd.len() < project.display_path.len()
-            || (cwd.len() == project.display_path.len() && cwd < project.display_path.as_str())
-        {
-            project.display_path = cwd.to_string();
-        }
-        project.indexed_files = project.indexed_files.saturating_add(1);
-
-        for (cache_key, totals) in &entry.daily {
-            let Some((UsageZone::Local, _)) = split_cache_day_key(cache_key) else {
+        for (cwd, project_daily) in &entry.parser_state.project_daily {
+            let key = normalize_project_key(cwd);
+            if key.is_empty() {
                 continue;
-            };
-            project.total_tokens = project
-                .total_tokens
-                .saturating_add(totals.input.saturating_add(totals.output));
-            project.cached_input_tokens = project
-                .cached_input_tokens
-                .saturating_add(totals.cached.min(totals.input));
-            project.agent_time_ms = project.agent_time_ms.saturating_add(totals.agent_ms);
-            project.agent_runs = project.agent_runs.saturating_add(totals.agent_runs);
+            }
+            let project = projects.entry(key).or_default();
+            prefer_project_display_path(&mut project.display_path, cwd);
+            for (cache_key, totals) in project_daily {
+                let Some((UsageZone::Local, _)) = split_cache_day_key(cache_key) else {
+                    continue;
+                };
+                project.total_tokens = project
+                    .total_tokens
+                    .saturating_add(totals.input.saturating_add(totals.output));
+                project.cached_input_tokens = project
+                    .cached_input_tokens
+                    .saturating_add(totals.cached.min(totals.input));
+                project.agent_time_ms = project.agent_time_ms.saturating_add(totals.agent_ms);
+                project.agent_runs = project.agent_runs.saturating_add(totals.agent_runs);
+            }
         }
     }
 
     let mut out = projects
         .into_values()
-        .map(|project| ProjectUsageSummary {
-            display_path: project.display_path,
-            total_tokens: project.total_tokens,
-            cached_input_tokens: project.cached_input_tokens,
-            agent_time_ms: project.agent_time_ms,
-            agent_runs: project.agent_runs,
-            indexed_files: project.indexed_files,
+        .map(|mut project| {
+            project.session_files.sort();
+            project.session_files.dedup();
+            ProjectUsageSummary {
+                display_path: project.display_path,
+                total_tokens: project.total_tokens,
+                cached_input_tokens: project.cached_input_tokens,
+                agent_time_ms: project.agent_time_ms,
+                agent_runs: project.agent_runs,
+                indexed_files: project.indexed_files,
+                session_files: project.session_files,
+            }
         })
         .collect::<Vec<_>>();
     out.sort_by(|left, right| left.display_path.cmp(&right.display_path));
     out
+}
+
+fn entry_project_paths(entry: &CachedFileScanEntry) -> Vec<String> {
+    let mut paths: HashMap<String, String> = HashMap::new();
+    for path in entry
+        .parser_state
+        .project_cwd_counts
+        .keys()
+        .chain(entry.parser_state.project_daily.keys())
+    {
+        let key = normalize_project_key(path);
+        if key.is_empty() {
+            continue;
+        }
+        let display = paths.entry(key).or_insert_with(|| path.clone());
+        prefer_project_display_path(display, path);
+    }
+    if paths.is_empty() {
+        if let Some(path) = fallback_project_identity(entry.session_cwd.as_deref()) {
+            let key = normalize_project_key(&path);
+            if !key.is_empty() {
+                paths.insert(key, path);
+            }
+        }
+    }
+    let mut out = paths.into_values().collect::<Vec<_>>();
+    out.sort_by_key(|path| normalize_project_key(path));
+    out
+}
+
+fn prefer_project_display_path(current: &mut String, candidate: &str) {
+    if current.is_empty()
+        || candidate.len() < current.len()
+        || (candidate.len() == current.len() && candidate < current.as_str())
+    {
+        *current = candidate.to_string();
+    }
 }
 
 fn build_project_activity(
@@ -1514,6 +1564,134 @@ fn daily_has_activity(totals: DailyTotals) -> bool {
     totals.input > 0 || totals.output > 0 || totals.agent_ms > 0 || totals.agent_runs > 0
 }
 
+fn fallback_project_identity(session_cwd: Option<&str>) -> Option<String> {
+    let cwd = session_cwd?.trim();
+    if cwd.is_empty() {
+        return None;
+    }
+    project_identity_from_path(cwd).or_else(|| Some(cwd.to_string()))
+}
+
+fn ensure_project_membership(parser_state: &mut ParserState, project: &str) {
+    if project.trim().is_empty() {
+        return;
+    }
+    if parser_state.project_cwd_counts.contains_key(project)
+        || parser_state.project_cwd_counts.len() < MAX_PROJECTS_PER_SESSION
+    {
+        parser_state
+            .project_cwd_counts
+            .entry(project.to_string())
+            .or_insert(1);
+    }
+    parser_state.project_cwd = preferred_project_identity(&parser_state.project_cwd_counts);
+}
+
+fn note_project_context(parser_state: &mut ParserState, project: String, live: bool) {
+    parser_state.active_project_cwd = Some(project.clone());
+    if !live {
+        return;
+    }
+    if parser_state.project_cwd_counts.contains_key(&project)
+        || parser_state.project_cwd_counts.len() < MAX_PROJECTS_PER_SESSION
+    {
+        let count = parser_state
+            .project_cwd_counts
+            .entry(project.clone())
+            .or_default();
+        *count = count.saturating_add(1);
+    }
+    if parser_state
+        .pending_project_cwd_counts
+        .contains_key(&project)
+        || parser_state.pending_project_cwd_counts.len() < MAX_PROJECTS_PER_SESSION
+    {
+        let count = parser_state
+            .pending_project_cwd_counts
+            .entry(project)
+            .or_default();
+        *count = count.saturating_add(1);
+    }
+    parser_state.project_cwd = preferred_project_identity(&parser_state.project_cwd_counts);
+}
+
+fn take_project_for_token(
+    parser_state: &mut ParserState,
+    session_cwd: Option<&str>,
+) -> Option<String> {
+    let project = preferred_project_identity(&parser_state.pending_project_cwd_counts)
+        .or_else(|| parser_state.active_project_cwd.clone())
+        .or_else(|| fallback_project_identity(session_cwd));
+    parser_state.pending_project_cwd_counts.clear();
+    if let Some(project) = project.as_deref() {
+        ensure_project_membership(parser_state, project);
+        parser_state.active_project_cwd = Some(project.to_string());
+    }
+    project
+}
+
+fn add_project_token_delta(
+    parser_state: &mut ParserState,
+    project: &str,
+    timestamp_ms: i64,
+    delta: UsageTotals,
+    model: &str,
+) {
+    for zone in [UsageZone::Local, UsageZone::Utc] {
+        let Some(day_key) = cache_day_key_for_timestamp_ms(timestamp_ms, zone) else {
+            continue;
+        };
+        let totals = parser_state
+            .project_daily
+            .entry(project.to_string())
+            .or_default()
+            .entry(day_key.clone())
+            .or_default();
+        totals.input = totals.input.saturating_add(delta.input);
+        totals.cached = totals.cached.saturating_add(delta.cached.min(delta.input));
+        totals.output = totals.output.saturating_add(delta.output);
+
+        let models = parser_state
+            .project_model_totals_by_day
+            .entry(project.to_string())
+            .or_default()
+            .entry(day_key)
+            .or_default();
+        add_model_tokens_limited(models, model.to_string(), delta.input + delta.output);
+    }
+}
+
+fn add_project_agent_run(parser_state: &mut ParserState, project: &str, timestamp_ms: i64) {
+    ensure_project_membership(parser_state, project);
+    let daily = parser_state
+        .project_daily
+        .entry(project.to_string())
+        .or_default();
+    add_agent_run(daily, timestamp_ms);
+}
+
+fn track_project_activity(parser_state: &mut ParserState, project: &str, timestamp_ms: i64) {
+    ensure_project_membership(parser_state, project);
+    let previous = parser_state.project_last_activity_ms.get(project).copied();
+    if let Some(previous) = previous {
+        let delta = timestamp_ms - previous;
+        if delta > 0 && delta <= MAX_ACTIVITY_GAP_MS {
+            let daily = parser_state
+                .project_daily
+                .entry(project.to_string())
+                .or_default();
+            for zone in [UsageZone::Local, UsageZone::Utc] {
+                if let Some(day_key) = cache_day_key_for_timestamp_ms(timestamp_ms, zone) {
+                    daily.entry(day_key).or_default().agent_ms += delta;
+                }
+            }
+        }
+    }
+    parser_state
+        .project_last_activity_ms
+        .insert(project.to_string(), timestamp_ms);
+}
+
 fn add_model_tokens_limited(
     model_totals: &mut HashMap<String, i64>,
     model: String,
@@ -1544,11 +1722,9 @@ fn apply_cached_file_entry(
 ) {
     let matches_workspace = match workspace_path {
         None => true,
-        Some(filter) => entry
-            .session_cwd
-            .as_deref()
-            .map(|cwd| path_matches_workspace(cwd, filter))
-            .unwrap_or(false),
+        Some(filter) => entry_project_paths(entry)
+            .iter()
+            .any(|project| path_matches_workspace(project, filter)),
     };
     if !matches_workspace {
         return;
@@ -1558,7 +1734,34 @@ fn apply_cached_file_entry(
         *matched_session_files = matched_session_files.saturating_add(1);
     }
 
-    for (cache_key, totals) in &entry.daily {
+    let mut filtered_daily: HashMap<String, DailyTotals> = HashMap::new();
+    let mut filtered_models: HashMap<String, HashMap<String, i64>> = HashMap::new();
+    if let Some(filter) = workspace_path {
+        for (project, per_day) in &entry.parser_state.project_daily {
+            if !path_matches_workspace(project, filter) {
+                continue;
+            }
+            merge_daily_totals(&mut filtered_daily, per_day);
+        }
+        for (project, per_day) in &entry.parser_state.project_model_totals_by_day {
+            if !path_matches_workspace(project, filter) {
+                continue;
+            }
+            merge_model_totals_by_day(&mut filtered_models, per_day);
+        }
+    }
+    let selected_daily = if workspace_path.is_some() {
+        &filtered_daily
+    } else {
+        &entry.daily
+    };
+    let selected_models = if workspace_path.is_some() {
+        &filtered_models
+    } else {
+        &entry.model_totals_by_day
+    };
+
+    for (cache_key, totals) in selected_daily {
         let Some((zone, day_key)) = split_cache_day_key(cache_key) else {
             continue;
         };
@@ -1574,7 +1777,7 @@ fn apply_cached_file_entry(
         dst.agent_runs += totals.agent_runs;
     }
 
-    for (cache_key, per_day_models) in &entry.model_totals_by_day {
+    for (cache_key, per_day_models) in selected_models {
         let Some((zone, day_key)) = split_cache_day_key(cache_key) else {
             continue;
         };
@@ -1590,8 +1793,37 @@ fn apply_cached_file_entry(
         }
     }
 
-    if let Some(cwd) = entry.session_cwd.as_deref() {
-        apply_project_activity(cwd, &entry.daily, daily, project_activity);
+    for (project, project_daily) in &entry.parser_state.project_daily {
+        if workspace_path.is_some_and(|filter| !path_matches_workspace(project, filter)) {
+            continue;
+        }
+        apply_project_activity(project, project_daily, daily, project_activity);
+    }
+}
+
+fn merge_daily_totals(
+    target: &mut HashMap<String, DailyTotals>,
+    source: &HashMap<String, DailyTotals>,
+) {
+    for (day, totals) in source {
+        let dst = target.entry(day.clone()).or_default();
+        dst.input = dst.input.saturating_add(totals.input);
+        dst.cached = dst.cached.saturating_add(totals.cached);
+        dst.output = dst.output.saturating_add(totals.output);
+        dst.agent_ms = dst.agent_ms.saturating_add(totals.agent_ms);
+        dst.agent_runs = dst.agent_runs.saturating_add(totals.agent_runs);
+    }
+}
+
+fn merge_model_totals_by_day(
+    target: &mut HashMap<String, HashMap<String, i64>>,
+    source: &HashMap<String, HashMap<String, i64>>,
+) {
+    for (day, models) in source {
+        let dst = target.entry(day.clone()).or_default();
+        for (model, tokens) in models {
+            add_model_tokens_limited(dst, model.clone(), *tokens);
+        }
     }
 }
 
@@ -1709,6 +1941,9 @@ fn parse_file_summary(
     } else {
         ParserState::default()
     };
+    // Project paths recur heavily in command logs. Keep filesystem probes bounded
+    // to one lookup per (base cwd, raw path) while this file slice is parsed.
+    let mut project_path_cache: HashMap<String, Option<String>> = HashMap::new();
     if fork_resolution.is_fork() {
         parser_state.fork_parent_id = fork_resolution.parent_id.clone();
         parser_state.fork_baseline = fork_resolution.baseline;
@@ -1767,16 +2002,11 @@ fn parse_file_summary(
 
         if (entry_type == "session_meta" || entry_type == "turn_context") && session_cwd.is_none() {
             session_cwd = extract_cwd(&value);
-        }
-        if entry_type == "response_item"
-            && usize::try_from(parser_state.project_identity_lines_seen).unwrap_or(usize::MAX)
-                <= PROJECT_IDENTITY_LINE_LIMIT
-        {
-            if let Some(project) = project_identity_from_tool_call(&value, session_cwd.as_deref()) {
-                let count = parser_state.project_cwd_counts.entry(project).or_default();
-                *count = count.saturating_add(1);
-                parser_state.project_cwd =
-                    preferred_project_identity(&parser_state.project_cwd_counts);
+            if parser_state.active_project_cwd.is_none() {
+                if let Some(project) = session_cwd.as_deref().and_then(project_identity_from_path) {
+                    ensure_project_membership(&mut parser_state, &project);
+                    parser_state.active_project_cwd = Some(project);
+                }
             }
         }
 
@@ -1795,6 +2025,16 @@ fn parse_file_summary(
             started_fork_replay
                 || fork_replay_should_skip_event(&mut fork_replay, event_timestamp_ms)
         };
+
+        for project in project_identities_from_structured_event_cached(
+            &value,
+            session_cwd.as_deref(),
+            &mut project_path_cache,
+        ) {
+            // Replayed fork events establish the inherited working project, but
+            // only live events create membership and attribution evidence.
+            note_project_context(&mut parser_state, project, !skip_fork_replay);
+        }
 
         if entry_type == "turn_context" {
             if uses_parent_baseline || !skip_fork_replay {
@@ -1823,8 +2063,22 @@ fn parse_file_summary(
                 if let Some(timestamp_ms) = event_timestamp_ms {
                     if seen_runs.insert(timestamp_ms) {
                         add_agent_run(&mut daily, timestamp_ms);
+                        if let Some(project) = parser_state
+                            .active_project_cwd
+                            .clone()
+                            .or_else(|| fallback_project_identity(session_cwd.as_deref()))
+                        {
+                            add_project_agent_run(&mut parser_state, &project, timestamp_ms);
+                        }
                     }
                     track_activity(&mut daily, &mut last_activity_ms, timestamp_ms);
+                    if let Some(project) = parser_state
+                        .active_project_cwd
+                        .clone()
+                        .or_else(|| fallback_project_identity(session_cwd.as_deref()))
+                    {
+                        track_project_activity(&mut parser_state, &project, timestamp_ms);
+                    }
                 }
                 continue;
             }
@@ -1832,6 +2086,13 @@ fn parse_file_summary(
             if payload_type == Some("agent_reasoning") {
                 if let Some(timestamp_ms) = event_timestamp_ms {
                     track_activity(&mut daily, &mut last_activity_ms, timestamp_ms);
+                    if let Some(project) = parser_state
+                        .active_project_cwd
+                        .clone()
+                        .or_else(|| fallback_project_identity(session_cwd.as_deref()))
+                    {
+                        track_project_activity(&mut parser_state, &project, timestamp_ms);
+                    }
                 }
                 continue;
             }
@@ -1937,6 +2198,9 @@ fn parse_file_summary(
                 continue;
             }
 
+            let attributed_project =
+                take_project_for_token(&mut parser_state, session_cwd.as_deref());
+
             if delta.input == 0 && delta.cached == 0 && delta.output == 0 {
                 continue;
             }
@@ -1947,6 +2211,15 @@ fn parse_file_summary(
                     .clone()
                     .or_else(|| extract_model_from_token_count(&value))
                     .unwrap_or_else(|| "unknown".to_string());
+                if let Some(project) = attributed_project.as_deref() {
+                    add_project_token_delta(
+                        &mut parser_state,
+                        project,
+                        timestamp_ms,
+                        delta,
+                        &model,
+                    );
+                }
                 for zone in [UsageZone::Local, UsageZone::Utc] {
                     let Some(day_key) = cache_day_key_for_timestamp_ms(timestamp_ms, zone) else {
                         continue;
@@ -1968,6 +2241,9 @@ fn parse_file_summary(
 
             if let Some(timestamp_ms) = timestamp_ms {
                 track_activity(&mut daily, &mut last_activity_ms, timestamp_ms);
+                if let Some(project) = attributed_project.as_deref() {
+                    track_project_activity(&mut parser_state, project, timestamp_ms);
+                }
             }
             continue;
         }
@@ -1990,12 +2266,33 @@ fn parse_file_summary(
                 if let Some(timestamp_ms) = event_timestamp_ms {
                     if seen_runs.insert(timestamp_ms) {
                         add_agent_run(&mut daily, timestamp_ms);
+                        if let Some(project) = parser_state
+                            .active_project_cwd
+                            .clone()
+                            .or_else(|| fallback_project_identity(session_cwd.as_deref()))
+                        {
+                            add_project_agent_run(&mut parser_state, &project, timestamp_ms);
+                        }
                     }
                     track_activity(&mut daily, &mut last_activity_ms, timestamp_ms);
+                    if let Some(project) = parser_state
+                        .active_project_cwd
+                        .clone()
+                        .or_else(|| fallback_project_identity(session_cwd.as_deref()))
+                    {
+                        track_project_activity(&mut parser_state, &project, timestamp_ms);
+                    }
                 }
             } else if payload_type != Some("message") {
                 if let Some(timestamp_ms) = event_timestamp_ms {
                     track_activity(&mut daily, &mut last_activity_ms, timestamp_ms);
+                    if let Some(project) = parser_state
+                        .active_project_cwd
+                        .clone()
+                        .or_else(|| fallback_project_identity(session_cwd.as_deref()))
+                    {
+                        track_project_activity(&mut parser_state, &project, timestamp_ms);
+                    }
                 }
             }
         }
@@ -2008,13 +2305,13 @@ fn parse_file_summary(
     parser_state.fork_replay = fork_replay;
     parser_state.fork_live_started = fork_live_started;
 
-    let effective_cwd = parser_state
-        .project_cwd
-        .clone()
-        .or_else(|| session_cwd.as_deref().and_then(project_identity_from_path))
-        .or(session_cwd);
+    if parser_state.project_cwd_counts.is_empty() {
+        if let Some(project) = fallback_project_identity(session_cwd.as_deref()) {
+            ensure_project_membership(&mut parser_state, &project);
+        }
+    }
     Ok(FileScanSummary {
-        session_cwd: effective_cwd,
+        session_cwd,
         parser_state,
         file_offset: file_offset.min(file_len),
         fully_parsed: fully_parsed && file_offset >= file_len,
@@ -2131,6 +2428,29 @@ fn open_or_init_scan_cache_db(path: &Path) -> Result<ScanCacheDb> {
             .with_context(|| {
                 format!(
                     "Unable to rebuild v9 project identities in {}",
+                    path.display()
+                )
+            })?;
+    }
+    if schema_version < 10 {
+        // v10 stores many-to-many project membership and per-project token,
+        // activity, and model aggregates in parser_state_json. Old rows only
+        // contain whole-session totals and cannot be split without replay.
+        conn.execute("DELETE FROM file_cache;", [])
+            .with_context(|| {
+                format!(
+                    "Unable to rebuild v10 project attribution in {}",
+                    path.display()
+                )
+            })?;
+    }
+    if schema_version < 11 {
+        // v11 also recognizes existing Git roots named explicitly in command
+        // arguments when the tool itself runs from a generic launcher cwd.
+        conn.execute("DELETE FROM file_cache;", [])
+            .with_context(|| {
+                format!(
+                    "Unable to rebuild v11 command-path project identities in {}",
                     path.display()
                 )
             })?;
@@ -2984,6 +3304,7 @@ pub(crate) fn normalize_project_key(path: &str) -> String {
     normalized
 }
 
+#[cfg(test)]
 pub(crate) fn project_identity_from_tool_call(
     value: &Value,
     session_cwd: Option<&str>,
@@ -3007,6 +3328,212 @@ pub(crate) fn project_identity_from_tool_call(
     let raw = ["workdir", "cwd", "working_directory"]
         .into_iter()
         .find_map(|key| arguments.get(key).and_then(Value::as_str))?;
+    project_identity_from_raw_path(raw, session_cwd)
+}
+
+#[cfg(test)]
+pub(crate) fn project_identity_from_structured_event(
+    value: &Value,
+    session_cwd: Option<&str>,
+) -> Option<String> {
+    project_identities_from_structured_event(value, session_cwd)
+        .into_iter()
+        .next()
+}
+
+pub(crate) fn project_identities_from_structured_event(
+    value: &Value,
+    session_cwd: Option<&str>,
+) -> Vec<String> {
+    let mut cache = HashMap::new();
+    project_identities_from_structured_event_cached(value, session_cwd, &mut cache)
+}
+
+fn project_identities_from_structured_event_cached(
+    value: &Value,
+    session_cwd: Option<&str>,
+    cache: &mut HashMap<String, Option<String>>,
+) -> Vec<String> {
+    let mut projects = Vec::new();
+    if value.get("type").and_then(Value::as_str) == Some("event_msg") {
+        let Some(payload) = value.get("payload").and_then(Value::as_object) else {
+            return projects;
+        };
+        let event_type = payload.get("type").and_then(Value::as_str);
+        if matches!(
+            event_type,
+            Some(
+                "exec_command_begin"
+                    | "exec_command_start"
+                    | "exec_command_end"
+                    | "thread_settings_applied"
+            )
+        ) {
+            if let Some(raw) = payload.get("cwd").and_then(Value::as_str) {
+                if let Some(project) = resolve_project_identity_cached(raw, session_cwd, cache) {
+                    projects.push(project);
+                }
+            }
+        }
+        return projects;
+    }
+
+    if value.get("type").and_then(Value::as_str) != Some("response_item") {
+        return projects;
+    }
+    let Some(payload) = value.get("payload").and_then(Value::as_object) else {
+        return projects;
+    };
+    if payload.get("type").and_then(Value::as_str) != Some("function_call") {
+        return projects;
+    }
+
+    let Some(arguments) = payload.get("arguments") else {
+        return projects;
+    };
+    let parsed_arguments;
+    let Some(arguments) = (if let Some(raw) = arguments.as_str() {
+        parsed_arguments = match serde_json::from_str::<Value>(raw) {
+            Ok(value) => value,
+            Err(_) => return projects,
+        };
+        parsed_arguments.as_object()
+    } else {
+        arguments.as_object()
+    }) else {
+        return projects;
+    };
+
+    let raw_workdir = ["workdir", "cwd", "working_directory"]
+        .into_iter()
+        .find_map(|key| arguments.get(key).and_then(Value::as_str));
+    if let Some(raw) = raw_workdir {
+        if let Some(project) = resolve_project_identity_cached(raw, session_cwd, cache) {
+            projects.push(project);
+        }
+    }
+
+    let tool_name = payload.get("name").and_then(Value::as_str).unwrap_or("");
+    if matches!(
+        tool_name,
+        "exec_command" | "shell_command" | "shell" | "run_command"
+    ) {
+        let command_base = raw_workdir.or(session_cwd);
+        for command in ["cmd", "command"]
+            .into_iter()
+            .filter_map(|key| arguments.get(key))
+            .flat_map(command_strings)
+        {
+            for raw in command_path_candidates(command) {
+                if let Some(project) = resolve_project_identity_cached(&raw, command_base, cache) {
+                    projects.push(project);
+                }
+            }
+        }
+    }
+
+    projects.sort_by_key(|project| normalize_project_key(project));
+    projects.dedup_by(|left, right| normalize_project_key(left) == normalize_project_key(right));
+    projects
+}
+
+fn command_strings(value: &Value) -> Vec<&str> {
+    match value {
+        Value::String(command) => vec![command.as_str()],
+        Value::Array(commands) => commands.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn resolve_project_identity_cached(
+    raw: &str,
+    base: Option<&str>,
+    cache: &mut HashMap<String, Option<String>>,
+) -> Option<String> {
+    let key = format!("{}\0{raw}", base.unwrap_or(""));
+    cache
+        .entry(key)
+        .or_insert_with(|| project_identity_from_raw_path(raw, base))
+        .clone()
+}
+
+fn command_path_candidates(command: &str) -> Vec<String> {
+    const MAX_COMMAND_BYTES: usize = 64 * 1024;
+    const MAX_PATH_CANDIDATES: usize = 128;
+    if command.is_empty() || command.len() > MAX_COMMAND_BYTES {
+        return Vec::new();
+    }
+
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in command.chars() {
+        if escaped {
+            token.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            } else {
+                token.push(ch);
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '(' | ')') {
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+        } else {
+            token.push(ch);
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+
+    let mut out = Vec::new();
+    let mut expect_relative_path = false;
+    for token in tokens {
+        let stripped = token.trim_matches(|ch| matches!(ch, '<' | '>' | ','));
+        let path = stripped
+            .split_once('=')
+            .map(|(_, value)| value)
+            .unwrap_or(stripped)
+            .trim_matches(|ch| matches!(ch, '<' | '>' | ','));
+        let explicit_path = path.starts_with('/')
+            || path.starts_with("./")
+            || path.starts_with("../")
+            || path.starts_with("~/")
+            || path.starts_with("\\\\wsl")
+            || (path.len() >= 3
+                && path.as_bytes()[1] == b':'
+                && matches!(path.as_bytes()[2], b'/' | b'\\'));
+        if !path.contains("://")
+            && !path.is_empty()
+            && path.len() <= 4096
+            && (explicit_path || (expect_relative_path && !path.starts_with('-')))
+        {
+            out.push(path.to_string());
+            if out.len() == MAX_PATH_CANDIDATES {
+                break;
+            }
+        }
+        expect_relative_path = matches!(stripped, "cd" | "pushd")
+            || matches!(stripped, "-C" | "--directory" | "--manifest-path");
+    }
+    out
+}
+
+fn project_identity_from_raw_path(raw: &str, session_cwd: Option<&str>) -> Option<String> {
     if let Some(identity) = project_identity_from_path(raw) {
         return Some(identity);
     }
@@ -3707,6 +4234,78 @@ mod tests {
     }
 
     #[test]
+    fn fork_replay_inherits_project_context_without_double_counting() {
+        let root = make_temp_dir("fork-project-context");
+        let codex_home = root.join("codex");
+        let sessions_root = codex_home.join("sessions");
+        let project = root.join("project");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions root");
+        std::fs::create_dir_all(project.join(".git")).expect("create project");
+
+        let parent_id = "33333333-3333-4333-8333-333333333333";
+        let child_id = "44444444-4444-4444-8444-444444444444";
+        let parent_path = sessions_root.join(format!("rollout-parent-{parent_id}.jsonl"));
+        let child_path = sessions_root.join(format!("rollout-child-{child_id}.jsonl"));
+        let fork_ms = Utc::now().timestamp_millis() - Duration::hours(1).num_milliseconds();
+
+        append_session_meta_line(&parent_path, fork_ms - 1_000, "/outside/launcher");
+        append_json_line(
+            &parent_path,
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": Utc.timestamp_millis_opt(fork_ms - 200).single().unwrap().to_rfc3339(),
+                "payload": {
+                    "type": "function_call",
+                    "arguments": serde_json::json!({"workdir": project}).to_string()
+                }
+            }),
+        );
+        append_total_token_line(&parent_path, fork_ms - 100, 1_500, 1_300, 130);
+
+        append_json_line(
+            &child_path,
+            serde_json::json!({
+                "type": "session_meta",
+                "timestamp": Utc.timestamp_millis_opt(fork_ms).single().unwrap().to_rfc3339(),
+                "payload": {
+                    "id": child_id,
+                    "forked_from_id": parent_id,
+                    "timestamp": Utc.timestamp_millis_opt(fork_ms).single().unwrap().to_rfc3339(),
+                    "cwd": "/outside/launcher"
+                }
+            }),
+        );
+        // Copied parent context establishes the inherited project but must not
+        // create usage or membership until the child becomes live.
+        append_json_line(
+            &child_path,
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": Utc.timestamp_millis_opt(fork_ms + 20).single().unwrap().to_rfc3339(),
+                "payload": {
+                    "type": "function_call",
+                    "arguments": serde_json::json!({"workdir": project}).to_string()
+                }
+            }),
+        );
+        append_total_token_line(&child_path, fork_ms + 100, 1_500, 1_300, 130);
+        append_agent_message_line(&child_path, fork_ms + 1_500);
+        append_total_token_line(&child_path, fork_ms + 1_600, 1_700, 1_400, 150);
+
+        let snapshot = compute_snapshot(30, &codex_home, None, default_test_limits(false), None)
+            .expect("snapshot");
+        let project_usage = snapshot
+            .project_usage_for_path(&project.display().to_string())
+            .expect("project usage");
+        assert_eq!(snapshot.totals.last30_days_tokens, 1_850);
+        assert_eq!(project_usage.total_tokens, 1_850);
+        assert_eq!(project_usage.indexed_files, 2);
+        assert_eq!(project_usage.session_files.len(), 2);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn cached_scanner_advances_through_backlog_across_refreshes() {
         let root = make_temp_dir("scan-backlog");
         let codex_home = root.join("codex");
@@ -3991,6 +4590,74 @@ mod tests {
         assert_eq!(summary.total_tokens, 120);
         assert_eq!(summary.cached_input_tokens, 25);
         assert_eq!(summary.indexed_files, 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compute_snapshot_splits_one_session_between_projects_without_double_counting() {
+        let root = make_temp_dir("project-many-to-many");
+        let codex_home = root.join("codex");
+        let sessions_root = codex_home.join("sessions");
+        let project_a = root.join("project-a");
+        let project_b = root.join("project-b");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions root");
+        std::fs::create_dir_all(project_a.join(".git")).expect("create project a");
+        std::fs::create_dir_all(project_b.join(".git")).expect("create project b");
+
+        let now_ms = Utc::now().timestamp_millis();
+        let session = sessions_root.join("session.jsonl");
+        append_session_meta_line(&session, now_ms, "/outside/launcher");
+        for (project, timestamp_ms, input, cached, output) in [
+            (&project_a, now_ms + 100, 100, 25, 20),
+            (&project_b, now_ms + 200, 160, 35, 30),
+        ] {
+            append_json_line(
+                &session,
+                serde_json::json!({
+                    "type": "response_item",
+                    "timestamp": Utc
+                        .timestamp_millis_opt(timestamp_ms - 1)
+                        .single()
+                        .expect("timestamp")
+                        .to_rfc3339(),
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "arguments": serde_json::json!({"workdir": project}).to_string()
+                    }
+                }),
+            );
+            append_total_token_line(&session, timestamp_ms, input, cached, output);
+        }
+
+        let snapshot = compute_snapshot(30, &codex_home, None, default_test_limits(false), None)
+            .expect("snapshot");
+        let a = snapshot
+            .project_usage_for_path(&project_a.display().to_string())
+            .expect("project a usage");
+        let b = snapshot
+            .project_usage_for_path(&project_b.display().to_string())
+            .expect("project b usage");
+        assert_eq!(a.total_tokens, 120);
+        assert_eq!(a.cached_input_tokens, 25);
+        assert_eq!(a.indexed_files, 1);
+        assert_eq!(b.total_tokens, 70);
+        assert_eq!(b.cached_input_tokens, 10);
+        assert_eq!(b.indexed_files, 1);
+        assert_eq!(a.total_tokens + b.total_tokens, 190);
+        assert_eq!(snapshot.totals.last30_days_tokens, 190);
+
+        let filtered_a = compute_snapshot(
+            30,
+            &codex_home,
+            Some(&project_a),
+            default_test_limits(false),
+            None,
+        )
+        .expect("filtered project a snapshot");
+        assert_eq!(filtered_a.totals.last30_days_tokens, 120);
+        assert_eq!(filtered_a.matched_session_files, 1);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4516,8 +5183,8 @@ mod tests {
     }
 
     #[test]
-    fn open_or_init_scan_cache_db_v9_reparses_v8_rows_for_project_identity() {
-        let root = make_temp_dir("cache-migrate-v9");
+    fn open_or_init_scan_cache_db_v11_reparses_v10_rows_for_command_path_attribution() {
+        let root = make_temp_dir("cache-migrate-v11");
         let sessions_root = root.join("sessions");
         std::fs::create_dir_all(&sessions_root).expect("create sessions root");
         let keep_path = sessions_root.join("keep.jsonl");
@@ -4527,14 +5194,14 @@ mod tests {
         write_forked_replay_file(&forked_path, now_ms);
 
         let db_path = root.join("comon.db");
-        let conn = Connection::open(&db_path).expect("open v8 db");
+        let conn = Connection::open(&db_path).expect("open v10 db");
         conn.execute_batch(
             "
             CREATE TABLE cache_meta (
                 key TEXT PRIMARY KEY,
                 value INTEGER NOT NULL
             );
-            INSERT INTO cache_meta(key, value) VALUES('schema_version', 8);
+            INSERT INTO cache_meta(key, value) VALUES('schema_version', 10);
             CREATE TABLE file_cache (
                 file_path TEXT PRIMARY KEY,
                 file_size INTEGER NOT NULL,
@@ -4549,7 +5216,7 @@ mod tests {
             );
             ",
         )
-        .expect("create v8 schema");
+        .expect("create v10 schema");
         for path in [&keep_path, &forked_path] {
             conn.execute(
                 "
@@ -4608,6 +5275,101 @@ mod tests {
                     .to_string()
             )
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn thread_settings_cwd_resolves_to_project_git_root() {
+        let root = make_temp_dir("thread-settings-project");
+        let project = root.join("project");
+        let child = project.join("src");
+        std::fs::create_dir_all(project.join(".git")).expect("create git marker");
+        std::fs::create_dir_all(&child).expect("create child");
+        let value = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "thread_settings_applied",
+                "cwd": child
+            }
+        });
+
+        assert_eq!(
+            project_identity_from_structured_event(&value, None),
+            Some(
+                std::fs::canonicalize(&project)
+                    .expect("canonical project")
+                    .display()
+                    .to_string()
+            )
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn command_paths_resolve_multiple_git_projects_from_launcher_cwd() {
+        let root = make_temp_dir("command-path-projects");
+        let launcher = root.join("launcher");
+        let project_a = root.join("project-a");
+        let project_b = root.join("project-b");
+        std::fs::create_dir_all(&launcher).expect("create launcher");
+        std::fs::create_dir_all(project_a.join(".git")).expect("create project a");
+        std::fs::create_dir_all(project_a.join("src")).expect("create project a child");
+        std::fs::create_dir_all(project_b.join(".git")).expect("create project b");
+        let command = format!(
+            "rg needle {}/src && cd ../project-b && cargo check",
+            project_a.display()
+        );
+        let value = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": serde_json::json!({
+                    "workdir": launcher,
+                    "cmd": command
+                }).to_string()
+            }
+        });
+
+        let projects =
+            project_identities_from_structured_event(&value, Some(&root.display().to_string()));
+        assert_eq!(projects.len(), 2, "resolved projects: {projects:?}");
+        assert!(projects.iter().any(|path| path
+            == &std::fs::canonicalize(&project_a)
+                .expect("canonical project a")
+                .display()
+                .to_string()));
+        assert!(projects.iter().any(|path| path
+            == &std::fs::canonicalize(&project_b)
+                .expect("canonical project b")
+                .display()
+                .to_string()));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn command_path_extraction_ignores_urls_and_plain_prose() {
+        let root = make_temp_dir("command-path-bounds");
+        let project = root.join("project");
+        std::fs::create_dir_all(project.join(".git")).expect("create project");
+        let value = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": serde_json::json!({
+                    "workdir": root,
+                    "cmd": "echo project && curl https://example.test/project"
+                }).to_string()
+            }
+        });
+
+        let projects =
+            project_identities_from_structured_event(&value, Some(&project.display().to_string()));
+        assert!(projects.is_empty(), "resolved projects: {projects:?}");
 
         let _ = std::fs::remove_dir_all(root);
     }

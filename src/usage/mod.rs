@@ -18,7 +18,8 @@ const DEFAULT_MAX_SESSION_FILES_SCANNED: usize = 10_000;
 const DEFAULT_MAX_JSONL_LINE_BYTES: usize = 512 * 1024;
 const DEFAULT_SCAN_TIME_BUDGET_MS: u64 = 1500;
 const MAX_DISTINCT_MODELS: usize = 5_000;
-const SCAN_CACHE_DB_SCHEMA_VERSION: i64 = 6;
+const SCAN_CACHE_DB_SCHEMA_VERSION: i64 = 9;
+pub(crate) const PROJECT_IDENTITY_LINE_LIMIT: usize = 128;
 const FORK_REPLAY_END_GAP_MS: i64 = 1_000;
 const FORK_REPLAY_NO_TOKEN_GRACE_MS: i64 = 2_000;
 pub const DEFAULT_SCAN_CACHE_MAX_ENTRIES: usize = 50_000;
@@ -223,6 +224,16 @@ pub struct ProjectActivity {
 }
 
 #[derive(Debug, Clone)]
+pub struct ProjectUsageSummary {
+    pub display_path: String,
+    pub total_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub agent_time_ms: i64,
+    pub agent_runs: i64,
+    pub indexed_files: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct LocalUsageSnapshot {
     pub days: Vec<UsageDay>,
     pub totals: UsageTotalsTokens,
@@ -232,6 +243,7 @@ pub struct LocalUsageSnapshot {
     pub utc_top_models: Vec<LocalUsageModel>,
     pub activity_first_weekday: Weekday,
     pub project_activity: Vec<ProjectActivity>,
+    pub project_usage: Vec<ProjectUsageSummary>,
     // Number of session files that were identified as belonging to the selected workspace filter.
     // When no workspace filter is used, this is 0.
     pub matched_session_files: u32,
@@ -254,6 +266,13 @@ pub struct UsageTotalsView {
 }
 
 impl LocalUsageSnapshot {
+    pub fn project_usage_for_path(&self, path: &str) -> Option<&ProjectUsageSummary> {
+        let key = normalize_project_key(path);
+        self.project_usage
+            .iter()
+            .find(|project| normalize_project_key(&project.display_path) == key)
+    }
+
     pub fn days_for_zone(&self, zone: UsageZone) -> &[UsageDay] {
         match zone {
             UsageZone::Local => &self.days,
@@ -450,6 +469,12 @@ struct ParserState {
     fork_baseline: Option<UsageTotals>,
     #[serde(default)]
     fork_live_started: bool,
+    #[serde(default)]
+    project_cwd: Option<String>,
+    #[serde(default)]
+    project_cwd_counts: HashMap<String, u32>,
+    #[serde(default)]
+    project_identity_lines_seen: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
@@ -520,6 +545,16 @@ impl ForkResolution {
 struct ProjectActivityBuilder {
     display_path: String,
     daily: HashMap<String, DailyTotals>,
+}
+
+#[derive(Debug, Default)]
+struct ProjectUsageBuilder {
+    display_path: String,
+    total_tokens: i64,
+    cached_input_tokens: i64,
+    agent_time_ms: i64,
+    agent_runs: i64,
+    indexed_files: usize,
 }
 
 fn default_true() -> bool {
@@ -603,6 +638,7 @@ pub fn compute_snapshot(
             activity_first_weekday,
             activity_day_keys,
             project_activity,
+            Vec::new(),
             0,
             0,
             0,
@@ -903,6 +939,9 @@ pub fn compute_snapshot(
                 &mut project_activity,
                 &mut matched_session_files,
             );
+            scan_cache_store
+                .entries
+                .insert(candidate_paths[idx].clone(), entry);
         }
     }
 
@@ -949,6 +988,8 @@ pub fn compute_snapshot(
     let chart_day_keys = make_complete_chart_day_keys(&daily, UsageZone::Local, &summary_day_keys);
     let utc_chart_day_keys =
         make_complete_chart_day_keys(&utc_daily, UsageZone::Utc, &utc_summary_day_keys);
+    let project_usage =
+        build_project_usage_summaries(&candidates, &candidate_paths, &scan_cache_store);
 
     Ok(build_snapshot(
         chart_day_keys,
@@ -961,6 +1002,7 @@ pub fn compute_snapshot(
         activity_first_weekday,
         activity_day_keys,
         project_activity,
+        project_usage,
         scan_total_files,
         scan_indexed_files,
         scan_pending_files,
@@ -1238,6 +1280,7 @@ fn build_snapshot(
     activity_first_weekday: Weekday,
     activity_day_keys: Vec<String>,
     project_activity: HashMap<String, ProjectActivityBuilder>,
+    project_usage: Vec<ProjectUsageSummary>,
     scan_total_files: usize,
     scan_indexed_files: usize,
     scan_pending_files: usize,
@@ -1256,6 +1299,7 @@ fn build_snapshot(
         utc_top_models,
         activity_first_weekday,
         project_activity: build_project_activity(activity_day_keys, project_activity),
+        project_usage,
         matched_session_files,
         scan_total_files,
         scan_indexed_files,
@@ -1338,6 +1382,74 @@ fn build_zone_snapshot(
         },
         top_models,
     )
+}
+
+fn build_project_usage_summaries(
+    candidates: &[SessionFileCandidate],
+    candidate_paths: &[String],
+    cache: &ScanCacheStore,
+) -> Vec<ProjectUsageSummary> {
+    let mut projects: HashMap<String, ProjectUsageBuilder> = HashMap::new();
+
+    for (index, candidate) in candidates.iter().enumerate() {
+        let Some(path) = candidate_paths.get(index) else {
+            continue;
+        };
+        let Some(entry) = cache.entries.get(path) else {
+            continue;
+        };
+        if !cache_entry_matches_candidate(entry, candidate) {
+            continue;
+        }
+        let Some(cwd) = entry
+            .session_cwd
+            .as_deref()
+            .filter(|cwd| !cwd.trim().is_empty())
+        else {
+            continue;
+        };
+        let key = normalize_project_key(cwd);
+        if key.is_empty() {
+            continue;
+        }
+
+        let project = projects.entry(key).or_default();
+        if project.display_path.is_empty()
+            || cwd.len() < project.display_path.len()
+            || (cwd.len() == project.display_path.len() && cwd < project.display_path.as_str())
+        {
+            project.display_path = cwd.to_string();
+        }
+        project.indexed_files = project.indexed_files.saturating_add(1);
+
+        for (cache_key, totals) in &entry.daily {
+            let Some((UsageZone::Local, _)) = split_cache_day_key(cache_key) else {
+                continue;
+            };
+            project.total_tokens = project
+                .total_tokens
+                .saturating_add(totals.input.saturating_add(totals.output));
+            project.cached_input_tokens = project
+                .cached_input_tokens
+                .saturating_add(totals.cached.min(totals.input));
+            project.agent_time_ms = project.agent_time_ms.saturating_add(totals.agent_ms);
+            project.agent_runs = project.agent_runs.saturating_add(totals.agent_runs);
+        }
+    }
+
+    let mut out = projects
+        .into_values()
+        .map(|project| ProjectUsageSummary {
+            display_path: project.display_path,
+            total_tokens: project.total_tokens,
+            cached_input_tokens: project.cached_input_tokens,
+            agent_time_ms: project.agent_time_ms,
+            agent_runs: project.agent_runs,
+            indexed_files: project.indexed_files,
+        })
+        .collect::<Vec<_>>();
+    out.sort_by(|left, right| left.display_path.cmp(&right.display_path));
+    out
 }
 
 fn build_project_activity(
@@ -1638,6 +1750,8 @@ fn parse_file_summary(
             break;
         }
         file_offset = file_offset.saturating_add(bytes_read as u64);
+        parser_state.project_identity_lines_seen =
+            parser_state.project_identity_lines_seen.saturating_add(1);
         if line.len() > max_jsonl_line_bytes {
             continue;
         }
@@ -1653,6 +1767,17 @@ fn parse_file_summary(
 
         if (entry_type == "session_meta" || entry_type == "turn_context") && session_cwd.is_none() {
             session_cwd = extract_cwd(&value);
+        }
+        if entry_type == "response_item"
+            && usize::try_from(parser_state.project_identity_lines_seen).unwrap_or(usize::MAX)
+                <= PROJECT_IDENTITY_LINE_LIMIT
+        {
+            if let Some(project) = project_identity_from_tool_call(&value, session_cwd.as_deref()) {
+                let count = parser_state.project_cwd_counts.entry(project).or_default();
+                *count = count.saturating_add(1);
+                parser_state.project_cwd =
+                    preferred_project_identity(&parser_state.project_cwd_counts);
+            }
         }
 
         let started_fork_replay = if entry_type == "session_meta" {
@@ -1883,8 +2008,13 @@ fn parse_file_summary(
     parser_state.fork_replay = fork_replay;
     parser_state.fork_live_started = fork_live_started;
 
+    let effective_cwd = parser_state
+        .project_cwd
+        .clone()
+        .or_else(|| session_cwd.as_deref().and_then(project_identity_from_path))
+        .or(session_cwd);
     Ok(FileScanSummary {
-        session_cwd,
+        session_cwd: effective_cwd,
         parser_state,
         file_offset: file_offset.min(file_len),
         fully_parsed: fully_parsed && file_offset >= file_len,
@@ -1991,6 +2121,19 @@ fn open_or_init_scan_cache_db(path: &Path) -> Result<ScanCacheDb> {
         // baseline is available. Reparse only fork rows so the first live
         // response after the copied prefix contributes to run/activity data.
         invalidate_forked_session_cache_rows(&conn, path)?;
+    }
+    if schema_version < 9 {
+        // v9 identifies the effective project from the dominant structured
+        // tool workdir before falling back to the session cwd.
+        // Existing rows must be replayed because parser_state_json did not yet
+        // retain that identity.
+        conn.execute("DELETE FROM file_cache;", [])
+            .with_context(|| {
+                format!(
+                    "Unable to rebuild v9 project identities in {}",
+                    path.display()
+                )
+            })?;
     }
     if schema_version < SCAN_CACHE_DB_SCHEMA_VERSION {
         conn.execute(
@@ -2831,8 +2974,121 @@ fn path_matches_workspace(cwd: &str, workspace_path: &Path) -> bool {
     cwd_path == workspace_path || cwd_path.starts_with(workspace_path)
 }
 
-fn normalize_project_key(path: &str) -> String {
-    path.trim().to_lowercase()
+pub(crate) fn normalize_project_key(path: &str) -> String {
+    let mut normalized = normalize_wsl_unc_path(path)
+        .unwrap_or_else(|| path.trim().replace('\\', "/"))
+        .to_lowercase();
+    while normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+    normalized
+}
+
+pub(crate) fn project_identity_from_tool_call(
+    value: &Value,
+    session_cwd: Option<&str>,
+) -> Option<String> {
+    if value.get("type").and_then(Value::as_str) != Some("response_item") {
+        return None;
+    }
+    let payload = value.get("payload")?.as_object()?;
+    if payload.get("type").and_then(Value::as_str) != Some("function_call") {
+        return None;
+    }
+
+    let arguments = payload.get("arguments")?;
+    let parsed_arguments;
+    let arguments = if let Some(raw) = arguments.as_str() {
+        parsed_arguments = serde_json::from_str::<Value>(raw).ok()?;
+        parsed_arguments.as_object()?
+    } else {
+        arguments.as_object()?
+    };
+    let raw = ["workdir", "cwd", "working_directory"]
+        .into_iter()
+        .find_map(|key| arguments.get(key).and_then(Value::as_str))?;
+    if let Some(identity) = project_identity_from_path(raw) {
+        return Some(identity);
+    }
+
+    let base = session_cwd.and_then(normalize_cross_platform_path)?;
+    let relative = Path::new(raw);
+    if relative.is_absolute() {
+        return None;
+    }
+    project_identity_from_path(&base.join(relative).display().to_string())
+}
+
+pub(crate) fn project_identity_from_path(raw: &str) -> Option<String> {
+    if raw.is_empty() || raw.len() > 4096 || raw.chars().any(char::is_control) {
+        return None;
+    }
+    let normalized = normalize_cross_platform_path(raw)?;
+    let path = normalized.as_path();
+    if !path.is_absolute() {
+        return None;
+    }
+
+    let mut current = path;
+    loop {
+        if current.join(".git").exists() {
+            let canonical =
+                std::fs::canonicalize(current).unwrap_or_else(|_| current.to_path_buf());
+            return Some(canonical.display().to_string());
+        }
+        current = current.parent()?;
+    }
+}
+
+fn preferred_project_identity(counts: &HashMap<String, u32>) -> Option<String> {
+    counts
+        .iter()
+        .max_by(|(left_path, left_count), (right_path, right_count)| {
+            left_count.cmp(right_count).then_with(|| {
+                Path::new(left_path)
+                    .components()
+                    .count()
+                    .cmp(&Path::new(right_path).components().count())
+            })
+        })
+        .map(|(path, _)| path.clone())
+}
+
+fn normalize_cross_platform_path(path: &str) -> Option<PathBuf> {
+    let normalized = normalize_wsl_unc_path(path).unwrap_or_else(|| path.trim().replace('\\', "/"));
+    if normalized.is_empty() {
+        return None;
+    }
+
+    #[cfg(unix)]
+    {
+        let bytes = normalized.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes[2] == b'/'
+        {
+            let drive = char::from(bytes[0]).to_ascii_lowercase();
+            return Some(PathBuf::from(format!("/mnt/{drive}/{}", &normalized[3..])));
+        }
+    }
+
+    Some(PathBuf::from(normalized))
+}
+
+fn normalize_wsl_unc_path(path: &str) -> Option<String> {
+    let normalized = path.trim().replace('\\', "/");
+    let lower = normalized.to_lowercase();
+    let prefix_len = if lower.starts_with("//wsl.localhost/") {
+        "//wsl.localhost/".len()
+    } else if lower.starts_with("//wsl$/") {
+        "//wsl$/".len()
+    } else {
+        return None;
+    };
+    let rest = normalized.get(prefix_len..)?;
+    let (_, linux_path) = rest.split_once('/')?;
+    Some(format!("/{linux_path}"))
 }
 
 fn make_day_keys_for_zone(days: u32, zone: UsageZone) -> Vec<String> {
@@ -3671,11 +3927,11 @@ mod tests {
         let newer_ms = now_ms - Duration::days(1).num_milliseconds();
 
         let photonia = sessions_root.join("photonia.jsonl");
-        append_session_meta_line(&photonia, older_ms, "/tmp/Photonia");
+        append_session_meta_line(&photonia, older_ms, "/outside/Photonia");
         append_total_token_line(&photonia, older_ms + 100, 100, 0, 20);
 
         let sfm = sessions_root.join("sfm.jsonl");
-        append_session_meta_line(&sfm, newer_ms, "/tmp/SFM");
+        append_session_meta_line(&sfm, newer_ms, "/outside/SFM");
         append_total_token_line(&sfm, newer_ms + 100, 200, 150, 50);
 
         let snapshot = compute_snapshot(30, &codex_home, None, default_test_limits(false), None)
@@ -3686,12 +3942,55 @@ mod tests {
             snapshot.project_activity[0].days.len(),
             ACTIVITY_TIMELINE_DAYS
         );
-        assert_eq!(snapshot.project_activity[0].display_path, "/tmp/SFM");
+        assert_eq!(snapshot.project_activity[0].display_path, "/outside/SFM");
         assert_eq!(snapshot.project_activity[0].total_tokens, 250);
         assert_eq!(snapshot.project_activity[0].cached_input_tokens, 150);
-        assert_eq!(snapshot.project_activity[1].display_path, "/tmp/Photonia");
+        assert_eq!(
+            snapshot.project_activity[1].display_path,
+            "/outside/Photonia"
+        );
         assert_eq!(snapshot.project_activity[1].total_tokens, 120);
         assert_eq!(snapshot.project_activity[1].cached_input_tokens, 0);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compute_snapshot_attributes_project_usage_to_structured_tool_workdir() {
+        let root = make_temp_dir("project-tool-workdir");
+        let codex_home = root.join("codex");
+        let sessions_root = codex_home.join("sessions");
+        let project = root.join("rustadmin-fps-diag");
+        let project_child = project.join("flutter");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions root");
+        std::fs::create_dir_all(project.join(".git")).expect("create git marker");
+        std::fs::create_dir_all(&project_child).expect("create project child");
+
+        let now_ms = Utc::now().timestamp_millis();
+        let session = sessions_root.join("session.jsonl");
+        append_session_meta_line(&session, now_ms, "/outside/non-git");
+        append_json_line(
+            &session,
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": serde_json::json!({"workdir": project_child}).to_string()
+                }
+            }),
+        );
+        append_total_token_line(&session, now_ms + 100, 100, 25, 20);
+
+        let snapshot = compute_snapshot(30, &codex_home, None, default_test_limits(false), None)
+            .expect("snapshot");
+        let summary = snapshot
+            .project_usage_for_path(&project.display().to_string())
+            .expect("project usage");
+        assert_eq!(summary.display_path, project.display().to_string());
+        assert_eq!(summary.total_tokens, 120);
+        assert_eq!(summary.cached_input_tokens, 25);
+        assert_eq!(summary.indexed_files, 1);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4217,8 +4516,8 @@ mod tests {
     }
 
     #[test]
-    fn open_or_init_scan_cache_db_v6_reparses_only_v5_fork_rows() {
-        let root = make_temp_dir("cache-migrate-v6");
+    fn open_or_init_scan_cache_db_v9_reparses_v8_rows_for_project_identity() {
+        let root = make_temp_dir("cache-migrate-v9");
         let sessions_root = root.join("sessions");
         std::fs::create_dir_all(&sessions_root).expect("create sessions root");
         let keep_path = sessions_root.join("keep.jsonl");
@@ -4228,14 +4527,14 @@ mod tests {
         write_forked_replay_file(&forked_path, now_ms);
 
         let db_path = root.join("comon.db");
-        let conn = Connection::open(&db_path).expect("open v5 db");
+        let conn = Connection::open(&db_path).expect("open v8 db");
         conn.execute_batch(
             "
             CREATE TABLE cache_meta (
                 key TEXT PRIMARY KEY,
                 value INTEGER NOT NULL
             );
-            INSERT INTO cache_meta(key, value) VALUES('schema_version', 5);
+            INSERT INTO cache_meta(key, value) VALUES('schema_version', 8);
             CREATE TABLE file_cache (
                 file_path TEXT PRIMARY KEY,
                 file_size INTEGER NOT NULL,
@@ -4250,7 +4549,7 @@ mod tests {
             );
             ",
         )
-        .expect("create v5 schema");
+        .expect("create v8 schema");
         for path in [&keep_path, &forked_path] {
             conn.execute(
                 "
@@ -4267,14 +4566,71 @@ mod tests {
 
         let db = open_or_init_scan_cache_db(&db_path).expect("open and migrate");
         let (store, _) = load_scan_cache_store(&db).expect("load migrated cache");
-        assert!(store
-            .entries
-            .contains_key(&keep_path.to_string_lossy().to_string()));
-        assert!(!store
-            .entries
-            .contains_key(&forked_path.to_string_lossy().to_string()));
+        assert!(store.entries.is_empty());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_keys_unify_wsl_unc_and_linux_paths() {
+        assert_eq!(
+            normalize_project_key(r"\\wsl.localhost\Ubuntu\home\w0w\rustadmin-fps-diag\"),
+            normalize_project_key("/home/w0w/rustadmin-fps-diag")
+        );
+        assert_eq!(
+            normalize_project_key(r"\\wsl$\Ubuntu\home\w0w\rustadmin-fps-diag"),
+            "/home/w0w/rustadmin-fps-diag"
+        );
+    }
+
+    #[test]
+    fn structured_relative_workdir_resolves_from_session_cwd() {
+        let root = make_temp_dir("relative-project-workdir");
+        let launcher = root.join("launcher");
+        let project = root.join("project");
+        std::fs::create_dir_all(&launcher).expect("create launcher");
+        std::fs::create_dir_all(project.join(".git")).expect("create git marker");
+        std::fs::create_dir_all(project.join("flutter")).expect("create child");
+        let value = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "arguments": serde_json::json!({"workdir": "../project/flutter"}).to_string()
+            }
+        });
+
+        assert_eq!(
+            project_identity_from_tool_call(&value, Some(&launcher.display().to_string())),
+            Some(
+                std::fs::canonicalize(&project)
+                    .expect("canonical project")
+                    .display()
+                    .to_string()
+            )
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dominant_project_identity_wins_over_earlier_parent_workdir() {
+        let counts = HashMap::from([
+            ("/home/w0w".to_string(), 3),
+            ("/home/w0w/rustadmin-fps-diag".to_string(), 21),
+        ]);
+        assert_eq!(
+            preferred_project_identity(&counts),
+            Some("/home/w0w/rustadmin-fps-diag".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_drive_path_maps_to_wsl_mount() {
+        assert_eq!(
+            normalize_cross_platform_path(r"C:\Users\w0w\project"),
+            Some(PathBuf::from("/mnt/c/Users/w0w/project"))
+        );
     }
 
     #[test]

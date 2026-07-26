@@ -180,7 +180,15 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
         ActiveScreen::Read => {
             let system_locale = state.system_locale.clone();
             let formatter = DisplayFormatter::new(state.display_style, &system_locale);
-            crate::read::tui::render(frame, inner, &mut state.read_browser, formatter);
+            crate::read::tui::render(
+                frame,
+                inner,
+                &mut state.read_browser,
+                state.usage.as_ref(),
+                state.usage_error.as_deref(),
+                formatter,
+            );
+            render_history_style_controls(frame, inner, state);
         }
     }
 
@@ -2709,6 +2717,38 @@ fn control_group_label(label: &'static str) -> Span<'static> {
             .bg(DARK_BAR_COLOR)
             .add_modifier(Modifier::BOLD),
     )
+}
+
+fn render_history_style_controls(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
+    let area = crate::read::tui::history_style_controls_area(area);
+    if area.width == 0 {
+        return;
+    }
+    let segments = [
+        (" STYLE ", None),
+        (
+            " CLASS ",
+            Some(UiClickAction::SetDisplayStyle(DisplayStyle::Classic)),
+        ),
+        (
+            " SCOMP ",
+            Some(UiClickAction::SetDisplayStyle(DisplayStyle::SystemCompact)),
+        ),
+        (
+            " SFULL ",
+            Some(UiClickAction::SetDisplayStyle(DisplayStyle::SystemFull)),
+        ),
+    ];
+    let spans = vec![
+        control_group_label("STYLE"),
+        pill("CLASS", state.display_style == DisplayStyle::Classic),
+        pill("SCOMP", state.display_style == DisplayStyle::SystemCompact),
+        pill("SFULL", state.display_style == DisplayStyle::SystemFull),
+    ];
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    state
+        .ui_hit_targets
+        .extend(right_aligned_targets(area, &segments));
 }
 
 #[derive(Debug)]

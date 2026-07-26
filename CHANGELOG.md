@@ -4,6 +4,11 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+## 0.4.4 - 2026-07-26
+
+- Placed APISTAT immediately after USAGE and aligned its header, live-limits card, server-total cards, and reset-credit summary with the Usage dashboard.
+- Moved the Activity, Limits, and History header rows between one blank line above and below their status information.
+
 ## 0.4.3 - 2026-07-22
 
 - Added a persisted `n` shortcut to cycle display formatting through Classic, System Compact, and System Full for numbers, dates, times, and calendar labels.

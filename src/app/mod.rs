@@ -193,9 +193,9 @@ enum ApiStatCommand {
 
 fn next_active_screen(screen: ActiveScreen) -> ActiveScreen {
     match screen {
-        ActiveScreen::Usage => ActiveScreen::Activity,
-        ActiveScreen::Activity => ActiveScreen::ApiStat,
-        ActiveScreen::ApiStat => ActiveScreen::LimitResets,
+        ActiveScreen::Usage => ActiveScreen::ApiStat,
+        ActiveScreen::ApiStat => ActiveScreen::Activity,
+        ActiveScreen::Activity => ActiveScreen::LimitResets,
         ActiveScreen::LimitResets => ActiveScreen::Read,
         ActiveScreen::Read => ActiveScreen::Usage,
     }
@@ -1989,17 +1989,17 @@ mod tests {
     }
 
     #[test]
-    fn screen_cycle_includes_api_stats_and_limit_resets() {
+    fn screen_cycle_places_api_stats_after_usage() {
         assert_eq!(
             next_active_screen(ActiveScreen::Usage),
-            ActiveScreen::Activity
-        );
-        assert_eq!(
-            next_active_screen(ActiveScreen::Activity),
             ActiveScreen::ApiStat
         );
         assert_eq!(
             next_active_screen(ActiveScreen::ApiStat),
+            ActiveScreen::Activity
+        );
+        assert_eq!(
+            next_active_screen(ActiveScreen::Activity),
             ActiveScreen::LimitResets
         );
         assert_eq!(

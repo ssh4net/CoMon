@@ -352,10 +352,11 @@ fn render_header(
     state: &BrowserState,
     formatter: DisplayFormatter<'_>,
 ) {
+    let line_area = header_line_area(area);
     let row = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(32), Constraint::Length(30)])
-        .split(area);
+        .split(line_area);
 
     let scope = format!(
         "SESSION_HISTORY {}",
@@ -382,6 +383,15 @@ fn render_header(
         ))),
         row[1],
     );
+}
+
+fn header_line_area(area: Rect) -> Rect {
+    Rect {
+        x: area.x,
+        y: area.y.saturating_add(area.height.min(2).saturating_sub(1)),
+        width: area.width,
+        height: area.height.min(1),
+    }
 }
 
 fn render_projects_view(
@@ -782,4 +792,18 @@ fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
         && column < area.x.saturating_add(area.width)
         && row >= area.y
         && row < area.y.saturating_add(area.height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::header_line_area;
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn header_line_has_one_blank_row_above_and_below() {
+        assert_eq!(
+            header_line_area(Rect::new(2, 1, 100, 3)),
+            Rect::new(2, 2, 100, 1)
+        );
+    }
 }

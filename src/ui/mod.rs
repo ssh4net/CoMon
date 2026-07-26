@@ -96,7 +96,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .title(Span::styled(
-            app_title(state.active_screen),
+            app_title(),
             Style::default().add_modifier(Modifier::BOLD),
         ))
         .title_top(navigation.right_aligned())
@@ -148,14 +148,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
         }
         ActiveScreen::ApiStat => {
             let footer_height = footer_height(inner.width, state);
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),
-                    Constraint::Min(0),
-                    Constraint::Length(footer_height),
-                ])
-                .split(inner);
+            let chunks = usage_screen_layout(inner, footer_height);
 
             render_api_stat_header(frame, chunks[0], state);
             render_api_stats(frame, chunks[1], state);
@@ -198,12 +191,8 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
     }
 }
 
-fn app_title(active_screen: ActiveScreen) -> String {
-    if active_screen == ActiveScreen::ApiStat {
-        format!(" comon :: {} :: SOURCE OPENAI ", env!("CARGO_PKG_VERSION"))
-    } else {
-        format!(" comon :: {} ", env!("CARGO_PKG_VERSION"))
-    }
+fn app_title() -> String {
+    format!(" comon :: {} ", env!("CARGO_PKG_VERSION"))
 }
 
 fn usage_screen_layout(area: Rect, footer_height: u16) -> [Rect; 3] {
@@ -232,12 +221,12 @@ fn navigation_title(area: Rect, active_screen: ActiveScreen) -> (Line<'static>, 
             Some(UiClickAction::SetScreen(ActiveScreen::Usage)),
         ),
         (
-            " ACTIVITY ",
-            Some(UiClickAction::SetScreen(ActiveScreen::Activity)),
-        ),
-        (
             " APISTAT ",
             Some(UiClickAction::SetScreen(ActiveScreen::ApiStat)),
+        ),
+        (
+            " ACTIVITY ",
+            Some(UiClickAction::SetScreen(ActiveScreen::Activity)),
         ),
         (
             " LIMITS ",
@@ -248,7 +237,7 @@ fn navigation_title(area: Rect, active_screen: ActiveScreen) -> (Line<'static>, 
             Some(UiClickAction::SetScreen(ActiveScreen::Read)),
         ),
     ];
-    let app_title_width = UnicodeWidthStr::width(app_title(active_screen).as_str());
+    let app_title_width = UnicodeWidthStr::width(app_title().as_str());
     let navigation_width = segments
         .iter()
         .map(|(text, _)| UnicodeWidthStr::width(*text))
@@ -264,8 +253,8 @@ fn navigation_title(area: Rect, active_screen: ActiveScreen) -> (Line<'static>, 
     let line = Line::from(vec![
         Span::raw(" "),
         pill("USAGE", active_screen == ActiveScreen::Usage),
-        pill("ACTIVITY", active_screen == ActiveScreen::Activity),
         pill("APISTAT", active_screen == ActiveScreen::ApiStat),
+        pill("ACTIVITY", active_screen == ActiveScreen::Activity),
         pill("LIMITS", active_screen == ActiveScreen::LimitResets),
         pill("HISTORY", active_screen == ActiveScreen::Read),
     ]);
@@ -301,7 +290,7 @@ fn quit_title(
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let line_area = usage_header_line_area(area);
+    let line_area = header_line_area(area);
     let row = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(20), Constraint::Length(40)])
@@ -321,7 +310,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(right, row[1]);
 }
 
-fn usage_header_line_area(area: Rect) -> Rect {
+fn header_line_area(area: Rect) -> Rect {
     Rect {
         x: area.x,
         y: area.y.saturating_add(area.height.min(2).saturating_sub(1)),
@@ -331,10 +320,11 @@ fn usage_header_line_area(area: Rect) -> Rect {
 }
 
 fn render_activity_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let line_area = header_line_area(area);
     let row = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(20), Constraint::Length(40)])
-        .split(area);
+        .split(line_area);
 
     let left = Paragraph::new(Line::from(Span::styled(
         "PROJECT_ACTIVITY",
@@ -367,10 +357,11 @@ fn usage_scan_status_label(state: &AppState) -> Option<String> {
 }
 
 fn render_limit_resets_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let line_area = header_line_area(area);
     let row = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(20), Constraint::Length(18)])
-        .split(area);
+        .split(line_area);
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -388,14 +379,15 @@ fn render_limit_resets_header(frame: &mut Frame<'_>, area: Rect, state: &AppStat
 }
 
 fn render_api_stat_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let line_area = header_line_area(area);
     let row = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Length(18)])
-        .split(area);
+        .constraints([Constraint::Min(20), Constraint::Length(40)])
+        .split(line_area);
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "CODEX_ACCOUNT_STATS",
+            "APISTAT :: SERVER",
             Style::default().add_modifier(Modifier::BOLD),
         ))),
         row[0],
@@ -428,33 +420,39 @@ fn render_api_stats(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
         return;
     };
 
-    let summary_height = if area.width >= 110 { 5 } else { 10 };
+    let reset_summary = reset_summary_text(state);
+    let cards_height = api_stat_cards_height(state, &account_usage, area.width);
+    let controls_height = api_stat_controls_height(reset_summary.as_deref(), area.width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(summary_height),
+            Constraint::Length(controls_height),
+            Constraint::Length(cards_height),
             Constraint::Min(0),
         ])
         .split(area);
 
-    render_api_stat_controls(frame, chunks[0], state);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("SOURCE  ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                "CODEX APP SERVER :: account/usage/read :: ACCOUNT-WIDE / UTC",
-                Style::default().fg(Color::Cyan),
-            ),
-        ])),
-        chunks[1],
-    );
-    render_api_stat_summary(frame, chunks[2], &account_usage, state.formatter());
-    render_api_stat_chart(frame, chunks[3], &account_usage, state);
+    render_api_stat_controls(frame, chunks[0], state, reset_summary.as_deref());
+    render_api_stat_cards(frame, chunks[1], state, &account_usage);
+    render_api_stat_chart(frame, chunks[2], &account_usage, state);
 }
 
-fn render_api_stat_controls(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
+fn api_stat_controls_height(summary: Option<&str>, width: u16) -> u16 {
+    1_u16.saturating_add(reset_summary_height(summary, width))
+}
+
+fn render_api_stat_controls(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut AppState,
+    reset_summary: Option<&str>,
+) {
+    let reset_height = reset_summary_height(reset_summary, area.width);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(reset_height)])
+        .split(area);
+
     let bars = pill("BARS", state.api_stat_graph == ApiStatGraph::Bars);
     let heat = pill("HEAT", state.api_stat_graph == ApiStatGraph::Heat);
     let day = pill("DAY", state.api_stat_grouping == ApiStatGrouping::Day);
@@ -540,11 +538,15 @@ fn render_api_stat_controls(frame: &mut Frame<'_>, area: Rect, state: &mut AppSt
     spans.push(control_group_label("STYLE"));
     spans.extend([classic, system_compact, system_full]);
 
-    register_right_aligned_targets(state, area, &segments);
+    register_right_aligned_targets(state, chunks[0], &segments);
     frame.render_widget(
         Paragraph::new(Line::from(spans)).alignment(Alignment::Right),
-        area,
+        chunks[0],
     );
+
+    if let Some(text) = reset_summary {
+        render_reset_summary(frame, chunks[1], text);
+    }
 }
 
 fn render_api_stat_message(frame: &mut Frame<'_>, area: Rect, message: &str) {
@@ -557,10 +559,7 @@ fn render_api_stat_message(frame: &mut Frame<'_>, area: Rect, message: &str) {
             top: 1,
             bottom: 0,
         })
-        .title(Span::styled(
-            " CODEX_ACCOUNT ",
-            Style::default().fg(Color::Gray),
-        ));
+        .title(Span::styled(" APISTAT ", Style::default().fg(Color::Gray)));
     let text = Text::from(vec![
         Line::from(message.to_string()),
         Line::from(""),
@@ -575,91 +574,142 @@ fn render_api_stat_message(frame: &mut Frame<'_>, area: Rect, message: &str) {
     );
 }
 
-fn render_api_stat_summary(
-    frame: &mut Frame<'_>,
-    area: Rect,
+fn api_stat_card_specs(
+    state: &AppState,
     usage: &crate::codex_rpc::AccountUsage,
-    formatter: DisplayFormatter<'_>,
-) {
+    card_width: u16,
+) -> Vec<(&'static str, CardSpec)> {
+    let formatter = state.formatter();
+    let (limits_value, limits_captions) =
+        limits_card_content(state, uses_compact_limit_lines(card_width));
     let summary = &usage.summary;
-    let cards = [
+
+    vec![
+        ("LIMITS", CardSpec::new(limits_value, limits_captions)),
         (
             "LIFETIME",
-            format_optional_account_tokens(summary.lifetime_tokens, formatter),
-            "tokens",
+            CardSpec::new(
+                format_optional_account_tokens(summary.lifetime_tokens, formatter),
+                vec!["tokens".to_string(), "account-wide / UTC".to_string()],
+            ),
         ),
         (
             "PEAK_DAY",
-            format_optional_account_tokens(summary.peak_daily_tokens, formatter),
-            "tokens",
+            CardSpec::new(
+                format_optional_account_tokens(summary.peak_daily_tokens, formatter),
+                vec!["tokens".to_string(), "highest UTC day".to_string()],
+            ),
         ),
         (
             "STREAK",
-            format_optional_days(summary.current_streak_days, formatter),
-            "current",
+            CardSpec::new(
+                format_optional_days(summary.current_streak_days, formatter),
+                vec!["current".to_string(), "UTC days".to_string()],
+            ),
         ),
         (
             "BEST_STREAK",
-            format_optional_days(summary.longest_streak_days, formatter),
-            "longest",
+            CardSpec::new(
+                format_optional_days(summary.longest_streak_days, formatter),
+                vec!["longest".to_string(), "UTC days".to_string()],
+            ),
         ),
         (
             "LONGEST_TURN",
-            summary
-                .longest_running_turn_sec
-                .map(format_account_duration)
-                .unwrap_or_else(|| "--".to_string()),
-            "elapsed",
+            CardSpec::new(
+                summary
+                    .longest_running_turn_sec
+                    .map(format_account_duration)
+                    .unwrap_or_else(|| "--".to_string()),
+                vec!["elapsed".to_string(), "server-recorded".to_string()],
+            ),
         ),
-    ];
+    ]
+}
 
-    if area.width >= 110 {
-        render_api_stat_card_row(frame, area, &cards);
+fn api_stat_cards_height(
+    state: &AppState,
+    usage: &crate::codex_rpc::AccountUsage,
+    width: u16,
+) -> u16 {
+    let layout = usage_card_layout(width);
+    let specs = api_stat_card_specs(state, usage, layout.min_card_width.max(1));
+    specs
+        .chunks(layout.columns)
+        .map(|row| api_stat_card_row_height(row, layout.min_card_width.max(1)))
+        .sum()
+}
+
+fn render_api_stat_cards(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &AppState,
+    usage: &crate::codex_rpc::AccountUsage,
+) {
+    let layout = usage_card_layout(area.width);
+    let specs = api_stat_card_specs(state, usage, layout.min_card_width.max(1));
+    let row_heights = specs
+        .chunks(layout.columns)
+        .map(|row| api_stat_card_row_height(row, layout.min_card_width.max(1)))
+        .collect::<Vec<_>>();
+
+    if layout.columns == 6 {
+        render_api_stat_card_row(frame, area, &specs);
     } else {
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+            .constraints([
+                Constraint::Length(row_heights[0]),
+                Constraint::Length(row_heights[1]),
+            ])
             .split(area);
-        render_api_stat_card_row(frame, rows[0], &cards[..3]);
-        render_api_stat_card_row(frame, rows[1], &cards[3..]);
+        render_api_stat_card_row(frame, rows[0], &specs[..3]);
+        render_api_stat_card_row(frame, rows[1], &specs[3..]);
     }
 }
 
-fn render_api_stat_card_row(frame: &mut Frame<'_>, area: Rect, cards: &[(&str, String, &str)]) {
+fn api_stat_card_row_height(cards: &[(&'static str, CardSpec)], card_width: u16) -> u16 {
+    cards
+        .iter()
+        .map(|(_, spec)| spec.required_height(card_width))
+        .max()
+        .unwrap_or(0)
+}
+
+fn render_api_stat_card_row(frame: &mut Frame<'_>, area: Rect, cards: &[(&'static str, CardSpec)]) {
     if cards.is_empty() {
         return;
     }
-    let constraints = vec![Constraint::Ratio(1, cards.len() as u32); cards.len()];
+    let constraints = match cards.len() {
+        6 => vec![
+            Constraint::Percentage(17),
+            Constraint::Percentage(17),
+            Constraint::Percentage(17),
+            Constraint::Percentage(17),
+            Constraint::Percentage(16),
+            Constraint::Percentage(16),
+        ],
+        3 => vec![
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ],
+        count => vec![Constraint::Ratio(1, count as u32); count],
+    };
     let areas = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(constraints)
         .split(area);
 
-    for (index, (title, value, caption)) in cards.iter().enumerate() {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Plain)
-            .padding(Padding {
-                left: 1,
-                right: 1,
-                top: 0,
-                bottom: 0,
-            })
-            .title(Span::styled(
-                format!(" {title} "),
-                Style::default().fg(Color::Gray),
-            ));
-        let text = Text::from(vec![
-            Line::from(Span::styled(
-                value.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                (*caption).to_string(),
-                Style::default().fg(Color::Gray),
-            )),
-        ]);
-        frame.render_widget(Paragraph::new(text).block(block), areas[index]);
+    for (index, (title, spec)) in cards.iter().enumerate() {
+        let Some((value, captions)) = spec.lines.split_first() else {
+            continue;
+        };
+        let captions = captions
+            .iter()
+            .map(|caption| Some(caption.as_str()))
+            .collect::<Vec<_>>();
+        frame.render_widget(card_with_captions(title, value, &captions), areas[index]);
     }
 }
 
@@ -4148,8 +4198,18 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
                 return;
             }
 
-            // Value column width: size to the widest full number, then anchor the column to the right.
-            let desired_value_w = {
+            // Value column width: size token pairs by their independent columns so
+            // every slash stays in the same terminal column.
+            let desired_value_w = if state.metric == UsageMetric::Tokens {
+                horizontal_token_pair_column_widths(
+                    visible_values,
+                    visible_out_of_cache,
+                    u16::MAX,
+                    formatter,
+                )
+                .map(|(left, right)| left.saturating_add(3).saturating_add(right))
+                .unwrap_or(6)
+            } else {
                 let mut max_len = 0usize;
                 for (idx, v) in visible_values.iter().enumerate() {
                     let out_of_cache = match state.metric {
@@ -4165,8 +4225,9 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
                     );
                     max_len = max_len.max(s.len());
                 }
-                (max_len as u16).clamp(6, 32)
+                max_len
             };
+            let desired_value_w = (desired_value_w as u16).clamp(6, 32);
 
             let mut value_w = desired_value_w.min(available.saturating_sub(value_gap).max(1));
             if available > min_bar_w.saturating_add(value_gap) {
@@ -4182,6 +4243,16 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
                 .saturating_sub(value_gap)
                 .saturating_sub(value_w)
                 .max(1);
+            let token_pair_columns = if state.metric == UsageMetric::Tokens {
+                horizontal_token_pair_column_widths(
+                    visible_values,
+                    visible_out_of_cache,
+                    value_w,
+                    formatter,
+                )
+            } else {
+                None
+            };
 
             let buf = frame.buffer_mut();
 
@@ -4271,6 +4342,7 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
                     value_max_width,
                     formatter,
                 );
+                let value_text = align_horizontal_token_pair(value_text, token_pair_columns);
                 let value_text = truncate_middle(&value_text, value_max_width as usize);
                 // Right-align numeric values within the dedicated value column.
                 let start_x = value_area
@@ -4517,6 +4589,43 @@ fn format_horizontal_value(
 
     // Final fallback: compact only.
     format_compact_kmb(value, max_width, formatter)
+}
+
+fn horizontal_token_pair_column_widths(
+    values: &[u64],
+    out_of_cache_values: &[u64],
+    max_width: u16,
+    formatter: DisplayFormatter<'_>,
+) -> Option<(usize, usize)> {
+    let mut left_width = 0usize;
+    let mut right_width = 0usize;
+
+    for (&value, &out_of_cache) in values.iter().zip(out_of_cache_values) {
+        let pair = format_horizontal_value(
+            value,
+            Some(out_of_cache),
+            UsageMetric::Tokens,
+            max_width,
+            formatter,
+        );
+        let (left, right) = pair.split_once(" / ")?;
+        left_width = left_width.max(UnicodeWidthStr::width(left));
+        right_width = right_width.max(UnicodeWidthStr::width(right));
+    }
+
+    let pair_width = left_width.saturating_add(3).saturating_add(right_width);
+    (pair_width <= max_width as usize).then_some((left_width, right_width))
+}
+
+fn align_horizontal_token_pair(value: String, columns: Option<(usize, usize)>) -> String {
+    let Some((left_width, right_width)) = columns else {
+        return value;
+    };
+    let Some((left, right)) = value.split_once(" / ") else {
+        return value;
+    };
+
+    format!("{left:>left_width$} / {right:>right_width$}")
 }
 
 fn format_duration_words(ms: i64) -> String {
@@ -5778,30 +5887,40 @@ mod tests {
             targets[0].action,
             UiClickAction::SetScreen(ActiveScreen::Usage)
         );
-        assert_eq!(targets[1].area, Rect::new(47, 2, 10, 1));
-        assert_eq!(targets[2].area, Rect::new(57, 2, 9, 1));
+        assert_eq!(targets[1].area, Rect::new(47, 2, 9, 1));
+        assert_eq!(
+            targets[1].action,
+            UiClickAction::SetScreen(ActiveScreen::ApiStat)
+        );
+        assert_eq!(targets[2].area, Rect::new(56, 2, 10, 1));
         assert_eq!(
             targets[2].action,
-            UiClickAction::SetScreen(ActiveScreen::ApiStat)
+            UiClickAction::SetScreen(ActiveScreen::Activity)
         );
         assert_eq!(targets[3].area, Rect::new(66, 2, 8, 1));
         assert_eq!(targets[4].area, Rect::new(74, 2, 9, 1));
     }
 
     #[test]
-    fn api_stats_outer_title_identifies_openai_as_the_source() {
+    fn api_stats_outer_title_matches_usage() {
         assert_eq!(
-            app_title(ActiveScreen::ApiStat),
-            format!(" comon :: {} :: SOURCE OPENAI ", env!("CARGO_PKG_VERSION"))
-        );
-        assert_eq!(
-            app_title(ActiveScreen::Usage),
+            app_title(),
             format!(" comon :: {} ", env!("CARGO_PKG_VERSION"))
         );
         let (navigation, targets) =
             navigation_title(Rect::new(0, 0, 80, 24), ActiveScreen::ApiStat);
         assert_eq!(navigation.width(), 44);
         assert_eq!(targets.len(), 5);
+    }
+
+    #[test]
+    fn api_stat_controls_reserve_the_same_reset_summary_row_as_usage() {
+        let summary = "Resets: 1 available | earliest expires Aug 13, 02:39";
+
+        assert_eq!(
+            api_stat_controls_height(Some(summary), 100),
+            usage_controls_height(Some(summary), 100)
+        );
     }
 
     #[test]
@@ -6029,7 +6148,7 @@ mod tests {
     #[test]
     fn usage_header_has_one_blank_row_above_and_below() {
         let chunks = usage_screen_layout(Rect::new(2, 1, 100, 20), 1);
-        let header_line = usage_header_line_area(chunks[0]);
+        let header_line = header_line_area(chunks[0]);
 
         assert_eq!(chunks[0], Rect::new(2, 1, 100, 3));
         assert_eq!(header_line, Rect::new(2, 2, 100, 1));
@@ -6404,6 +6523,43 @@ mod tests {
         );
         assert!(out.contains(" / "));
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn horizontal_tokens_pair_aligns_total_and_non_cached_columns() {
+        let system_locale = crate::locale::SystemLocale::default();
+        let formatter = DisplayFormatter::new(crate::locale::DisplayStyle::Classic, &system_locale);
+        let values = [0, 121_030_387, 403_643_361, 287_431_139];
+        let out_of_cache = [0, 7_630_451, 15_714_273, 8_681_443];
+        let columns =
+            horizontal_token_pair_column_widths(&values, &out_of_cache, u16::MAX, formatter);
+
+        assert_eq!(columns, Some((11, 10)));
+        let pairs = values
+            .iter()
+            .zip(out_of_cache)
+            .map(|(&value, out_of_cache)| {
+                align_horizontal_token_pair(
+                    format_horizontal_value(
+                        value,
+                        Some(out_of_cache),
+                        UsageMetric::Tokens,
+                        u16::MAX,
+                        formatter,
+                    ),
+                    columns,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pairs,
+            [
+                "          0 /          0",
+                "121,030,387 /  7,630,451",
+                "403,643,361 / 15,714,273",
+                "287,431,139 /  8,681,443",
+            ]
+        );
     }
 
     #[test]

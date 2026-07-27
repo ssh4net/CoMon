@@ -1,13 +1,16 @@
+use crate::usage::{
+    normalize_project_key, project_identities_from_structured_event, project_identity_from_path,
+    ProjectUsageSummary, PROJECT_IDENTITY_LINE_LIMIT,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Utc};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-const INDEX_LINE_LIMIT: usize = 128;
 const MAX_TITLE_CHARS: usize = 96;
 const MAX_TURN_PREVIEW_CHARS: usize = 220;
 
@@ -39,6 +42,57 @@ pub(crate) struct SessionSummary {
     pub(crate) repo_url: Option<String>,
     pub(crate) model_provider: Option<String>,
     pub(crate) model: Option<String>,
+    project_paths: Vec<String>,
+}
+
+impl Catalog {
+    pub(crate) fn reconcile_project_usage(&mut self, usage: &[ProjectUsageSummary]) {
+        let mut summaries: HashMap<PathBuf, SessionSummary> = HashMap::new();
+        for project in &self.projects {
+            for session in &project.sessions {
+                summaries
+                    .entry(session.file_path.clone())
+                    .or_insert_with(|| session.clone());
+            }
+        }
+
+        let indexed_paths = usage
+            .iter()
+            .flat_map(|project| project.session_files.iter().cloned())
+            .collect::<HashSet<_>>();
+        let mut grouped: BTreeMap<String, ProjectBuilder> = BTreeMap::new();
+
+        for project in &self.projects {
+            for session in &project.sessions {
+                if indexed_paths.contains(&session.file_path) {
+                    continue;
+                }
+                grouped
+                    .entry(normalize_project_key(&project.display_path))
+                    .or_default()
+                    .sessions
+                    .push(session.clone());
+            }
+        }
+
+        for project in usage {
+            let key = normalize_project_key(&project.display_path);
+            if key.is_empty() {
+                continue;
+            }
+            let builder = grouped.entry(key).or_default();
+            for file_path in &project.session_files {
+                let Some(summary) = summaries.get(file_path) else {
+                    continue;
+                };
+                let mut linked = summary.clone();
+                linked.cwd = project.display_path.clone();
+                builder.sessions.push(linked);
+            }
+        }
+
+        self.projects = finish_project_builders(grouped);
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -74,6 +128,13 @@ struct SessionSummaryBuilder {
     repo_url: Option<String>,
     model_provider: Option<String>,
     model: Option<String>,
+    project_cwds: BTreeMap<String, ProjectPathCandidate>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProjectPathCandidate {
+    display_path: String,
+    count: u32,
 }
 
 pub(crate) fn build_catalog(sessions_dir: &Path) -> Result<Catalog> {
@@ -98,8 +159,12 @@ pub(crate) fn build_catalog(sessions_dir: &Path) -> Result<Catalog> {
         match scan_session_summary(&path) {
             Ok(summary) => {
                 files_scanned += 1;
-                let key = normalize_project_key(&summary.cwd);
-                grouped.entry(key).or_default().sessions.push(summary);
+                for project_path in summary.project_paths.clone() {
+                    let key = normalize_project_key(&project_path);
+                    let mut linked = summary.clone();
+                    linked.cwd = project_path;
+                    grouped.entry(key).or_default().sessions.push(linked);
+                }
             }
             Err(_) => {
                 files_skipped += 1;
@@ -107,6 +172,17 @@ pub(crate) fn build_catalog(sessions_dir: &Path) -> Result<Catalog> {
         }
     }
 
+    let projects = finish_project_builders(grouped);
+
+    Ok(Catalog {
+        sessions_dir: sessions_dir.to_path_buf(),
+        projects,
+        files_scanned,
+        files_skipped,
+    })
+}
+
+fn finish_project_builders(grouped: BTreeMap<String, ProjectBuilder>) -> Vec<ProjectRecord> {
     let mut projects = Vec::with_capacity(grouped.len());
     for (_, mut builder) in grouped {
         builder.sessions.sort_by(|left, right| {
@@ -115,6 +191,10 @@ pub(crate) fn build_catalog(sessions_dir: &Path) -> Result<Catalog> {
                 .cmp(&left.started_at_sort_key_ms)
                 .then_with(|| left.file_path.cmp(&right.file_path))
         });
+        let mut seen = HashSet::new();
+        builder
+            .sessions
+            .retain(|session| seen.insert(session.file_path.clone()));
         let display_path = builder
             .sessions
             .first()
@@ -127,13 +207,7 @@ pub(crate) fn build_catalog(sessions_dir: &Path) -> Result<Catalog> {
     }
 
     projects.sort_by(|left, right| left.display_path.cmp(&right.display_path));
-
-    Ok(Catalog {
-        sessions_dir: sessions_dir.to_path_buf(),
-        projects,
-        files_scanned,
-        files_skipped,
-    })
+    projects
 }
 
 pub(crate) fn load_session_detail(path: &Path) -> Result<SessionDetail> {
@@ -291,14 +365,25 @@ fn scan_session_summary(path: &Path) -> Result<SessionSummary> {
         match entry_type {
             "session_meta" => extract_session_meta(&mut builder, &value),
             "turn_context" => extract_turn_context(&mut builder, &value),
-            "response_item" => extract_title_candidate(&mut builder, &value),
+            "response_item" => {
+                extract_title_candidate(&mut builder, &value);
+                for project in
+                    project_identities_from_structured_event(&value, builder.cwd.as_deref())
+                {
+                    builder.note_project_cwd(project);
+                }
+            }
+            "event_msg" => {
+                for project in
+                    project_identities_from_structured_event(&value, builder.cwd.as_deref())
+                {
+                    builder.note_project_cwd(project);
+                }
+            }
             _ => {}
         }
 
-        if lines_seen >= INDEX_LINE_LIMIT && builder.has_minimum_fields() {
-            break;
-        }
-        if builder.is_complete() {
+        if lines_seen >= PROJECT_IDENTITY_LINE_LIMIT && builder.has_minimum_fields() {
             break;
         }
     }
@@ -416,16 +501,40 @@ impl SessionSummaryBuilder {
         self.cwd.is_some() && self.session_id.is_some()
     }
 
-    fn is_complete(&self) -> bool {
-        self.has_minimum_fields()
-            && self.meaningful_title.is_some()
-            && self.started_at_raw.is_some()
+    fn note_project_cwd(&mut self, display_path: String) {
+        let key = normalize_project_key(&display_path);
+        let candidate = self.project_cwds.entry(key).or_default();
+        if candidate.display_path.is_empty() {
+            candidate.display_path = display_path;
+        }
+        candidate.count = candidate.count.saturating_add(1);
     }
 
     fn finish(self) -> Result<SessionSummary> {
-        let cwd = self
+        let fallback_cwd = self
             .cwd
+            .as_deref()
+            .and_then(project_identity_from_path)
+            .or_else(|| self.cwd.clone())
             .ok_or_else(|| anyhow::anyhow!("Missing cwd in {}", self.file_path.display()))?;
+        let mut project_paths = self
+            .project_cwds
+            .values()
+            .map(|candidate| candidate.display_path.clone())
+            .collect::<Vec<_>>();
+        if let Some(initial_project) = self.cwd.as_deref().and_then(project_identity_from_path) {
+            if !project_paths
+                .iter()
+                .any(|path| normalize_project_key(path) == normalize_project_key(&initial_project))
+            {
+                project_paths.push(initial_project);
+            }
+        }
+        if project_paths.is_empty() {
+            project_paths.push(fallback_cwd.clone());
+        }
+        project_paths.sort_by_key(|path| normalize_project_key(path));
+        let cwd = project_paths.first().cloned().unwrap_or(fallback_cwd);
         let session_id = self
             .session_id
             .unwrap_or_else(|| self.file_path.display().to_string());
@@ -460,6 +569,7 @@ impl SessionSummaryBuilder {
             repo_url: self.repo_url,
             model_provider: self.model_provider,
             model: self.model,
+            project_paths,
         })
     }
 }
@@ -518,10 +628,6 @@ fn read_i64(value: Option<&Value>) -> Option<i64> {
             .as_i64()
             .or_else(|| value.as_u64().and_then(|raw| i64::try_from(raw).ok()))
     })
-}
-
-fn normalize_project_key(path: &str) -> String {
-    path.trim().to_lowercase()
 }
 
 fn parse_rfc3339_to_epoch_ms(raw: &str) -> Option<i64> {
@@ -641,6 +747,157 @@ mod tests {
         assert_eq!(
             catalog.projects[0].sessions[1].title,
             "show me the session history"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn build_catalog_links_session_to_every_structured_tool_workdir_git_root() {
+        let root = make_temp_dir("tool-workdir");
+        let sessions = root.join("sessions");
+        let project = root.join("rustadmin-fps-diag");
+        let project_child = project.join("flutter");
+        std::fs::create_dir_all(sessions.join("2026/06/23")).expect("create sessions");
+        std::fs::create_dir_all(root.join(".git")).expect("create parent git marker");
+        std::fs::create_dir_all(project.join(".git")).expect("create git marker");
+        std::fs::create_dir_all(&project_child).expect("create project child");
+        let session = sessions.join("2026/06/23/a.jsonl");
+        write_session(
+            &session,
+            &format!(
+                "{}\n{}\n{}\n{}\n{}\n",
+                r#"{"type":"session_meta","payload":{"id":"a","timestamp":"2026-06-23T08:30:22.974Z","cwd":"/outside/non-git","model_provider":"openai"}}"#,
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"work on the project"}]}}"#,
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "arguments": serde_json::json!({"workdir": root}).to_string()
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "arguments": serde_json::json!({"workdir": project_child}).to_string()
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "arguments": serde_json::json!({"workdir": project_child}).to_string()
+                    }
+                })
+            ),
+        );
+
+        let catalog = build_catalog(&sessions).expect("catalog");
+        assert_eq!(catalog.projects.len(), 2);
+        assert!(catalog
+            .projects
+            .iter()
+            .any(|entry| entry.display_path == root.display().to_string()));
+        assert!(catalog
+            .projects
+            .iter()
+            .any(|entry| entry.display_path == project.display().to_string()));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cached_project_links_add_late_projects_and_keep_many_sessions_per_project() {
+        let root = make_temp_dir("late-many-to-many");
+        let sessions = root.join("sessions/2026/07/26");
+        let project_a = root.join("project-a");
+        let project_b = root.join("project-b");
+        std::fs::create_dir_all(&sessions).expect("create sessions");
+        std::fs::create_dir_all(project_a.join(".git")).expect("create project a");
+        std::fs::create_dir_all(project_b.join(".git")).expect("create project b");
+
+        let first = sessions.join("first.jsonl");
+        let mut body = String::from(
+            r#"{"type":"session_meta","payload":{"id":"first","timestamp":"2026-07-26T08:00:00Z","cwd":"/outside/launcher"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"work across projects"}]}}
+"#,
+        );
+        for _ in 0..140 {
+            body.push_str("{\"type\":\"event_msg\",\"payload\":{\"type\":\"noop\"}}\n");
+        }
+        for project in [&project_a, &project_b] {
+            body.push_str(
+                &serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "arguments": serde_json::json!({"workdir": project}).to_string()
+                    }
+                })
+                .to_string(),
+            );
+            body.push('\n');
+        }
+        write_session(&first, &body);
+
+        let second = sessions.join("second.jsonl");
+        write_session(
+            &second,
+            &format!(
+                "{}\n{}\n",
+                r#"{"type":"session_meta","payload":{"id":"second","timestamp":"2026-07-26T09:00:00Z","cwd":"/outside/launcher"}}"#,
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "arguments": serde_json::json!({"workdir": project_a}).to_string()
+                    }
+                })
+            ),
+        );
+
+        let mut catalog = build_catalog(&root.join("sessions")).expect("catalog");
+        assert_eq!(catalog.projects.len(), 2);
+        catalog.reconcile_project_usage(&[
+            ProjectUsageSummary {
+                display_path: project_a.display().to_string(),
+                total_tokens: 0,
+                cached_input_tokens: 0,
+                agent_time_ms: 0,
+                agent_runs: 0,
+                indexed_files: 2,
+                session_files: vec![first.clone(), second.clone()],
+            },
+            ProjectUsageSummary {
+                display_path: project_b.display().to_string(),
+                total_tokens: 0,
+                cached_input_tokens: 0,
+                agent_time_ms: 0,
+                agent_runs: 0,
+                indexed_files: 1,
+                session_files: vec![first.clone()],
+            },
+        ]);
+        assert_eq!(catalog.projects.len(), 2);
+        let project_a_entry = catalog
+            .projects
+            .iter()
+            .find(|entry| entry.display_path == project_a.display().to_string())
+            .expect("project a");
+        assert_eq!(project_a_entry.sessions.len(), 2);
+        let project_b_entry = catalog
+            .projects
+            .iter()
+            .find(|entry| entry.display_path == project_b.display().to_string())
+            .expect("project b");
+        assert_eq!(project_b_entry.sessions.len(), 1);
+        assert_eq!(
+            project_a_entry.sessions[1].file_path,
+            project_b_entry.sessions[0].file_path
         );
 
         let _ = std::fs::remove_dir_all(root);

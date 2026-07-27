@@ -3,6 +3,9 @@ use crate::read::scan::{
     load_session_detail, truncate_single_line, Catalog, ProjectRecord, SessionDetail,
     SessionSummary,
 };
+use crate::usage::{
+    format_compact_kmb, format_duration, normalize_project_key, LocalUsageSnapshot,
+};
 use anyhow::Result;
 use chrono::{DateTime, Local};
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
@@ -13,13 +16,26 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
+use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthStr;
+
+const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
     Projects,
     Sessions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserClickTarget {
+    Project(usize),
+    Parent,
+    Session(usize),
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -37,6 +53,8 @@ pub(crate) struct BrowserState {
     session_details: BTreeMap<PathBuf, SessionDetail>,
     error: Option<String>,
     layout: UiLayout,
+    last_click: Option<(BrowserClickTarget, Instant)>,
+    usage_project_revision: Option<u64>,
 }
 
 impl BrowserState {
@@ -49,18 +67,18 @@ impl BrowserState {
         });
 
         let mut session_state = ListState::default();
-        session_state.select(
+        session_state.select(Some(
             if catalog
                 .projects
                 .first()
                 .map(|project| project.sessions.is_empty())
                 .unwrap_or(true)
             {
-                None
+                0
             } else {
-                Some(0)
+                1
             },
-        );
+        ));
 
         Self {
             catalog,
@@ -70,7 +88,55 @@ impl BrowserState {
             session_details: BTreeMap::new(),
             error: None,
             layout: UiLayout::default(),
+            last_click: None,
+            usage_project_revision: None,
         }
+    }
+
+    fn reconcile_project_usage(&mut self, usage: &LocalUsageSnapshot) {
+        let mut hasher = DefaultHasher::new();
+        for project in &usage.project_usage {
+            project.display_path.hash(&mut hasher);
+            project.session_files.hash(&mut hasher);
+        }
+        let revision = hasher.finish();
+        if self.usage_project_revision == Some(revision) {
+            return;
+        }
+
+        let selected_project = self
+            .selected_project()
+            .map(|project| normalize_project_key(&project.display_path));
+        let selected_session = self
+            .selected_session()
+            .map(|session| session.file_path.clone());
+        self.catalog.reconcile_project_usage(&usage.project_usage);
+        self.usage_project_revision = Some(revision);
+
+        let project_index = selected_project
+            .as_deref()
+            .and_then(|key| {
+                self.catalog
+                    .projects
+                    .iter()
+                    .position(|project| normalize_project_key(&project.display_path) == key)
+            })
+            .or_else(|| (!self.catalog.projects.is_empty()).then_some(0));
+        self.project_state.select(project_index);
+
+        let session_row = project_index
+            .and_then(|index| self.catalog.projects.get(index))
+            .and_then(|project| {
+                selected_session.as_ref().and_then(|path| {
+                    project
+                        .sessions
+                        .iter()
+                        .position(|session| &session.file_path == path)
+                        .map(|index| index + 1)
+                })
+            })
+            .unwrap_or(0);
+        self.session_state.select(Some(session_row));
     }
 
     fn selected_project_index(&self) -> Option<usize> {
@@ -83,7 +149,7 @@ impl BrowserState {
     }
 
     fn selected_session_index(&self) -> Option<usize> {
-        self.session_state.selected()
+        self.session_state.selected()?.checked_sub(1)
     }
 
     fn selected_session(&self) -> Option<&SessionSummary> {
@@ -111,6 +177,17 @@ impl BrowserState {
         self.session_details.insert(path, detail);
         Ok(())
     }
+
+    fn register_click(&mut self, target: BrowserClickTarget, now: Instant) -> bool {
+        let is_double = self.last_click.is_some_and(|(previous, at)| {
+            previous == target
+                && now
+                    .checked_duration_since(at)
+                    .is_some_and(|elapsed| elapsed <= DOUBLE_CLICK_WINDOW)
+        });
+        self.last_click = if is_double { None } else { Some((target, now)) };
+        is_double
+    }
 }
 
 pub(crate) fn handle_event(state: &mut BrowserState, event: Event) -> Result<bool> {
@@ -129,12 +206,9 @@ pub(crate) fn handle_event(state: &mut BrowserState, event: Event) -> Result<boo
 
 fn handle_key_event(state: &mut BrowserState, code: KeyCode) -> bool {
     match code {
-        KeyCode::Esc | KeyCode::Backspace | KeyCode::Left => {
-            if state.view == ViewMode::Sessions {
-                state.view = ViewMode::Projects;
-                state.error = None;
-                return true;
-            }
+        KeyCode::Esc | KeyCode::Backspace | KeyCode::Left if state.view == ViewMode::Sessions => {
+            close_selected_project(state);
+            return true;
         }
         KeyCode::Up | KeyCode::Char('k') => {
             move_selection(state, -1);
@@ -162,9 +236,15 @@ fn handle_key_event(state: &mut BrowserState, code: KeyCode) -> bool {
         }
         KeyCode::Enter | KeyCode::Right => {
             if state.view == ViewMode::Projects && state.selected_project().is_some() {
-                state.view = ViewMode::Sessions;
-                sync_session_selection(state);
-                try_load_selected_session_detail(state);
+                open_selected_project(state);
+                return true;
+            }
+            if state.view == ViewMode::Sessions {
+                if state.session_state.selected() == Some(0) {
+                    close_selected_project(state);
+                } else {
+                    try_load_selected_session_detail(state);
+                }
                 return true;
             }
         }
@@ -185,17 +265,25 @@ fn handle_mouse_event(state: &mut BrowserState, mouse: MouseEvent) -> bool {
             true
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            if rect_contains(state.layout.project_list_area, mouse.column, mouse.row)
-                && click_project_row(state, mouse.row)
-            {
-                return true;
+            let now = Instant::now();
+            if rect_contains(state.layout.project_list_area, mouse.column, mouse.row) {
+                if let Some(index) = click_project_row(state, mouse.row) {
+                    if state.register_click(BrowserClickTarget::Project(index), now) {
+                        open_selected_project(state);
+                    }
+                    return true;
+                }
             }
-            if rect_contains(state.layout.session_list_area, mouse.column, mouse.row)
-                && click_session_row(state, mouse.row)
-            {
-                state.view = ViewMode::Sessions;
-                try_load_selected_session_detail(state);
-                return true;
+            if rect_contains(state.layout.session_list_area, mouse.column, mouse.row) {
+                if let Some(target) = click_session_row(state, mouse.row) {
+                    let double_click = state.register_click(target, now);
+                    if target == BrowserClickTarget::Parent && double_click {
+                        close_selected_project(state);
+                    } else {
+                        try_load_selected_session_detail(state);
+                    }
+                    return true;
+                }
             }
             false
         }
@@ -217,11 +305,8 @@ fn move_selection(state: &mut BrowserState, delta: isize) {
         ViewMode::Sessions => {
             let len = state
                 .selected_project()
-                .map(|project| project.sessions.len())
-                .unwrap_or(0);
-            if len == 0 {
-                return;
-            }
+                .map(|project| project.sessions.len().saturating_add(1))
+                .unwrap_or(1);
             let next = advance_index(state.session_state.selected(), len, delta);
             state.session_state.select(Some(next));
             try_load_selected_session_detail(state);
@@ -243,11 +328,8 @@ fn jump_to_edge(state: &mut BrowserState, first: bool) {
         ViewMode::Sessions => {
             let len = state
                 .selected_project()
-                .map(|project| project.sessions.len())
-                .unwrap_or(0);
-            if len == 0 {
-                return;
-            }
+                .map(|project| project.sessions.len().saturating_add(1))
+                .unwrap_or(1);
             let index = if first { 0 } else { len.saturating_sub(1) };
             state.session_state.select(Some(index));
             try_load_selected_session_detail(state);
@@ -258,15 +340,36 @@ fn jump_to_edge(state: &mut BrowserState, first: bool) {
 fn sync_session_selection(state: &mut BrowserState) {
     let len = state
         .selected_project()
-        .map(|project| project.sessions.len())
-        .unwrap_or(0);
-    if len == 0 {
-        state.session_state.select(None);
-        return;
-    }
-    let selected = state.session_state.selected().unwrap_or(0);
+        .map(|project| project.sessions.len().saturating_add(1))
+        .unwrap_or(1);
+    let selected = state.session_state.selected().unwrap_or(1);
     let clamped = selected.min(len.saturating_sub(1));
     state.session_state.select(Some(clamped));
+}
+
+fn open_selected_project(state: &mut BrowserState) {
+    if state.selected_project().is_none() {
+        return;
+    }
+    state.view = ViewMode::Sessions;
+    state.session_state.select(Some(
+        if state
+            .selected_project()
+            .is_some_and(|project| project.sessions.is_empty())
+        {
+            0
+        } else {
+            1
+        },
+    ));
+    state.last_click = None;
+    try_load_selected_session_detail(state);
+}
+
+fn close_selected_project(state: &mut BrowserState) {
+    state.view = ViewMode::Projects;
+    state.error = None;
+    state.last_click = None;
 }
 
 fn try_load_selected_session_detail(state: &mut BrowserState) {
@@ -281,6 +384,9 @@ fn try_load_selected_session_detail(state: &mut BrowserState) {
 }
 
 fn advance_index(current: Option<usize>, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
     let current = current.unwrap_or(0);
     let current = isize::try_from(current).unwrap_or(0);
     let len = isize::try_from(len).unwrap_or(0);
@@ -288,47 +394,56 @@ fn advance_index(current: Option<usize>, len: usize, delta: isize) -> usize {
     usize::try_from(next).unwrap_or(0)
 }
 
-fn click_project_row(state: &mut BrowserState, row: u16) -> bool {
+fn click_project_row(state: &mut BrowserState, row: u16) -> Option<usize> {
     let content = inner_rect(state.layout.project_list_area);
     if row < content.y || row >= content.y.saturating_add(content.height) {
-        return false;
+        return None;
     }
     let current_offset = state.project_state.offset();
     let row_offset = usize::from(row.saturating_sub(content.y));
     let index = current_offset.saturating_add(row_offset);
     if index >= state.catalog.projects.len() {
-        return false;
+        return None;
     }
     state.project_state.select(Some(index));
     sync_session_selection(state);
-    true
+    Some(index)
 }
 
-fn click_session_row(state: &mut BrowserState, row: u16) -> bool {
+fn click_session_row(state: &mut BrowserState, row: u16) -> Option<BrowserClickTarget> {
     let content = inner_rect(state.layout.session_list_area);
     if row < content.y || row >= content.y.saturating_add(content.height) {
-        return false;
+        return None;
     }
     let current_offset = state.session_state.offset();
     let row_offset = usize::from(row.saturating_sub(content.y));
     let index = current_offset.saturating_add(row_offset);
     let len = state
         .selected_project()
-        .map(|project| project.sessions.len())
-        .unwrap_or(0);
+        .map(|project| project.sessions.len().saturating_add(1))
+        .unwrap_or(1);
     if index >= len {
-        return false;
+        return None;
     }
     state.session_state.select(Some(index));
-    true
+    if index == 0 {
+        Some(BrowserClickTarget::Parent)
+    } else {
+        Some(BrowserClickTarget::Session(index - 1))
+    }
 }
 
 pub(crate) fn render(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &mut BrowserState,
+    usage: Option<&LocalUsageSnapshot>,
+    usage_error: Option<&str>,
     formatter: DisplayFormatter<'_>,
 ) {
+    if let Some(usage) = usage {
+        state.reconcile_project_usage(usage);
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -340,7 +455,9 @@ pub(crate) fn render(
 
     render_header(frame, chunks[0], state, formatter);
     state.layout = match state.view {
-        ViewMode::Projects => render_projects_view(frame, chunks[1], state, formatter),
+        ViewMode::Projects => {
+            render_projects_view(frame, chunks[1], state, usage, usage_error, formatter)
+        }
         ViewMode::Sessions => render_sessions_view(frame, chunks[1], state, formatter),
     };
     render_footer(frame, chunks[2], state, formatter);
@@ -353,10 +470,27 @@ fn render_header(
     formatter: DisplayFormatter<'_>,
 ) {
     let line_area = header_line_area(area);
+    let controls = history_style_controls_area(area);
+    let content_area = Rect {
+        width: line_area.width.saturating_sub(controls.width),
+        ..line_area
+    };
+    let summary = format!(
+        "{} projects  {} files  {} skipped",
+        formatter.format_usize(state.catalog.projects.len()),
+        formatter.format_usize(state.catalog.files_scanned),
+        formatter.format_usize(state.catalog.files_skipped)
+    );
+    let summary_width = u16::try_from(UnicodeWidthStr::width(summary.as_str())).unwrap_or(u16::MAX);
+    let show_summary = content_area.width >= 32u16.saturating_add(summary_width);
     let row = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(32), Constraint::Length(30)])
-        .split(line_area);
+        .constraints(if show_summary {
+            [Constraint::Min(32), Constraint::Length(summary_width)]
+        } else {
+            [Constraint::Min(0), Constraint::Length(0)]
+        })
+        .split(content_area);
 
     let scope = format!(
         "SESSION_HISTORY {}",
@@ -370,19 +504,15 @@ fn render_header(
         row[0],
     );
 
-    let summary = format!(
-        "{} projects  {} files  {} skipped",
-        formatter.format_usize(state.catalog.projects.len()),
-        formatter.format_usize(state.catalog.files_scanned),
-        formatter.format_usize(state.catalog.files_skipped)
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            summary,
-            Style::default().fg(Color::Gray),
-        ))),
-        row[1],
-    );
+    if show_summary {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                summary,
+                Style::default().fg(Color::Gray),
+            ))),
+            row[1],
+        );
+    }
 }
 
 fn header_line_area(area: Rect) -> Rect {
@@ -394,10 +524,26 @@ fn header_line_area(area: Rect) -> Rect {
     }
 }
 
+pub(crate) fn history_style_controls_area(area: Rect) -> Rect {
+    const WIDTH: u16 = 30;
+    let line = header_line_area(area);
+    if line.width < WIDTH {
+        return Rect::default();
+    }
+    Rect {
+        x: line.x.saturating_add(line.width - WIDTH),
+        y: line.y,
+        width: WIDTH,
+        height: 1,
+    }
+}
+
 fn render_projects_view(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &mut BrowserState,
+    usage: Option<&LocalUsageSnapshot>,
+    usage_error: Option<&str>,
     formatter: DisplayFormatter<'_>,
 ) -> UiLayout {
     let columns = Layout::default()
@@ -428,7 +574,8 @@ fn render_projects_view(
         .highlight_symbol(">> ");
     frame.render_stateful_widget(list, columns[0], &mut state.project_state);
 
-    let detail_text = render_project_detail(state.selected_project(), formatter);
+    let detail_text =
+        render_project_detail(state.selected_project(), usage, usage_error, formatter);
     frame.render_widget(
         Paragraph::new(detail_text)
             .block(
@@ -460,17 +607,15 @@ fn render_sessions_view(
     let project = state.selected_project();
     let items = project
         .map(|project| {
-            project
-                .sessions
-                .iter()
-                .map(|session| {
+            std::iter::once(ListItem::new(Line::from("..")))
+                .chain(project.sessions.iter().map(|session| {
                     let label = format!(
                         "{}  {}",
                         session_started_label(session, formatter),
                         truncate_single_line(&session.title, 64)
                     );
                     ListItem::new(Line::from(label))
-                })
+                }))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -514,6 +659,8 @@ fn render_sessions_view(
 
 fn render_project_detail(
     project: Option<&ProjectRecord>,
+    usage: Option<&LocalUsageSnapshot>,
+    usage_error: Option<&str>,
     formatter: DisplayFormatter<'_>,
 ) -> Text<'static> {
     let Some(project) = project else {
@@ -525,6 +672,51 @@ fn render_project_detail(
         .first()
         .map(|session| session_started_label(session, formatter))
         .unwrap_or_else(|| "--".to_string());
+
+    let usage_summary =
+        usage.and_then(|snapshot| snapshot.project_usage_for_path(&project.display_path));
+    let expected_files = project.sessions.len();
+    let indexed_files = usage_summary
+        .map(|summary| summary.indexed_files)
+        .unwrap_or(0);
+    let scan_complete = usage.is_some_and(|snapshot| snapshot.scan_pending_files == 0);
+    let usage_ready =
+        usage_error.is_none() && usage_summary.is_some() && indexed_files >= expected_files;
+    let project_scan = if usage_error.is_some() {
+        "ERROR".to_string()
+    } else if usage_ready {
+        "READY".to_string()
+    } else if scan_complete {
+        "NO DATA".to_string()
+    } else {
+        format!(
+            "SCANNING {}/{}",
+            formatter.format_usize(indexed_files),
+            formatter.format_usize(expected_files)
+        )
+    };
+
+    let (consumed_tokens, activity) = if usage_ready {
+        let summary = usage_summary.expect("usage summary checked above");
+        let non_cached = summary
+            .total_tokens
+            .saturating_sub(summary.cached_input_tokens)
+            .max(0);
+        (
+            format!(
+                "{} total / {} non-cached",
+                format_project_count(summary.total_tokens, formatter),
+                format_project_count(non_cached, formatter)
+            ),
+            format!(
+                "{} runs / {}",
+                formatter.format_count(summary.agent_runs),
+                format_duration(summary.agent_time_ms)
+            ),
+        )
+    } else {
+        ("--".to_string(), "--".to_string())
+    };
 
     let mut lines = vec![
         Line::from(vec![
@@ -546,6 +738,25 @@ fn render_project_detail(
             Span::raw(latest),
         ]),
         Line::from(""),
+        Line::from(vec![
+            Span::styled("CURRENT_CONSUMED_TOKENS", Style::default().fg(Color::Gray)),
+            Span::raw("  "),
+            Span::styled(
+                consumed_tokens,
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("PROJECT_SCAN", Style::default().fg(Color::Gray)),
+            Span::raw("  "),
+            Span::raw(project_scan),
+        ]),
+        Line::from(vec![
+            Span::styled("ACTIVITY", Style::default().fg(Color::Gray)),
+            Span::raw("  "),
+            Span::raw(activity),
+        ]),
+        Line::from(""),
         Line::from(Span::styled(
             "RECENT",
             Style::default()
@@ -563,6 +774,13 @@ fn render_project_detail(
     }
 
     Text::from(lines)
+}
+
+fn format_project_count(value: i64, formatter: DisplayFormatter<'_>) -> String {
+    match formatter.style() {
+        DisplayStyle::SystemCompact => format_compact_kmb(value.max(0) as u64, 16, formatter),
+        DisplayStyle::Classic | DisplayStyle::SystemFull => formatter.format_count(value),
+    }
 }
 
 fn render_session_detail(
@@ -740,10 +958,10 @@ fn render_footer(
 ) {
     let base = match state.view {
         ViewMode::Projects => {
-            "Projects: up/down, mouse wheel, enter/right open, s/F2 switch, r/F5 rescan, q quit"
+            "Projects: up/down or wheel, double-click/enter open, s/F2 switch, r/F5 rescan, q quit"
         }
         ViewMode::Sessions => {
-            "Sessions: up/down, mouse wheel, backspace/left/esc back, s/F2 switch, r/F5 rescan, q quit"
+            "Sessions: up/down or wheel, double-click .. / backspace / left / esc back, q quit"
         }
     };
     let error = state
@@ -796,8 +1014,14 @@ fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::header_line_area;
+    use super::{
+        header_line_area, history_style_controls_area, BrowserClickTarget, BrowserState,
+        DOUBLE_CLICK_WINDOW,
+    };
+    use crate::read::scan::Catalog;
     use ratatui::layout::Rect;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn header_line_has_one_blank_row_above_and_below() {
@@ -805,5 +1029,35 @@ mod tests {
             header_line_area(Rect::new(2, 1, 100, 3)),
             Rect::new(2, 2, 100, 1)
         );
+    }
+
+    #[test]
+    fn history_style_controls_use_right_side_of_header_line() {
+        assert_eq!(
+            history_style_controls_area(Rect::new(2, 1, 100, 3)),
+            Rect::new(72, 2, 30, 1)
+        );
+        assert_eq!(
+            history_style_controls_area(Rect::new(2, 1, 20, 3)),
+            Rect::default()
+        );
+    }
+
+    #[test]
+    fn identical_clicks_within_window_are_double_clicks() {
+        let mut state = BrowserState::new(Catalog {
+            sessions_dir: PathBuf::from("/tmp/sessions"),
+            projects: Vec::new(),
+            files_scanned: 0,
+            files_skipped: 0,
+        });
+        let now = Instant::now();
+        assert!(!state.register_click(BrowserClickTarget::Project(2), now));
+        assert!(state.register_click(BrowserClickTarget::Project(2), now + DOUBLE_CLICK_WINDOW));
+        assert!(!state.register_click(BrowserClickTarget::Parent, now));
+        assert!(!state.register_click(
+            BrowserClickTarget::Parent,
+            now + DOUBLE_CLICK_WINDOW + Duration::from_millis(1)
+        ));
     }
 }

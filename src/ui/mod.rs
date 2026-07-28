@@ -5654,7 +5654,9 @@ fn rolling_windows_for_limits(
 /// How full the unlocked N-day share of the weekly window is.
 ///
 /// Pace uses API `used_percent` (not the displayed percent-left). Allowed share is
-/// continuous: `elapsed/window * 100` from `resetsAt` + `windowDurationMins`.
+/// a **local calendar-day ladder** inside the rolling window from `resetsAt` +
+/// `windowDurationMins`: day 1 unlocks ~100/7, day 2 unlocks ~200/7, etc.
+/// Crossing local midnight increases the unlocked share even with no new usage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WeeklyPaceBand {
     /// fill < 50% of unlocked allowance
@@ -5681,28 +5683,53 @@ fn now_unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Unlocked fair-share percent of the weekly window at `now_unix_secs`.
-/// Returns `None` when the window cannot be placed on a timeline.
-fn weekly_unlocked_allowed_percent(
+fn weekly_window_bounds_secs(
     window: &crate::codex_rpc::RateLimitWindow,
-    now_unix_secs: i64,
-) -> Option<f64> {
+) -> Option<(i64, i64, f64)> {
     let window_mins = window
         .window_duration_mins
         .filter(|value| value.is_finite() && *value > 0.0)?;
     let resets_at = window.resets_at?;
     let reset_ms = crate::codex_rpc::normalize_epoch_millis(resets_at);
     let reset_secs = reset_ms.div_euclid(1000);
-    let remaining_secs = reset_secs.saturating_sub(now_unix_secs).max(0);
-    let remaining_mins = (remaining_secs as f64) / 60.0;
-    let elapsed_mins = (window_mins - remaining_mins).clamp(0.0, window_mins);
-    Some((elapsed_mins / window_mins) * 100.0)
+    // Prefer integer minutes when the API sends whole minutes (typical 10080).
+    let window_secs = if window_mins.fract().abs() < f64::EPSILON {
+        (window_mins as i64).saturating_mul(60).max(1)
+    } else {
+        (window_mins * 60.0).round().max(1.0) as i64
+    };
+    let start_secs = reset_secs.saturating_sub(window_secs);
+    Some((start_secs, reset_secs, window_mins))
+}
+
+/// 1-based local calendar day index inside the weekly window.
+///
+/// Day 1 is the local date of the window start; day advances at each local midnight.
+fn weekly_local_day_index(start_secs: i64, now_unix_secs: i64, reset_secs: i64) -> Option<i64> {
+    let now_clamped = now_unix_secs.clamp(start_secs, reset_secs.max(start_secs));
+    let start_date = Local.timestamp_opt(start_secs, 0).single()?.date_naive();
+    let now_date = Local.timestamp_opt(now_clamped, 0).single()?.date_naive();
+    let days = (now_date - start_date).num_days();
+    Some(days.max(0).saturating_add(1))
+}
+
+/// Unlocked fair-share percent of the weekly window at `now_unix_secs` (local day ladder).
+/// Returns `None` when the window cannot be placed on a timeline.
+fn weekly_unlocked_allowed_percent(
+    window: &crate::codex_rpc::RateLimitWindow,
+    now_unix_secs: i64,
+) -> Option<f64> {
+    let (start_secs, reset_secs, window_mins) = weekly_window_bounds_secs(window)?;
+    let day_index = weekly_local_day_index(start_secs, now_unix_secs, reset_secs)?;
+    let window_days = (window_mins / (24.0 * 60.0)).max(1.0);
+    let max_days = window_days.ceil().max(1.0) as i64;
+    let day_index = day_index.clamp(1, max_days) as f64;
+    Some((day_index / window_days) * 100.0)
 }
 
 /// Map weekly window + clock to a display band.
 ///
-/// `fill% = used% / allowed% * 100` where `allowed%` is the unlocked N-day share.
-/// Soft-floors tiny `allowed` so early-window math stays stable.
+/// `fill% = used% / allowed% * 100` where `allowed%` is the unlocked local-day share.
 fn weekly_pace_band(
     window: &crate::codex_rpc::RateLimitWindow,
     now_unix_secs: i64,
@@ -5717,7 +5744,7 @@ fn weekly_pace_band(
     if !allowed.is_finite() {
         return WeeklyPaceBand::Normal;
     }
-    // Avoid divide-by-near-zero right after a reset; 0.5% floor ~ first ~50 minutes of a 7d window.
+    // Safety floor (should not hit with day ladder; day 1 is already ~100/7).
     if allowed < 0.5 {
         allowed = 0.5;
     }
@@ -5911,9 +5938,7 @@ fn format_weekly_pace_tooltip(
         allowed = 0.5;
     }
     let pace_x = (used / allowed).clamp(0.0, 99.0);
-    let window_mins = window
-        .window_duration_mins
-        .filter(|value| value.is_finite() && *value > 0.0)?;
+    let (start_secs, reset_secs, window_mins) = weekly_window_bounds_secs(window)?;
     let day_mins = 24.0 * 60.0;
     let window_days = (window_mins / day_mins).max(1.0);
     let day_budget = 100.0 / window_days;
@@ -5922,15 +5947,7 @@ fn format_weekly_pace_tooltip(
     } else {
         0.0
     };
-    let reset_ms = window
-        .resets_at
-        .map(crate::codex_rpc::normalize_epoch_millis);
-    let reset_secs = reset_ms.map(|ms| ms.div_euclid(1000));
-    let remaining_mins = reset_secs
-        .map(|reset| reset.saturating_sub(now_unix_secs).max(0) as f64 / 60.0)
-        .unwrap_or(0.0);
-    let elapsed_mins = (window_mins - remaining_mins).clamp(0.0, window_mins);
-    let days_elapsed = elapsed_mins / day_mins;
+    let local_day = weekly_local_day_index(start_secs, now_unix_secs, reset_secs)? as f64;
     let reset_phrase = resets_label(window.resets_at, formatter)
         .map(|label| format!(" ({label})"))
         .unwrap_or_default();
@@ -5943,21 +5960,19 @@ fn format_weekly_pace_tooltip(
     } else {
         format!("{:.1}", days_used)
     };
-    let days_elapsed_label = if days_elapsed < 0.05 {
-        "just after reset".to_string()
-    } else if days_elapsed < 1.0 {
-        format!("{:.1} day", days_elapsed.max(0.1))
+    let days_elapsed_label = if local_day <= 1.0 {
+        "local day 1 of the weekly window".to_string()
     } else {
-        format!("{:.1} days", days_elapsed)
+        format!("local day {local_day:.0} of the weekly window")
     };
 
     let text = match band {
         WeeklyPaceBand::Normal => return None,
         WeeklyPaceBand::Yellow => format!(
-            "Weekly pace is elevated.\nUsed {used_i}% vs ~{allowed_i}% unlocked for time so far (~{pace_label} fair pace)."
+            "Weekly pace is elevated.\nUsed {used_i}% vs ~{allowed_i}% unlocked through {days_elapsed_label} (~{pace_label} fair pace)."
         ),
         WeeklyPaceBand::Orange => format!(
-            "You have used about {days_used_label} day-shares of the weekly limit in {days_elapsed_label} (~{pace_label} unlocked pace).\nThe weekly limit may run out before the reset{reset_phrase}."
+            "You have used about {days_used_label} day-shares of the weekly limit on {days_elapsed_label} (~{pace_label} unlocked pace).\nThe weekly limit may run out before the reset{reset_phrase}."
         ),
         WeeklyPaceBand::Red => format!(
             "You already used near {days_used_label}x a full day's share of the weekly limit (~{pace_label} unlocked pace).\nWeekly limits may finish faster than the reset day{reset_phrase}."
@@ -6871,72 +6886,79 @@ mod tests {
         assert_eq!(compact_caption1.as_deref(), Some("5h limit: --"));
     }
 
-    fn weekly_window_at(
+    fn local_unix_secs(date: NaiveDate, hour: u32, minute: u32) -> i64 {
+        let naive = date
+            .and_hms_opt(hour, minute, 0)
+            .expect("valid local wall time");
+        Local
+            .from_local_datetime(&naive)
+            .single()
+            .or_else(|| Local.from_local_datetime(&naive).earliest())
+            .expect("local datetime")
+            .timestamp()
+    }
+
+    /// Build a 7-day weekly window starting at local midnight of `window_start_date`.
+    fn weekly_window_local_days(
         used_percent: f64,
-        now_unix_secs: i64,
-        elapsed_mins: f64,
-    ) -> crate::codex_rpc::RateLimitWindow {
-        const WINDOW_MINS: f64 = 10080.0;
-        let remaining_mins = (WINDOW_MINS - elapsed_mins).max(0.0);
-        let resets_at = now_unix_secs.saturating_add((remaining_mins * 60.0) as i64);
-        crate::codex_rpc::RateLimitWindow {
+        window_start_date: NaiveDate,
+        now_date: NaiveDate,
+        now_hour: u32,
+        now_minute: u32,
+    ) -> (crate::codex_rpc::RateLimitWindow, i64) {
+        const WINDOW_DAYS: i64 = 7;
+        let start_secs = local_unix_secs(window_start_date, 0, 0);
+        let reset_secs = start_secs.saturating_add(WINDOW_DAYS.saturating_mul(24 * 3600));
+        let now_secs = local_unix_secs(now_date, now_hour, now_minute);
+        let window = crate::codex_rpc::RateLimitWindow {
             used_percent: Some(used_percent),
-            window_duration_mins: Some(WINDOW_MINS),
-            resets_at: Some(resets_at),
-        }
+            window_duration_mins: Some((WINDOW_DAYS * 24 * 60) as f64),
+            resets_at: Some(reset_secs),
+        };
+        (window, now_secs)
     }
 
     #[test]
     fn weekly_pace_band_thresholds_use_unlocked_share() {
-        let now = 1_700_000_000_i64;
-        // After 1 day, allowed ~ 100/7 ~ 14.286%.
+        // Local day 1: allowed ~ 100/7 ~ 14.286%.
         // used 6 -> fill ~ 42% -> Normal
         // used 8 -> fill ~ 56% -> Yellow
         // used 10 -> fill ~ 70% -> Orange
         // used 13 -> fill ~ 91% -> Red
-        let day1 = 24.0 * 60.0;
-        assert_eq!(
-            weekly_pace_band(&weekly_window_at(6.0, now, day1), now),
-            WeeklyPaceBand::Normal
-        );
-        assert_eq!(
-            weekly_pace_band(&weekly_window_at(8.0, now, day1), now),
-            WeeklyPaceBand::Yellow
-        );
-        assert_eq!(
-            weekly_pace_band(&weekly_window_at(10.0, now, day1), now),
-            WeeklyPaceBand::Orange
-        );
-        assert_eq!(
-            weekly_pace_band(&weekly_window_at(13.0, now, day1), now),
-            WeeklyPaceBand::Red
-        );
+        let start = NaiveDate::from_ymd_opt(2026, 7, 20).expect("date");
+        let (w6, now) = weekly_window_local_days(6.0, start, start, 15, 0);
+        assert_eq!(weekly_pace_band(&w6, now), WeeklyPaceBand::Normal);
+        let (w8, now) = weekly_window_local_days(8.0, start, start, 15, 0);
+        assert_eq!(weekly_pace_band(&w8, now), WeeklyPaceBand::Yellow);
+        let (w10, now) = weekly_window_local_days(10.0, start, start, 15, 0);
+        assert_eq!(weekly_pace_band(&w10, now), WeeklyPaceBand::Orange);
+        let (w13, now) = weekly_window_local_days(13.0, start, start, 15, 0);
+        assert_eq!(weekly_pace_band(&w13, now), WeeklyPaceBand::Red);
     }
 
     #[test]
-    fn weekly_pace_band_eases_as_window_elapses_without_new_use() {
-        let now = 1_700_000_000_i64;
+    fn weekly_pace_band_eases_at_local_midnight_without_new_use() {
+        let start = NaiveDate::from_ymd_opt(2026, 7, 20).expect("date");
+        let day2 = NaiveDate::from_ymd_opt(2026, 7, 21).expect("date");
+        let day3 = NaiveDate::from_ymd_opt(2026, 7, 22).expect("date");
         let used = 17.0;
-        // Day 1: allowed ~14.3%, fill ~119% -> Red
-        assert_eq!(
-            weekly_pace_band(&weekly_window_at(used, now, 24.0 * 60.0), now),
-            WeeklyPaceBand::Red
-        );
-        // Day 2: allowed ~28.6%, fill ~59.5% -> Yellow
-        assert_eq!(
-            weekly_pace_band(&weekly_window_at(used, now, 2.0 * 24.0 * 60.0), now),
-            WeeklyPaceBand::Yellow
-        );
-        // Day 3: allowed ~42.9%, fill ~39.7% -> Normal
-        assert_eq!(
-            weekly_pace_band(&weekly_window_at(used, now, 3.0 * 24.0 * 60.0), now),
-            WeeklyPaceBand::Normal
-        );
+
+        // Day 1 evening: allowed ~14.3%, fill ~119% -> Red
+        let (w, now) = weekly_window_local_days(used, start, start, 23, 30);
+        assert_eq!(weekly_pace_band(&w, now), WeeklyPaceBand::Red);
+
+        // Local day 2 at 00:23: allowed ~28.6%, fill ~59.5% -> Yellow
+        let (w, now) = weekly_window_local_days(used, start, day2, 0, 23);
+        assert_eq!(weekly_pace_band(&w, now), WeeklyPaceBand::Yellow);
+
+        // Local day 3: allowed ~42.9%, fill ~39.7% -> Normal
+        let (w, now) = weekly_window_local_days(used, start, day3, 0, 23);
+        assert_eq!(weekly_pace_band(&w, now), WeeklyPaceBand::Normal);
     }
 
     #[test]
     fn weekly_pace_band_is_normal_without_resets_at_or_bad_used() {
-        let now = 1_700_000_000_i64;
+        let now = local_unix_secs(NaiveDate::from_ymd_opt(2026, 7, 20).expect("date"), 12, 0);
         let missing_reset = crate::codex_rpc::RateLimitWindow {
             used_percent: Some(50.0),
             window_duration_mins: Some(10080.0),
@@ -6957,11 +6979,11 @@ mod tests {
 
     #[test]
     fn weekly_pace_tooltip_explains_orange_and_red_without_normal() {
-        let now = 1_700_000_000_i64;
+        let start = NaiveDate::from_ymd_opt(2026, 7, 20).expect("date");
         let locale = crate::locale::SystemLocale::default();
         let formatter = DisplayFormatter::new(DisplayStyle::Classic, &locale);
 
-        let normal = weekly_window_at(6.0, now, 24.0 * 60.0);
+        let (normal, now) = weekly_window_local_days(6.0, start, start, 15, 0);
         assert_eq!(weekly_pace_band(&normal, now), WeeklyPaceBand::Normal);
         assert!(format_weekly_pace_tooltip(
             &normal,
@@ -6971,7 +6993,7 @@ mod tests {
         )
         .is_none());
 
-        let orange = weekly_window_at(10.0, now, 24.0 * 60.0);
+        let (orange, now) = weekly_window_local_days(10.0, start, start, 15, 0);
         assert_eq!(weekly_pace_band(&orange, now), WeeklyPaceBand::Orange);
         let orange_text =
             format_weekly_pace_tooltip(&orange, WeeklyPaceBand::Orange, now, formatter)
@@ -6980,7 +7002,7 @@ mod tests {
         assert!(orange_text.contains("may run out"));
         assert!(orange_text.contains('\n'));
 
-        let red = weekly_window_at(17.0, now, 24.0 * 60.0);
+        let (red, now) = weekly_window_local_days(17.0, start, start, 15, 0);
         assert_eq!(weekly_pace_band(&red, now), WeeklyPaceBand::Red);
         let red_text =
             format_weekly_pace_tooltip(&red, WeeklyPaceBand::Red, now, formatter).expect("red");

@@ -3,9 +3,7 @@ use crate::read::scan::{
     load_session_detail, truncate_single_line, Catalog, ProjectRecord, SessionDetail,
     SessionSummary,
 };
-use crate::usage::{
-    format_compact_kmb, format_duration, normalize_project_key, LocalUsageSnapshot,
-};
+use crate::usage::{format_compact_kmb, format_duration, LocalUsageSnapshot};
 use anyhow::Result;
 use chrono::{DateTime, Local};
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
@@ -16,9 +14,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
-use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
@@ -54,7 +50,6 @@ pub(crate) struct BrowserState {
     error: Option<String>,
     layout: UiLayout,
     last_click: Option<(BrowserClickTarget, Instant)>,
-    usage_project_revision: Option<u64>,
 }
 
 impl BrowserState {
@@ -89,54 +84,7 @@ impl BrowserState {
             error: None,
             layout: UiLayout::default(),
             last_click: None,
-            usage_project_revision: None,
         }
-    }
-
-    fn reconcile_project_usage(&mut self, usage: &LocalUsageSnapshot) {
-        let mut hasher = DefaultHasher::new();
-        for project in &usage.project_usage {
-            project.display_path.hash(&mut hasher);
-            project.session_files.hash(&mut hasher);
-        }
-        let revision = hasher.finish();
-        if self.usage_project_revision == Some(revision) {
-            return;
-        }
-
-        let selected_project = self
-            .selected_project()
-            .map(|project| normalize_project_key(&project.display_path));
-        let selected_session = self
-            .selected_session()
-            .map(|session| session.file_path.clone());
-        self.catalog.reconcile_project_usage(&usage.project_usage);
-        self.usage_project_revision = Some(revision);
-
-        let project_index = selected_project
-            .as_deref()
-            .and_then(|key| {
-                self.catalog
-                    .projects
-                    .iter()
-                    .position(|project| normalize_project_key(&project.display_path) == key)
-            })
-            .or_else(|| (!self.catalog.projects.is_empty()).then_some(0));
-        self.project_state.select(project_index);
-
-        let session_row = project_index
-            .and_then(|index| self.catalog.projects.get(index))
-            .and_then(|project| {
-                selected_session.as_ref().and_then(|path| {
-                    project
-                        .sessions
-                        .iter()
-                        .position(|session| &session.file_path == path)
-                        .map(|index| index + 1)
-                })
-            })
-            .unwrap_or(0);
-        self.session_state.select(Some(session_row));
     }
 
     fn selected_project_index(&self) -> Option<usize> {
@@ -441,9 +389,6 @@ pub(crate) fn render(
     usage_error: Option<&str>,
     formatter: DisplayFormatter<'_>,
 ) {
-    if let Some(usage) = usage {
-        state.reconcile_project_usage(usage);
-    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

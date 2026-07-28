@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+- Fixed project attribution to use recorded session context only: sandbox permissions, tool working directories, and referenced command paths cannot create project memberships or relink Session history. The v12 cache migration rebuilds derived usage from raw session logs.
+
 ## 0.4.4 - 2026-07-26
 
 - Placed APISTAT immediately after USAGE and aligned its header, live-limits card, server-total cards, and reset-credit summary with the Usage dashboard.

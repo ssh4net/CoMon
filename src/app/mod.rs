@@ -155,6 +155,16 @@ enum InputOutcome {
     Quit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuitConfirmationCommand {
+    Confirm,
+    Cancel,
+    QuitImmediately,
+    ToggleDontAskAgain,
+    SelectYes,
+    SelectNo,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum ActivityCommand {
     RefreshAll,
@@ -229,6 +239,7 @@ pub(crate) struct AppState {
     pub(crate) no_sessions_confirm_open: bool,
     pub(crate) no_sessions_confirm_dismissed: bool,
     pub(crate) quit_confirm_open: bool,
+    pub(crate) quit_confirm_yes_selected: bool,
     pub(crate) quit_dont_ask_again: bool,
     pub(crate) skip_quit_confirmation: bool,
     pub(crate) quit_preference_prompt: Option<bool>,
@@ -642,6 +653,7 @@ async fn run_inner(
         no_sessions_confirm_open: false,
         no_sessions_confirm_dismissed: restored_ui_state.no_sessions_confirm_dismissed,
         quit_confirm_open: false,
+        quit_confirm_yes_selected: false,
         quit_dont_ask_again: false,
         skip_quit_confirmation: restored_ui_state.skip_quit_confirmation,
         quit_preference_prompt: None,
@@ -834,6 +846,7 @@ fn handle_input_event(
                     }
                     Some(UiClickAction::CancelQuit) => {
                         state.quit_confirm_open = false;
+                        state.quit_confirm_yes_selected = false;
                         state.quit_dont_ask_again = false;
                         Ok(InputOutcome::Continue(true))
                     }
@@ -844,28 +857,38 @@ fn handle_input_event(
                     _ => Ok(InputOutcome::Continue(false)),
                 }
             }
-            Event::Key(key) if key.kind == KeyEventKind::Press => match (key.code, key.modifiers) {
-                (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
-                    state.skip_quit_confirmation = state.quit_dont_ask_again;
-                    Ok(InputOutcome::Quit)
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                match quit_confirmation_command(
+                    key.code,
+                    key.modifiers,
+                    state.quit_confirm_yes_selected,
+                ) {
+                    Some(QuitConfirmationCommand::Confirm) => {
+                        state.skip_quit_confirmation = state.quit_dont_ask_again;
+                        Ok(InputOutcome::Quit)
+                    }
+                    Some(QuitConfirmationCommand::QuitImmediately) => Ok(InputOutcome::Quit),
+                    Some(QuitConfirmationCommand::ToggleDontAskAgain) => {
+                        state.quit_dont_ask_again = !state.quit_dont_ask_again;
+                        Ok(InputOutcome::Continue(true))
+                    }
+                    Some(QuitConfirmationCommand::SelectYes) => {
+                        state.quit_confirm_yes_selected = true;
+                        Ok(InputOutcome::Continue(true))
+                    }
+                    Some(QuitConfirmationCommand::SelectNo) => {
+                        state.quit_confirm_yes_selected = false;
+                        Ok(InputOutcome::Continue(true))
+                    }
+                    Some(QuitConfirmationCommand::Cancel) => {
+                        state.quit_confirm_open = false;
+                        state.quit_confirm_yes_selected = false;
+                        state.quit_dont_ask_again = false;
+                        Ok(InputOutcome::Continue(true))
+                    }
+                    None => Ok(InputOutcome::Continue(false)),
                 }
-                (KeyCode::Char('c'), KeyModifiers::CONTROL) => Ok(InputOutcome::Quit),
-                (KeyCode::Char(' '), _) => {
-                    state.quit_dont_ask_again = !state.quit_dont_ask_again;
-                    Ok(InputOutcome::Continue(true))
-                }
-                (KeyCode::Enter, _)
-                | (KeyCode::Esc, _)
-                | (KeyCode::Char('n'), _)
-                | (KeyCode::Char('N'), _)
-                | (KeyCode::Char('q'), _)
-                | (KeyCode::Char('Q'), _) => {
-                    state.quit_confirm_open = false;
-                    state.quit_dont_ask_again = false;
-                    Ok(InputOutcome::Continue(true))
-                }
-                _ => Ok(InputOutcome::Continue(false)),
-            },
+            }
             Event::Resize(_, _) => Ok(InputOutcome::Continue(true)),
             _ => Ok(InputOutcome::Continue(false)),
         };
@@ -959,6 +982,7 @@ fn handle_input_event(
                     return Ok(InputOutcome::Quit);
                 }
                 state.quit_confirm_open = true;
+                state.quit_confirm_yes_selected = false;
                 state.quit_dont_ask_again = false;
                 return Ok(InputOutcome::Continue(true));
             }
@@ -1023,6 +1047,31 @@ fn handle_input_event(
             &mut state.read_browser,
             event,
         )?)),
+    }
+}
+
+fn quit_confirmation_command(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    yes_selected: bool,
+) -> Option<QuitConfirmationCommand> {
+    if code == KeyCode::Char('c') && modifiers == KeyModifiers::CONTROL {
+        return Some(QuitConfirmationCommand::QuitImmediately);
+    }
+
+    match code {
+        KeyCode::Left => Some(QuitConfirmationCommand::SelectYes),
+        KeyCode::Right => Some(QuitConfirmationCommand::SelectNo),
+        KeyCode::Enter if yes_selected => Some(QuitConfirmationCommand::Confirm),
+        KeyCode::Enter => Some(QuitConfirmationCommand::Cancel),
+        KeyCode::Char('y') | KeyCode::Char('Y') => Some(QuitConfirmationCommand::Confirm),
+        KeyCode::Char(' ') => Some(QuitConfirmationCommand::ToggleDontAskAgain),
+        KeyCode::Esc
+        | KeyCode::Char('n')
+        | KeyCode::Char('N')
+        | KeyCode::Char('q')
+        | KeyCode::Char('Q') => Some(QuitConfirmationCommand::Cancel),
+        _ => None,
     }
 }
 
@@ -1161,11 +1210,13 @@ fn apply_ui_click_action(state: &mut AppState, action: UiClickAction) -> bool {
         }
         UiClickAction::PromptQuit => {
             state.quit_confirm_open = true;
+            state.quit_confirm_yes_selected = false;
             state.quit_dont_ask_again = false;
             true
         }
         UiClickAction::CancelQuit => {
             state.quit_confirm_open = false;
+            state.quit_confirm_yes_selected = false;
             state.quit_dont_ask_again = false;
             true
         }
@@ -1937,6 +1988,26 @@ mod tests {
         );
         assert_eq!(ui_click_action_at(&targets, 14, 5), None);
         assert_eq!(ui_click_action_at(&targets, 10, 7), None);
+    }
+
+    #[test]
+    fn quit_confirmation_arrows_select_and_enter_uses_the_selected_button() {
+        assert_eq!(
+            quit_confirmation_command(KeyCode::Left, KeyModifiers::NONE, false),
+            Some(QuitConfirmationCommand::SelectYes)
+        );
+        assert_eq!(
+            quit_confirmation_command(KeyCode::Right, KeyModifiers::NONE, true),
+            Some(QuitConfirmationCommand::SelectNo)
+        );
+        assert_eq!(
+            quit_confirmation_command(KeyCode::Enter, KeyModifiers::NONE, true),
+            Some(QuitConfirmationCommand::Confirm)
+        );
+        assert_eq!(
+            quit_confirmation_command(KeyCode::Enter, KeyModifiers::NONE, false),
+            Some(QuitConfirmationCommand::Cancel)
+        );
     }
 
     #[test]

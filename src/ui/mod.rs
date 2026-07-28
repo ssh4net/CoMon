@@ -4906,11 +4906,11 @@ fn render_quit_confirmation(frame: &mut Frame<'_>, area: Rect, state: &mut AppSt
         Paragraph::new(Text::from(vec![
             Line::from("Are you sure you want to quit?"),
             Line::from(Span::styled(
-                "Y confirms; N/Esc/Enter cancels",
+                "Left/Right selects; Enter chooses",
                 Style::default().fg(Color::Gray),
             )),
             Line::from(Span::styled(
-                "Space toggles the checkbox",
+                "Y yes; N/Esc no; Space toggles",
                 Style::default().fg(Color::Gray),
             )),
         ]))
@@ -4958,9 +4958,9 @@ fn render_quit_confirmation(frame: &mut Frame<'_>, area: Rect, state: &mut AppSt
         .extend(centered_targets(buttons_area, &segments));
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            pill("YES", false),
+            pill("YES", state.quit_confirm_yes_selected),
             Span::raw("   "),
-            pill("NO", true),
+            pill("NO", !state.quit_confirm_yes_selected),
         ]))
         .alignment(Alignment::Center),
         buttons_area,

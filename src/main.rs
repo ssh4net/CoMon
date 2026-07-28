@@ -409,6 +409,7 @@ mod tests {
         let mut candidates = vec![std::env::temp_dir()];
         #[cfg(unix)]
         {
+            candidates.push(PathBuf::from("/dev/shm"));
             candidates.push(PathBuf::from("/var/tmp"));
         }
 
@@ -417,12 +418,27 @@ mod tests {
                 .map(|meta| meta.is_dir())
                 .unwrap_or(false)
                 && detect_git_root(&candidate).is_none()
+                && directory_is_writable(&candidate)
             {
                 return candidate;
             }
         }
 
         std::env::temp_dir()
+    }
+
+    fn directory_is_writable(path: &Path) -> bool {
+        let probe = path.join(format!(
+            ".comon-main-write-probe-{}",
+            TEMP_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::create_dir(&probe) {
+            Ok(()) => {
+                let _ = std::fs::remove_dir(&probe);
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     fn make_git_repo(path: &Path) -> PathBuf {

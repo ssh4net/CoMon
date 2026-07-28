@@ -27,8 +27,12 @@ use ratatui::{
 };
 use std::collections::BTreeMap;
 use std::io::{self, Stdout};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use unicode_width::UnicodeWidthStr;
+
+/// Orange used for weekly pace warning bands (distinct from yellow/red).
+const WEEKLY_PACE_ORANGE: Color = Color::Rgb(204, 102, 0);
+const WEEKLY_PACE_ORANGE_BG: Color = Color::Rgb(160, 80, 0);
 
 const ACTIVITY_PROJECT_HEIGHT: u16 = 9;
 const ACTIVITY_PROJECT_STRIDE: u16 = 10;
@@ -441,8 +445,11 @@ fn render_api_stats(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
         .split(area);
 
     render_api_stat_controls(frame, chunks[0], state, reset_summary.as_deref());
-    render_api_stat_cards(frame, chunks[1], state, &account_usage);
+    let weekly_hover = render_api_stat_cards(frame, chunks[1], state, &account_usage);
     render_api_stat_chart(frame, chunks[2], &account_usage, state);
+    if let Some(hover) = weekly_hover {
+        render_hover_tooltip(frame, area, hover.mouse, &hover.text);
+    }
 }
 
 fn api_stat_controls_height(summary: Option<&str>, width: u16) -> u16 {
@@ -653,16 +660,18 @@ fn render_api_stat_cards(
     area: Rect,
     state: &AppState,
     usage: &crate::codex_rpc::AccountUsage,
-) {
+) -> Option<WeeklyPaceHover> {
     let layout = usage_card_layout(area.width);
-    let specs = api_stat_card_specs(state, usage, layout.min_card_width.max(1));
+    let card_width = layout.min_card_width.max(1);
+    let compact_limits = uses_compact_limit_lines(card_width);
+    let specs = api_stat_card_specs(state, usage, card_width);
     let row_heights = specs
         .chunks(layout.columns)
-        .map(|row| api_stat_card_row_height(row, layout.min_card_width.max(1)))
+        .map(|row| api_stat_card_row_height(row, card_width))
         .collect::<Vec<_>>();
 
     if layout.columns == 6 {
-        render_api_stat_card_row(frame, area, &specs);
+        render_api_stat_card_row(frame, area, &specs, state, compact_limits)
     } else {
         let rows = Layout::default()
             .direction(Direction::Vertical)
@@ -671,8 +680,10 @@ fn render_api_stat_cards(
                 Constraint::Length(row_heights[1]),
             ])
             .split(area);
-        render_api_stat_card_row(frame, rows[0], &specs[..3]);
-        render_api_stat_card_row(frame, rows[1], &specs[3..]);
+        let top = render_api_stat_card_row(frame, rows[0], &specs[..3], state, compact_limits);
+        let bottom =
+            render_api_stat_card_row(frame, rows[1], &specs[3..], state, compact_limits);
+        top.or(bottom)
     }
 }
 
@@ -684,9 +695,15 @@ fn api_stat_card_row_height(cards: &[(&'static str, CardSpec)], card_width: u16)
         .unwrap_or(0)
 }
 
-fn render_api_stat_card_row(frame: &mut Frame<'_>, area: Rect, cards: &[(&'static str, CardSpec)]) {
+fn render_api_stat_card_row(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    cards: &[(&'static str, CardSpec)],
+    state: &AppState,
+    compact_limits: bool,
+) -> Option<WeeklyPaceHover> {
     if cards.is_empty() {
-        return;
+        return None;
     }
     let constraints = match cards.len() {
         6 => vec![
@@ -709,7 +726,14 @@ fn render_api_stat_card_row(frame: &mut Frame<'_>, area: Rect, cards: &[(&'stati
         .constraints(constraints)
         .split(area);
 
+    let mut hover = None;
     for (index, (title, spec)) in cards.iter().enumerate() {
+        if *title == "LIMITS" {
+            if let Some(next) = render_limits_card(frame, areas[index], state, compact_limits) {
+                hover = Some(next);
+            }
+            continue;
+        }
         let Some((value, captions)) = spec.lines.split_first() else {
             continue;
         };
@@ -719,6 +743,7 @@ fn render_api_stat_card_row(frame: &mut Frame<'_>, area: Rect, cards: &[(&'stati
             .collect::<Vec<_>>();
         frame.render_widget(card_with_captions(title, value, &captions), areas[index]);
     }
+    hover
 }
 
 fn format_optional_account_tokens(value: Option<u64>, formatter: DisplayFormatter<'_>) -> String {
@@ -1953,9 +1978,12 @@ fn render_usage(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     let chunks = usage_layout(area, controls_height, cards_height);
 
     render_usage_controls(frame, chunks[0], state, reset_summary.as_deref());
-    render_usage_cards(frame, chunks[1], state);
+    let weekly_hover = render_usage_cards(frame, chunks[1], state);
     render_usage_chart(frame, chunks[2], state);
     render_top_models(frame, chunks[3], state);
+    if let Some(hover) = weekly_hover {
+        render_hover_tooltip(frame, area, hover.mouse, &hover.text);
+    }
 }
 
 fn usage_layout(area: Rect, controls_height: u16, cards_height: u16) -> [Rect; 4] {
@@ -1989,8 +2017,11 @@ fn render_activity(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
         .split(area);
 
     render_activity_controls(frame, chunks[0], state, reset_summary.as_deref());
-    render_usage_cards(frame, chunks[1], state);
+    let weekly_hover = render_usage_cards(frame, chunks[1], state);
     render_activity_heatmaps(frame, chunks[2], state);
+    if let Some(hover) = weekly_hover {
+        render_hover_tooltip(frame, area, hover.mouse, &hover.text);
+    }
 }
 
 fn render_activity_controls(
@@ -3100,7 +3131,8 @@ fn usage_cards_height(state: &AppState, width: u16) -> u16 {
     total
 }
 
-fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> Option<WeeklyPaceHover> {
+    let mut weekly_hover: Option<WeeklyPaceHover> = None;
     let formatter = state.formatter();
     let today_now = match state.usage_zone {
         UsageZone::Local => Local::now().naive_local(),
@@ -3127,29 +3159,6 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let totals =
         snapshot.map(|s| s.totals_view_for_zone(state.metric, formatter, state.usage_zone));
     let today = snapshot.and_then(|s| s.days_for_zone(state.usage_zone).last());
-
-    // LIMITS card (live from Codex app-server).
-    let (limits_value, limits_caption1, limits_caption2, limits_caption3): (
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ) = if !state.limits_enabled {
-        let msg = state
-            .limits_error
-            .as_deref()
-            .or(state.limits_notice.as_deref())
-            .unwrap_or("Limits unavailable.");
-        ("Unavailable".to_string(), Some(msg.to_string()), None, None)
-    } else if let Some(l) = state.limits.as_ref() {
-        format_limits_compact_card_lines(
-            l,
-            uses_compact_limit_lines(card_layout.min_card_width),
-            formatter,
-        )
-    } else {
-        ("Loading...".to_string(), None, None, None)
-    };
 
     if let Some(pending) = state
         .usage
@@ -3185,16 +3194,14 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                         Constraint::Percentage(16),
                     ])
                     .split(row1);
-                frame.render_widget(
-                    card4(
-                        "LIMITS",
-                        &limits_value,
-                        limits_caption1.as_deref(),
-                        limits_caption2.as_deref(),
-                        limits_caption3.as_deref(),
-                    ),
-                    cards[0],
-                );
+                if let Some(hover) = render_limits_card(
+                        frame,
+                        cards[0],
+                        state,
+                        uses_compact_limit_lines(card_layout.min_card_width),
+                    ) {
+                        weekly_hover = Some(hover);
+                    };
                 for (title, target) in [
                     (today_title.as_str(), cards[1]),
                     ("LAST_7_DAYS", cards[2]),
@@ -3213,16 +3220,14 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                         Constraint::Percentage(33),
                     ])
                     .split(row1);
-                frame.render_widget(
-                    card4(
-                        "LIMITS",
-                        &limits_value,
-                        limits_caption1.as_deref(),
-                        limits_caption2.as_deref(),
-                        limits_caption3.as_deref(),
-                    ),
-                    top[0],
-                );
+                if let Some(hover) = render_limits_card(
+                        frame,
+                        top[0],
+                        state,
+                        uses_compact_limit_lines(card_layout.min_card_width),
+                    ) {
+                        weekly_hover = Some(hover);
+                    };
                 render_pending(frame, &today_title, top[1]);
                 render_pending(frame, "LAST_7_DAYS", top[2]);
             }
@@ -3240,7 +3245,7 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             render_pending(frame, aux_title, bottom[1]);
             render_pending(frame, "PEAK_DAY", bottom[2]);
         }
-        return;
+        return weekly_hover;
     }
 
     // TODAY card always shows Tokens / Runs / Time.
@@ -3330,16 +3335,14 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                             Constraint::Percentage(16),
                         ])
                         .split(row1);
-                    frame.render_widget(
-                        card4(
-                            "LIMITS",
-                            &limits_value,
-                            limits_caption1.as_deref(),
-                            limits_caption2.as_deref(),
-                            limits_caption3.as_deref(),
-                        ),
+                    if let Some(hover) = render_limits_card(
+                        frame,
                         cards[0],
-                    );
+                        state,
+                        uses_compact_limit_lines(card_layout.min_card_width),
+                    ) {
+                        weekly_hover = Some(hover);
+                    };
                     frame.render_widget(
                         card(
                             &today_title,
@@ -3383,16 +3386,14 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                             Constraint::Percentage(33),
                         ])
                         .split(row1);
-                    frame.render_widget(
-                        card4(
-                            "LIMITS",
-                            &limits_value,
-                            limits_caption1.as_deref(),
-                            limits_caption2.as_deref(),
-                            limits_caption3.as_deref(),
-                        ),
+                    if let Some(hover) = render_limits_card(
+                        frame,
                         top[0],
-                    );
+                        state,
+                        uses_compact_limit_lines(card_layout.min_card_width),
+                    ) {
+                        weekly_hover = Some(hover);
+                    };
                     let runs7 = last7_runs_caption.as_deref();
                     frame.render_widget(
                         card(
@@ -3484,16 +3485,14 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                             Constraint::Percentage(16),
                         ])
                         .split(row1);
-                    frame.render_widget(
-                        card4(
-                            "LIMITS",
-                            &limits_value,
-                            limits_caption1.as_deref(),
-                            limits_caption2.as_deref(),
-                            limits_caption3.as_deref(),
-                        ),
+                    if let Some(hover) = render_limits_card(
+                        frame,
                         cards[0],
-                    );
+                        state,
+                        uses_compact_limit_lines(card_layout.min_card_width),
+                    ) {
+                        weekly_hover = Some(hover);
+                    };
                     frame.render_widget(
                         card(
                             &today_title,
@@ -3534,16 +3533,14 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                             Constraint::Percentage(33),
                         ])
                         .split(row1);
-                    frame.render_widget(
-                        card4(
-                            "LIMITS",
-                            &limits_value,
-                            limits_caption1.as_deref(),
-                            limits_caption2.as_deref(),
-                            limits_caption3.as_deref(),
-                        ),
+                    if let Some(hover) = render_limits_card(
+                        frame,
                         top[0],
-                    );
+                        state,
+                        uses_compact_limit_lines(card_layout.min_card_width),
+                    ) {
+                        weekly_hover = Some(hover);
+                    };
                     let runs7 = last7_runs_caption.as_deref();
                     frame.render_widget(
                         card(
@@ -3673,16 +3670,14 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                             Constraint::Percentage(16),
                         ])
                         .split(row1);
-                    frame.render_widget(
-                        card4(
-                            "LIMITS",
-                            &limits_value,
-                            limits_caption1.as_deref(),
-                            limits_caption2.as_deref(),
-                            limits_caption3.as_deref(),
-                        ),
+                    if let Some(hover) = render_limits_card(
+                        frame,
                         cards[0],
-                    );
+                        state,
+                        uses_compact_limit_lines(card_layout.min_card_width),
+                    ) {
+                        weekly_hover = Some(hover);
+                    };
                     frame.render_widget(
                         card(
                             &today_title,
@@ -3721,16 +3716,14 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                             Constraint::Percentage(33),
                         ])
                         .split(row1);
-                    frame.render_widget(
-                        card4(
-                            "LIMITS",
-                            &limits_value,
-                            limits_caption1.as_deref(),
-                            limits_caption2.as_deref(),
-                            limits_caption3.as_deref(),
-                        ),
+                    if let Some(hover) = render_limits_card(
+                        frame,
                         top[0],
-                    );
+                        state,
+                        uses_compact_limit_lines(card_layout.min_card_width),
+                    ) {
+                        weekly_hover = Some(hover);
+                    };
                     frame.render_widget(
                         card(
                             &today_title,
@@ -3774,6 +3767,7 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             }
         }
     }
+    weekly_hover
 }
 
 fn aggregate_usage_days(days: &[UsageDay], grouping: ChartRange) -> Vec<UsageDay> {
@@ -4492,37 +4486,68 @@ fn format_vertical_bar_tooltip(
 }
 
 fn render_chart_tooltip(frame: &mut Frame<'_>, bounds: Rect, mouse: (u16, u16), text: &str) {
-    let Some(area) = chart_tooltip_rect(
-        bounds,
-        mouse,
-        UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16,
-    ) else {
+    render_hover_tooltip(frame, bounds, mouse, text);
+}
+
+fn render_hover_tooltip(frame: &mut Frame<'_>, bounds: Rect, mouse: (u16, u16), text: &str) {
+    let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+    if lines.is_empty() {
+        return;
+    }
+    let content_width = lines
+        .iter()
+        .map(|line| UnicodeWidthStr::width(*line))
+        .max()
+        .unwrap_or(0)
+        .min(u16::MAX as usize) as u16;
+    let content_height = lines.len().min(u16::MAX as usize) as u16;
+    let Some(area) = hover_tooltip_rect(bounds, mouse, content_width, content_height) else {
         return;
     };
-    let text = truncate_middle(text, area.width.saturating_sub(2) as usize);
+    let inner_width = area.width.saturating_sub(2).max(1) as usize;
+    let styled_lines: Vec<Line<'static>> = lines
+        .into_iter()
+        .map(|line| {
+            Line::from(Span::styled(
+                truncate_middle(line, inner_width),
+                Style::default().add_modifier(Modifier::BOLD),
+            ))
+        })
+        .collect();
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::White))
         .style(Style::default().bg(Color::Black));
+    let alignment = if content_height <= 1 {
+        Alignment::Center
+    } else {
+        Alignment::Left
+    };
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            text,
-            Style::default().add_modifier(Modifier::BOLD),
-        )))
-        .alignment(Alignment::Center)
-        .block(block),
+        Paragraph::new(Text::from(styled_lines))
+            .alignment(alignment)
+            .block(block),
         area,
     );
 }
 
 fn chart_tooltip_rect(bounds: Rect, mouse: (u16, u16), content_width: u16) -> Option<Rect> {
+    hover_tooltip_rect(bounds, mouse, content_width, 1)
+}
+
+fn hover_tooltip_rect(
+    bounds: Rect,
+    mouse: (u16, u16),
+    content_width: u16,
+    content_height: u16,
+) -> Option<Rect> {
     if bounds.width < 3 || bounds.height < 3 {
         return None;
     }
     let width = content_width.saturating_add(2).clamp(3, bounds.width);
-    let height = 3;
+    let height = content_height.saturating_add(2).clamp(3, bounds.height);
     let right = bounds.x.saturating_add(bounds.width);
     let bottom = bounds.y.saturating_add(bounds.height);
     let max_x = right.saturating_sub(width);
@@ -5157,16 +5182,6 @@ fn today_card_title(formatter: DisplayFormatter<'_>, now: NaiveDateTime) -> Stri
     )
 }
 
-fn card4(
-    title: &str,
-    value: &str,
-    caption1: Option<&str>,
-    caption2: Option<&str>,
-    caption3: Option<&str>,
-) -> Paragraph<'static> {
-    card_with_captions(title, value, &[caption1, caption2, caption3])
-}
-
 fn card_with_captions(title: &str, value: &str, captions: &[Option<&str>]) -> Paragraph<'static> {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -5634,6 +5649,427 @@ fn rolling_windows_for_limits(
         .find(|bucket| bucket.primary.is_some() || bucket.secondary.is_some())
         .map(|bucket| classify_rolling_windows(bucket.primary.as_ref(), bucket.secondary.as_ref()))
         .unwrap_or((None, None))
+}
+
+/// How full the unlocked N-day share of the weekly window is.
+///
+/// Pace uses API `used_percent` (not the displayed percent-left). Allowed share is
+/// continuous: `elapsed/window * 100` from `resetsAt` + `windowDurationMins`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WeeklyPaceBand {
+    /// fill < 50% of unlocked allowance
+    Normal,
+    /// fill >= 50%
+    Yellow,
+    /// fill >= 70%
+    Orange,
+    /// fill >= 90%
+    Red,
+}
+
+fn now_unix_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| {
+            let secs = duration.as_secs();
+            if secs > i64::MAX as u64 {
+                i64::MAX
+            } else {
+                secs as i64
+            }
+        })
+        .unwrap_or(0)
+}
+
+/// Unlocked fair-share percent of the weekly window at `now_unix_secs`.
+/// Returns `None` when the window cannot be placed on a timeline.
+fn weekly_unlocked_allowed_percent(
+    window: &crate::codex_rpc::RateLimitWindow,
+    now_unix_secs: i64,
+) -> Option<f64> {
+    let window_mins = window
+        .window_duration_mins
+        .filter(|value| value.is_finite() && *value > 0.0)?;
+    let resets_at = window.resets_at?;
+    let reset_ms = crate::codex_rpc::normalize_epoch_millis(resets_at);
+    let reset_secs = reset_ms.div_euclid(1000);
+    let remaining_secs = reset_secs.saturating_sub(now_unix_secs).max(0);
+    let remaining_mins = (remaining_secs as f64) / 60.0;
+    let elapsed_mins = (window_mins - remaining_mins).clamp(0.0, window_mins);
+    Some((elapsed_mins / window_mins) * 100.0)
+}
+
+/// Map weekly window + clock to a display band.
+///
+/// `fill% = used% / allowed% * 100` where `allowed%` is the unlocked N-day share.
+/// Soft-floors tiny `allowed` so early-window math stays stable.
+fn weekly_pace_band(
+    window: &crate::codex_rpc::RateLimitWindow,
+    now_unix_secs: i64,
+) -> WeeklyPaceBand {
+    let Some(used) = window.used_percent.filter(|value| value.is_finite()) else {
+        return WeeklyPaceBand::Normal;
+    };
+    let used = used.clamp(0.0, 100.0);
+    let Some(mut allowed) = weekly_unlocked_allowed_percent(window, now_unix_secs) else {
+        return WeeklyPaceBand::Normal;
+    };
+    if !allowed.is_finite() {
+        return WeeklyPaceBand::Normal;
+    }
+    // Avoid divide-by-near-zero right after a reset; 0.5% floor ~ first ~50 minutes of a 7d window.
+    if allowed < 0.5 {
+        allowed = 0.5;
+    }
+    let fill = (used / allowed) * 100.0;
+    if fill >= 90.0 {
+        WeeklyPaceBand::Red
+    } else if fill >= 70.0 {
+        WeeklyPaceBand::Orange
+    } else if fill >= 50.0 {
+        WeeklyPaceBand::Yellow
+    } else {
+        WeeklyPaceBand::Normal
+    }
+}
+
+/// Split `Weekly:   89% (resets...)` / `7d: 89% | ...` into label word, mid, percent, suffix.
+fn split_weekly_limit_line_parts(plain: &str) -> (String, String, String, String) {
+    let Some(percent_end) = plain.find('%').map(|index| index + 1) else {
+        return (plain.to_string(), String::new(), String::new(), String::new());
+    };
+    let bytes = plain.as_bytes();
+    let mut percent_start = percent_end.saturating_sub(1);
+    while percent_start > 0 && bytes[percent_start - 1].is_ascii_digit() {
+        percent_start -= 1;
+    }
+    let prefix = &plain[..percent_start];
+    let percent = &plain[percent_start..percent_end];
+    let suffix = &plain[percent_end..];
+
+    let (label, mid) = if let Some(rest) = prefix.strip_prefix("Weekly") {
+        ("Weekly", rest)
+    } else if let Some(rest) = prefix.strip_prefix("7d") {
+        ("7d", rest)
+    } else {
+        return (
+            prefix.to_string(),
+            String::new(),
+            percent.to_string(),
+            suffix.to_string(),
+        );
+    };
+    (
+        label.to_string(),
+        mid.to_string(),
+        percent.to_string(),
+        suffix.to_string(),
+    )
+}
+
+fn style_weekly_limit_line(plain: &str, band: WeeklyPaceBand, emphasize: bool) -> Line<'static> {
+    let (label, mid, percent, suffix) = split_weekly_limit_line_parts(plain);
+    let gray = Style::default().fg(Color::Gray);
+    let mut spans = Vec::with_capacity(4);
+
+    match band {
+        WeeklyPaceBand::Normal => {
+            let mut body = Style::default().fg(Color::White);
+            if emphasize {
+                body = body.add_modifier(Modifier::BOLD);
+            }
+            let head = format!("{label}{mid}{percent}");
+            spans.push(Span::styled(head, body));
+            if !suffix.is_empty() {
+                spans.push(Span::styled(suffix, gray));
+            }
+        }
+        WeeklyPaceBand::Yellow => {
+            let body = Style::default().fg(Color::Yellow);
+            spans.push(Span::styled(format!("{label}{mid}{percent}"), body));
+            if !suffix.is_empty() {
+                spans.push(Span::styled(suffix, gray));
+            }
+        }
+        WeeklyPaceBand::Orange => {
+            spans.push(Span::styled(
+                label,
+                Style::default()
+                    .fg(Color::White)
+                    .bg(WEEKLY_PACE_ORANGE_BG),
+            ));
+            if !mid.is_empty() {
+                spans.push(Span::styled(mid, Style::default().fg(WEEKLY_PACE_ORANGE)));
+            }
+            if !percent.is_empty() {
+                spans.push(Span::styled(
+                    percent,
+                    Style::default().fg(WEEKLY_PACE_ORANGE),
+                ));
+            }
+            if !suffix.is_empty() {
+                spans.push(Span::styled(suffix, gray));
+            }
+        }
+        WeeklyPaceBand::Red => {
+            // Red background covers label + percent only (`Weekly: ##%` / `7d: ##%`).
+            spans.push(Span::styled(
+                format!("{label}{mid}{percent}"),
+                Style::default().fg(Color::White).bg(Color::Red),
+            ));
+            if !suffix.is_empty() {
+                spans.push(Span::styled(suffix, gray));
+            }
+        }
+    }
+
+    Line::from(spans)
+}
+
+fn limits_line_for_slot(
+    text: &str,
+    weekly_plain: Option<&str>,
+    band: WeeklyPaceBand,
+    is_value: bool,
+) -> Line<'static> {
+    if weekly_plain == Some(text) {
+        return style_weekly_limit_line(text, band, is_value);
+    }
+    if is_value {
+        Line::from(Span::styled(
+            text.to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Line::from(Span::styled(
+            text.to_string(),
+            Style::default().fg(Color::Gray),
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WeeklyPaceHover {
+    mouse: (u16, u16),
+    text: String,
+}
+
+/// Card chrome for LIMITS matches `card_with_captions` (border 1 + pad top 1 / left 2).
+const LIMITS_CARD_CONTENT_TOP: u16 = 2;
+const LIMITS_CARD_CONTENT_LEFT: u16 = 3;
+const LIMITS_CARD_CONTENT_RIGHT_PAD: u16 = 2;
+
+fn weekly_line_hit_rect(card_area: Rect, line_index: usize) -> Option<Rect> {
+    if card_area.width < 6 || card_area.height < 4 {
+        return None;
+    }
+    let y = card_area
+        .y
+        .saturating_add(LIMITS_CARD_CONTENT_TOP)
+        .saturating_add(line_index as u16);
+    let bottom = card_area.y.saturating_add(card_area.height).saturating_sub(1);
+    if y >= bottom {
+        return None;
+    }
+    let x = card_area.x.saturating_add(LIMITS_CARD_CONTENT_LEFT);
+    let width = card_area
+        .width
+        .saturating_sub(LIMITS_CARD_CONTENT_LEFT)
+        .saturating_sub(LIMITS_CARD_CONTENT_RIGHT_PAD)
+        .max(1);
+    Some(Rect::new(x, y, width, 1))
+}
+
+fn rect_contains(area: Rect, point: (u16, u16)) -> bool {
+    point.0 >= area.x
+        && point.0 < area.x.saturating_add(area.width)
+        && point.1 >= area.y
+        && point.1 < area.y.saturating_add(area.height)
+}
+
+/// Human-friendly hover text for elevated weekly pace (yellow/orange/red).
+///
+/// Uses API `used_percent` and unlocked N-day share; not the displayed percent-left.
+fn format_weekly_pace_tooltip(
+    window: &crate::codex_rpc::RateLimitWindow,
+    band: WeeklyPaceBand,
+    now_unix_secs: i64,
+    formatter: DisplayFormatter<'_>,
+) -> Option<String> {
+    if matches!(band, WeeklyPaceBand::Normal) {
+        return None;
+    }
+    let used = window
+        .used_percent
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(0.0, 100.0))?;
+    let mut allowed = weekly_unlocked_allowed_percent(window, now_unix_secs)?;
+    if !allowed.is_finite() {
+        return None;
+    }
+    if allowed < 0.5 {
+        allowed = 0.5;
+    }
+    let pace_x = (used / allowed).clamp(0.0, 99.0);
+    let window_mins = window
+        .window_duration_mins
+        .filter(|value| value.is_finite() && *value > 0.0)?;
+    let day_mins = 24.0 * 60.0;
+    let window_days = (window_mins / day_mins).max(1.0);
+    let day_budget = 100.0 / window_days;
+    let days_used = if day_budget > 0.0 {
+        used / day_budget
+    } else {
+        0.0
+    };
+    let reset_ms = window
+        .resets_at
+        .map(crate::codex_rpc::normalize_epoch_millis);
+    let reset_secs = reset_ms.map(|ms| ms.div_euclid(1000));
+    let remaining_mins = reset_secs
+        .map(|reset| reset.saturating_sub(now_unix_secs).max(0) as f64 / 60.0)
+        .unwrap_or(0.0);
+    let elapsed_mins = (window_mins - remaining_mins).clamp(0.0, window_mins);
+    let days_elapsed = elapsed_mins / day_mins;
+    let reset_phrase = resets_label(window.resets_at, formatter)
+        .map(|label| format!(" ({label})"))
+        .unwrap_or_default();
+
+    let used_i = used.round() as i64;
+    let allowed_i = allowed.round() as i64;
+    let pace_label = format!("{:.1}x", pace_x);
+    let days_used_label = if days_used >= 10.0 {
+        format!("{:.0}", days_used)
+    } else {
+        format!("{:.1}", days_used)
+    };
+    let days_elapsed_label = if days_elapsed < 0.05 {
+        "just after reset".to_string()
+    } else if days_elapsed < 1.0 {
+        format!("{:.1} day", days_elapsed.max(0.1))
+    } else {
+        format!("{:.1} days", days_elapsed)
+    };
+
+    let text = match band {
+        WeeklyPaceBand::Normal => return None,
+        WeeklyPaceBand::Yellow => format!(
+            "Weekly pace is elevated.\nUsed {used_i}% vs ~{allowed_i}% unlocked for time so far (~{pace_label} fair pace)."
+        ),
+        WeeklyPaceBand::Orange => format!(
+            "You have used about {days_used_label} day-shares of the weekly limit in {days_elapsed_label} (~{pace_label} unlocked pace).\nThe weekly limit may run out before the reset{reset_phrase}."
+        ),
+        WeeklyPaceBand::Red => format!(
+            "You already used near {days_used_label}x a full day's share of the weekly limit (~{pace_label} unlocked pace).\nWeekly limits may finish faster than the reset day{reset_phrase}."
+        ),
+    };
+    Some(text)
+}
+
+fn limits_card_paragraph(
+    state: &AppState,
+    compact: bool,
+) -> (Paragraph<'static>, Option<usize>, Option<String>) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .padding(Padding {
+            left: 2,
+            right: 1,
+            top: 1,
+            bottom: 0,
+        })
+        .title(Span::styled(
+            " LIMITS ".to_string(),
+            Style::default().fg(Color::Gray),
+        ));
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut weekly_line_index: Option<usize> = None;
+    let mut tooltip: Option<String> = None;
+
+    if !state.limits_enabled {
+        let msg = state
+            .limits_error
+            .as_deref()
+            .or(state.limits_notice.as_deref())
+            .unwrap_or("Limits unavailable.");
+        lines.push(Line::from(Span::styled(
+            "Unavailable".to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            msg.to_string(),
+            Style::default().fg(Color::Gray),
+        )));
+    } else if let Some(limits) = state.limits.as_ref() {
+        let formatter = state.formatter();
+        let now = now_unix_secs();
+        let (value, caption1, caption2, caption3) =
+            format_limits_compact_card_lines(limits, compact, formatter);
+        let (_, weekly_window) = rolling_windows_for_limits(limits);
+        let weekly_label = if compact { "7d:" } else { "Weekly:" };
+        let weekly_plain = weekly_window.map(|window| {
+            format_limit_compact_line(weekly_label, Some(window), compact, formatter)
+        });
+        let band = weekly_window
+            .map(|window| weekly_pace_band(window, now))
+            .unwrap_or(WeeklyPaceBand::Normal);
+        if let Some(window) = weekly_window {
+            tooltip = format_weekly_pace_tooltip(window, band, now, formatter);
+        }
+
+        let mut push_line = |text: &str, is_value: bool| {
+            if weekly_plain.as_deref() == Some(text) {
+                weekly_line_index = Some(lines.len());
+            }
+            lines.push(limits_line_for_slot(
+                text,
+                weekly_plain.as_deref(),
+                band,
+                is_value,
+            ));
+        };
+
+        push_line(&value, true);
+        for caption in [caption1, caption2, caption3].into_iter().flatten() {
+            if caption.trim().is_empty() {
+                continue;
+            }
+            push_line(&caption, false);
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Loading...".to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.push(Line::from(""));
+
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: true });
+    (paragraph, weekly_line_index, tooltip)
+}
+
+fn render_limits_card(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &AppState,
+    compact: bool,
+) -> Option<WeeklyPaceHover> {
+    let (paragraph, weekly_line_index, tooltip) = limits_card_paragraph(state, compact);
+    frame.render_widget(paragraph, area);
+
+    let mouse = state.mouse_position?;
+    let line_index = weekly_line_index?;
+    let text = tooltip?;
+    let hit = weekly_line_hit_rect(area, line_index)?;
+    if !rect_contains(hit, mouse) {
+        return None;
+    }
+    Some(WeeklyPaceHover { mouse, text })
 }
 
 fn format_individual_limit_compact_lines(
@@ -6433,6 +6869,168 @@ mod tests {
             format_limits_compact_card_lines(&limits, true, formatter);
         assert_eq!(compact_value, "7d: 96%");
         assert_eq!(compact_caption1.as_deref(), Some("5h limit: --"));
+    }
+
+    fn weekly_window_at(
+        used_percent: f64,
+        now_unix_secs: i64,
+        elapsed_mins: f64,
+    ) -> crate::codex_rpc::RateLimitWindow {
+        const WINDOW_MINS: f64 = 10080.0;
+        let remaining_mins = (WINDOW_MINS - elapsed_mins).max(0.0);
+        let resets_at = now_unix_secs.saturating_add((remaining_mins * 60.0) as i64);
+        crate::codex_rpc::RateLimitWindow {
+            used_percent: Some(used_percent),
+            window_duration_mins: Some(WINDOW_MINS),
+            resets_at: Some(resets_at),
+        }
+    }
+
+    #[test]
+    fn weekly_pace_band_thresholds_use_unlocked_share() {
+        let now = 1_700_000_000_i64;
+        // After 1 day, allowed ~ 100/7 ~ 14.286%.
+        // used 6 -> fill ~ 42% -> Normal
+        // used 8 -> fill ~ 56% -> Yellow
+        // used 10 -> fill ~ 70% -> Orange
+        // used 13 -> fill ~ 91% -> Red
+        let day1 = 24.0 * 60.0;
+        assert_eq!(
+            weekly_pace_band(&weekly_window_at(6.0, now, day1), now),
+            WeeklyPaceBand::Normal
+        );
+        assert_eq!(
+            weekly_pace_band(&weekly_window_at(8.0, now, day1), now),
+            WeeklyPaceBand::Yellow
+        );
+        assert_eq!(
+            weekly_pace_band(&weekly_window_at(10.0, now, day1), now),
+            WeeklyPaceBand::Orange
+        );
+        assert_eq!(
+            weekly_pace_band(&weekly_window_at(13.0, now, day1), now),
+            WeeklyPaceBand::Red
+        );
+    }
+
+    #[test]
+    fn weekly_pace_band_eases_as_window_elapses_without_new_use() {
+        let now = 1_700_000_000_i64;
+        let used = 17.0;
+        // Day 1: allowed ~14.3%, fill ~119% -> Red
+        assert_eq!(
+            weekly_pace_band(&weekly_window_at(used, now, 24.0 * 60.0), now),
+            WeeklyPaceBand::Red
+        );
+        // Day 2: allowed ~28.6%, fill ~59.5% -> Yellow
+        assert_eq!(
+            weekly_pace_band(&weekly_window_at(used, now, 2.0 * 24.0 * 60.0), now),
+            WeeklyPaceBand::Yellow
+        );
+        // Day 3: allowed ~42.9%, fill ~39.7% -> Normal
+        assert_eq!(
+            weekly_pace_band(&weekly_window_at(used, now, 3.0 * 24.0 * 60.0), now),
+            WeeklyPaceBand::Normal
+        );
+    }
+
+    #[test]
+    fn weekly_pace_band_is_normal_without_resets_at_or_bad_used() {
+        let now = 1_700_000_000_i64;
+        let missing_reset = crate::codex_rpc::RateLimitWindow {
+            used_percent: Some(50.0),
+            window_duration_mins: Some(10080.0),
+            resets_at: None,
+        };
+        assert_eq!(
+            weekly_pace_band(&missing_reset, now),
+            WeeklyPaceBand::Normal
+        );
+
+        let bad_used = crate::codex_rpc::RateLimitWindow {
+            used_percent: Some(f64::NAN),
+            window_duration_mins: Some(10080.0),
+            resets_at: Some(now + 3_600),
+        };
+        assert_eq!(weekly_pace_band(&bad_used, now), WeeklyPaceBand::Normal);
+    }
+
+    #[test]
+    fn weekly_pace_tooltip_explains_orange_and_red_without_normal() {
+        let now = 1_700_000_000_i64;
+        let locale = crate::locale::SystemLocale::default();
+        let formatter = DisplayFormatter::new(DisplayStyle::Classic, &locale);
+
+        let normal = weekly_window_at(6.0, now, 24.0 * 60.0);
+        assert_eq!(weekly_pace_band(&normal, now), WeeklyPaceBand::Normal);
+        assert!(format_weekly_pace_tooltip(
+            &normal,
+            WeeklyPaceBand::Normal,
+            now,
+            formatter
+        )
+        .is_none());
+
+        let orange = weekly_window_at(10.0, now, 24.0 * 60.0);
+        assert_eq!(weekly_pace_band(&orange, now), WeeklyPaceBand::Orange);
+        let orange_text =
+            format_weekly_pace_tooltip(&orange, WeeklyPaceBand::Orange, now, formatter)
+                .expect("orange tooltip");
+        assert!(orange_text.contains("day-shares"));
+        assert!(orange_text.contains("may run out"));
+        assert!(orange_text.contains('\n'));
+
+        let red = weekly_window_at(17.0, now, 24.0 * 60.0);
+        assert_eq!(weekly_pace_band(&red, now), WeeklyPaceBand::Red);
+        let red_text =
+            format_weekly_pace_tooltip(&red, WeeklyPaceBand::Red, now, formatter).expect("red");
+        assert!(red_text.to_lowercase().contains("faster") || red_text.contains("day's share"));
+        assert!(red_text.contains('\n'));
+    }
+
+    #[test]
+    fn weekly_line_hit_rect_matches_card_chrome() {
+        let card = Rect::new(10, 20, 40, 10);
+        let hit = weekly_line_hit_rect(card, 1).expect("hit");
+        assert_eq!(hit.x, 13); // + left border + pad
+        assert_eq!(hit.y, 23); // + top border + pad + line 1
+        assert_eq!(hit.height, 1);
+        assert!(hit.width > 0);
+        assert!(rect_contains(hit, (13, 23)));
+        assert!(!rect_contains(hit, (13, 22)));
+    }
+
+    #[test]
+    fn style_weekly_limit_line_matches_band_colors() {
+        let plain = "Weekly:   83% (resets 12:14, 4 Aug)";
+        let yellow = style_weekly_limit_line(plain, WeeklyPaceBand::Yellow, false);
+        assert_eq!(yellow.spans.len(), 2);
+        assert_eq!(yellow.spans[0].style.fg, Some(Color::Yellow));
+        assert_eq!(yellow.spans[1].style.fg, Some(Color::Gray));
+
+        let orange = style_weekly_limit_line(plain, WeeklyPaceBand::Orange, false);
+        assert!(orange.spans.len() >= 3);
+        assert_eq!(orange.spans[0].content.as_ref(), "Weekly");
+        assert_eq!(orange.spans[0].style.bg, Some(WEEKLY_PACE_ORANGE_BG));
+        assert_eq!(orange.spans[0].style.fg, Some(Color::White));
+        let percent_span = orange
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref().ends_with('%'))
+            .expect("percent span");
+        assert_eq!(percent_span.style.fg, Some(WEEKLY_PACE_ORANGE));
+        assert_eq!(percent_span.style.bg, None);
+
+        let red = style_weekly_limit_line(plain, WeeklyPaceBand::Red, false);
+        assert_eq!(red.spans.len(), 2);
+        assert_eq!(red.spans[0].style.bg, Some(Color::Red));
+        assert_eq!(red.spans[0].style.fg, Some(Color::White));
+        assert!(red.spans[0].content.as_ref().contains("83%"));
+        assert_eq!(red.spans[1].style.fg, Some(Color::Gray));
+
+        let compact = style_weekly_limit_line("7d: 50% | 12:14", WeeklyPaceBand::Orange, false);
+        assert_eq!(compact.spans[0].content.as_ref(), "7d");
+        assert_eq!(compact.spans[0].style.bg, Some(WEEKLY_PACE_ORANGE_BG));
     }
 
     #[test]

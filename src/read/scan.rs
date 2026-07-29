@@ -1,5 +1,5 @@
 use crate::usage::{
-    normalize_project_key, project_identity_from_path, PROJECT_IDENTITY_LINE_LIMIT,
+    normalize_project_key, resolve_session_owner, SessionOwner, PROJECT_IDENTITY_LINE_LIMIT,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Utc};
@@ -12,6 +12,7 @@ use std::time::SystemTime;
 
 const MAX_TITLE_CHARS: usize = 96;
 const MAX_TURN_PREVIEW_CHARS: usize = 220;
+const UNRESOLVED_SESSION_OWNER: &str = "<unresolved session owner>";
 
 #[derive(Debug, Clone)]
 pub(crate) struct Catalog {
@@ -66,7 +67,6 @@ struct ProjectBuilder {
 struct SessionSummaryBuilder {
     file_path: PathBuf,
     session_id: Option<String>,
-    cwd: Option<String>,
     first_user_text: Option<String>,
     meaningful_title: Option<String>,
     started_at_raw: Option<String>,
@@ -269,6 +269,8 @@ fn collect_session_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 }
 
 fn scan_session_summary(path: &Path) -> Result<SessionSummary> {
+    let owner = resolve_session_owner(path).unwrap_or(None);
+    let resolved_session_id = owner.as_ref().and_then(|owner| owner.session_id.as_deref());
     let file = File::open(path).with_context(|| format!("Unable to open {}", path.display()))?;
     let mut reader = BufReader::new(file);
     let mut line = String::new();
@@ -296,38 +298,37 @@ fn scan_session_summary(path: &Path) -> Result<SessionSummary> {
 
         let entry_type = value.get("type").and_then(Value::as_str).unwrap_or("");
         match entry_type {
-            "session_meta" => extract_session_meta(&mut builder, &value),
+            "session_meta" => extract_session_meta(&mut builder, &value, resolved_session_id),
             "turn_context" => extract_turn_context(&mut builder, &value),
             "response_item" => extract_title_candidate(&mut builder, &value),
             _ => {}
         }
 
-        if lines_seen >= PROJECT_IDENTITY_LINE_LIMIT && builder.has_minimum_fields() {
+        if lines_seen >= PROJECT_IDENTITY_LINE_LIMIT {
             break;
         }
     }
 
-    builder.finish()
+    builder.finish(owner)
 }
 
-fn extract_session_meta(builder: &mut SessionSummaryBuilder, value: &Value) {
+fn extract_session_meta(
+    builder: &mut SessionSummaryBuilder,
+    value: &Value,
+    expected_session_id: Option<&str>,
+) {
     let payload = match value.get("payload").and_then(Value::as_object) {
         Some(payload) => payload,
         None => return,
     };
 
-    if builder.session_id.is_none() {
-        builder.session_id = payload
-            .get("id")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
+    let session_id = payload.get("id").and_then(Value::as_str);
+    if expected_session_id.is_some_and(|expected| session_id != Some(expected)) {
+        return;
     }
 
-    if builder.cwd.is_none() {
-        builder.cwd = payload
-            .get("cwd")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
+    if builder.session_id.is_none() {
+        builder.session_id = session_id.map(ToOwned::to_owned);
     }
 
     if builder.model_provider.is_none() {
@@ -375,13 +376,6 @@ fn extract_turn_context(builder: &mut SessionSummaryBuilder, value: &Value) {
         None => return,
     };
 
-    if builder.cwd.is_none() {
-        builder.cwd = payload
-            .get("cwd")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-    }
-
     if builder.model.is_none() {
         builder.model = payload
             .get("model")
@@ -416,17 +410,10 @@ fn extract_title_candidate(builder: &mut SessionSummaryBuilder, value: &Value) {
 }
 
 impl SessionSummaryBuilder {
-    fn has_minimum_fields(&self) -> bool {
-        self.cwd.is_some() && self.session_id.is_some()
-    }
-
-    fn finish(self) -> Result<SessionSummary> {
-        let fallback_cwd = self
-            .cwd
-            .as_deref()
-            .and_then(project_identity_from_path)
-            .or_else(|| self.cwd.clone())
-            .ok_or_else(|| anyhow::anyhow!("Missing cwd in {}", self.file_path.display()))?;
+    fn finish(self, owner: Option<SessionOwner>) -> Result<SessionSummary> {
+        let cwd = owner
+            .map(|owner| owner.cwd)
+            .unwrap_or_else(|| UNRESOLVED_SESSION_OWNER.to_string());
         let session_id = self
             .session_id
             .unwrap_or_else(|| self.file_path.display().to_string());
@@ -451,7 +438,7 @@ impl SessionSummaryBuilder {
         Ok(SessionSummary {
             file_path: self.file_path,
             session_id,
-            cwd: fallback_cwd,
+            cwd,
             title,
             started_at_raw,
             started_at_label,
@@ -609,8 +596,9 @@ mod tests {
         std::fs::write(path, body).expect("write session");
     }
 
+    #[cfg(not(windows))]
     #[test]
-    fn build_catalog_groups_projects_case_insensitively() {
+    fn build_catalog_keeps_case_distinct_linux_paths_separate() {
         let root = make_temp_dir("group");
         let sessions = root.join("sessions");
         std::fs::create_dir_all(sessions.join("2026/03/16")).expect("create tree");
@@ -632,13 +620,15 @@ mod tests {
         );
 
         let catalog = build_catalog(&sessions).expect("catalog");
-        assert_eq!(catalog.projects.len(), 1);
-        assert_eq!(catalog.projects[0].sessions.len(), 2);
-        assert_eq!(catalog.projects[0].sessions[0].title, "list prompts");
+        assert_eq!(catalog.projects.len(), 2);
+        assert_eq!(catalog.projects[0].display_path, "/mnt/e/GH/oiio-builder");
+        assert_eq!(catalog.projects[0].sessions.len(), 1);
         assert_eq!(
-            catalog.projects[0].sessions[1].title,
+            catalog.projects[0].sessions[0].title,
             "show me the session history"
         );
+        assert_eq!(catalog.projects[1].display_path, "/mnt/e/gh/oiio-builder");
+        assert_eq!(catalog.projects[1].sessions[0].title, "list prompts");
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -649,7 +639,7 @@ mod tests {
         let sessions = root.join("sessions");
         let external = root.join("nativefiledialog-extended");
         std::fs::create_dir_all(sessions.join("2026/06/23")).expect("create sessions");
-        std::fs::create_dir_all(external.join(".git")).expect("create external git marker");
+        std::fs::create_dir_all(&external).expect("create external dir");
         let session = sessions.join("2026/06/23/a.jsonl");
         write_session(
             &session,
@@ -715,6 +705,57 @@ mod tests {
         assert_eq!(catalog.projects.len(), 1);
         assert_eq!(catalog.projects[0].display_path, "/outside/Charter");
         assert_eq!(catalog.projects[0].sessions[0].file_path, session);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn build_catalog_recovers_late_meta_without_rehoming_to_settings() {
+        let root = make_temp_dir("late-owner-recovery");
+        let sessions = root.join("sessions/2026/07/29");
+        std::fs::create_dir_all(&sessions).expect("create sessions");
+        let session = sessions.join("late.jsonl");
+        let mut body = String::from(
+            r#"{"type":"turn_context","payload":{"cwd":"/outside/fallback"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"recover this session"}]}}
+"#,
+        );
+        for _ in 0..128 {
+            body.push_str("{\"type\":\"event_msg\",\"payload\":{\"type\":\"noop\"}}\n");
+        }
+        body.push_str(
+            r#"{"type":"session_meta","payload":{"id":"late","timestamp":"2026-07-29T08:00:00Z","cwd":"/outside/Charter"}}
+{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"cwd":"/outside/nativefiledialog-extended"}}}
+"#,
+        );
+        write_session(&session, &body);
+
+        let catalog = build_catalog(&root.join("sessions")).expect("catalog");
+        assert_eq!(catalog.files_scanned, 1);
+        assert_eq!(catalog.projects.len(), 1);
+        assert_eq!(catalog.projects[0].display_path, "/outside/Charter");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn build_catalog_keeps_sessions_with_no_owner_visible() {
+        let root = make_temp_dir("unresolved-owner");
+        let sessions = root.join("sessions/2026/07/29");
+        std::fs::create_dir_all(&sessions).expect("create sessions");
+        let session = sessions.join("unknown.jsonl");
+        write_session(
+            &session,
+            r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"cwd":"/outside/not-an-owner"}}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"orphaned session"}]}}
+"#,
+        );
+
+        let catalog = build_catalog(&root.join("sessions")).expect("catalog");
+        assert_eq!(catalog.files_scanned, 1);
+        assert_eq!(catalog.files_skipped, 0);
+        assert_eq!(catalog.projects.len(), 1);
+        assert_eq!(catalog.projects[0].display_path, UNRESOLVED_SESSION_OWNER);
 
         let _ = std::fs::remove_dir_all(root);
     }

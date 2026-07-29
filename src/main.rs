@@ -66,23 +66,21 @@ fn validate_dir(path: &std::path::Path, label: &str) -> Result<PathBuf> {
     Ok(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
 }
 
-fn detect_git_root(start: &std::path::Path) -> Option<PathBuf> {
-    // Heuristic: treat a directory as a "project" if it's inside a git work tree.
-    // Walk upwards looking for `.git` (directory or file for worktrees/submodules).
-    let mut cur = start;
-    for _ in 0..64 {
-        let git = cur.join(".git");
-        if std::fs::metadata(&git).is_ok() {
-            return Some(cur.to_path_buf());
-        }
-        cur = cur.parent()?;
-    }
-    None
-}
-
 fn resolve_workspace_filter(project_override: Option<&Path>) -> Option<PathBuf> {
+    // Codex-native path filter: sessions whose session cwd equals or is under this path.
+    // No filesystem .git discovery.
     let project_candidate = project_override?;
-    detect_git_root(project_candidate).map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+    Some(
+        std::fs::canonicalize(project_candidate).unwrap_or_else(|_| {
+            if project_candidate.is_absolute() {
+                project_candidate.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(project_candidate))
+                    .unwrap_or_else(|_| project_candidate.to_path_buf())
+            }
+        }),
+    )
 }
 
 fn resolve_comon_home(override_home: Option<PathBuf>) -> Option<PathBuf> {
@@ -196,7 +194,7 @@ struct Args {
     #[arg(long)]
     cwd: Option<PathBuf>,
 
-    /// Filter usage stats to a specific project/workspace path.
+    /// Filter usage stats to sessions whose working directory equals or is under this path.
     ///
     /// If `--cwd` is not provided, this also becomes the default working directory for
     /// launching Codex App Server.
@@ -406,44 +404,7 @@ mod tests {
     }
 
     fn test_temp_base_without_git_parent() -> PathBuf {
-        let mut candidates = vec![std::env::temp_dir()];
-        #[cfg(unix)]
-        {
-            candidates.push(PathBuf::from("/dev/shm"));
-            candidates.push(PathBuf::from("/var/tmp"));
-        }
-
-        for candidate in candidates {
-            if std::fs::metadata(&candidate)
-                .map(|meta| meta.is_dir())
-                .unwrap_or(false)
-                && detect_git_root(&candidate).is_none()
-                && directory_is_writable(&candidate)
-            {
-                return candidate;
-            }
-        }
-
         std::env::temp_dir()
-    }
-
-    fn directory_is_writable(path: &Path) -> bool {
-        let probe = path.join(format!(
-            ".comon-main-write-probe-{}",
-            TEMP_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        match std::fs::create_dir(&probe) {
-            Ok(()) => {
-                let _ = std::fs::remove_dir(&probe);
-                true
-            }
-            Err(_) => false,
-        }
-    }
-
-    fn make_git_repo(path: &Path) -> PathBuf {
-        std::fs::create_dir_all(path.join(".git")).expect("create .git directory");
-        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
     }
 
     #[test]
@@ -456,37 +417,37 @@ mod tests {
 
     #[test]
     fn resolve_workspace_filter_uses_all_workspaces_without_project_override() {
-        let root = make_temp_dir("launch-repo");
-        let repo = root.join("repo");
-        std::fs::create_dir_all(&repo).expect("create repo dir");
-        let _ = make_git_repo(&repo);
+        let root = make_temp_dir("launch-path");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace dir");
 
-        let workspace = resolve_workspace_filter(None);
-        assert!(workspace.is_none());
+        let filtered = resolve_workspace_filter(None);
+        assert!(filtered.is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn resolve_workspace_filter_uses_project_override_repo() {
-        let root = make_temp_dir("project-override-repo");
-        let repo = root.join("repo");
-        let nested = repo.join("nested");
-        std::fs::create_dir_all(&nested).expect("create nested repo dir");
-        let expected = make_git_repo(&repo);
+    fn resolve_workspace_filter_uses_project_path_as_filter() {
+        let root = make_temp_dir("project-override-path");
+        let workspace = root.join("workspace");
+        let nested = workspace.join("nested");
+        std::fs::create_dir_all(&nested).expect("create nested dir");
+        let expected = std::fs::canonicalize(&nested).unwrap_or_else(|_| nested.clone());
 
-        let workspace = resolve_workspace_filter(Some(nested.as_path()));
-        assert_eq!(workspace, Some(expected));
+        let filtered = resolve_workspace_filter(Some(nested.as_path()));
+        assert_eq!(filtered, Some(expected));
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn resolve_workspace_filter_uses_all_when_project_override_not_repo() {
-        let root = make_temp_dir("project-override-non-repo");
-        let non_repo = root.join("plain-dir");
-        std::fs::create_dir_all(&non_repo).expect("create non-repo dir");
+    fn resolve_workspace_filter_accepts_non_git_directory() {
+        let root = make_temp_dir("project-override-non-git");
+        let plain = root.join("plain-dir");
+        std::fs::create_dir_all(&plain).expect("create plain dir");
+        let expected = std::fs::canonicalize(&plain).unwrap_or_else(|_| plain.clone());
 
-        let workspace = resolve_workspace_filter(Some(non_repo.as_path()));
-        assert!(workspace.is_none());
+        let filtered = resolve_workspace_filter(Some(plain.as_path()));
+        assert_eq!(filtered, Some(expected));
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -31,9 +31,8 @@ By default, `comon` shows usage for **All workspaces** (regardless of current di
 
 Press `s` / `F2` at runtime to switch between the Usage and Session history screens.
 
-Use `--project <path>` (or `--workspace <path>`) to filter usage stats to a specific git repo.
-
-If `--project` points to a non-git directory, `comon` falls back to **All workspaces**.
+Use `--project <path>` (or `--workspace <path>`) to filter usage stats to sessions whose
+working directory equals or is under that path (Codex session `cwd`).
 
 `--cwd` controls where Codex App Server is launched and does not change usage scope.
 
@@ -60,7 +59,7 @@ Common flags:
 - `--app-server-bin <path>`: override a standalone Codex App Server executable (spawned directly)
 - `--live-limits <auto|on|off>`: `auto` tries App Server if found, `on` requires it, `off` disables live limits (default: `auto`)
 - `--cwd <path>`: directory to launch Codex App Server in (default: current directory; does not change usage scope)
-- `--project <path>` / `--workspace <path>`: filter usage stats to a specific project/workspace (also becomes default `--cwd` if `--cwd` not set)
+- `--project <path>` / `--workspace <path>`: filter usage stats by session working directory path (also becomes default `--cwd` if `--cwd` not set)
 - `--usage-days <n>`: summary/model-share window (clamped 1..=90; default from config); charts index the complete local history
 - `--refresh-usage-secs <n>`: usage refresh interval in seconds (default from config)
 - `--refresh-limits-secs <n>`: limits refresh interval in seconds (default from config)

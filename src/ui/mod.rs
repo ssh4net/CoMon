@@ -681,8 +681,7 @@ fn render_api_stat_cards(
             ])
             .split(area);
         let top = render_api_stat_card_row(frame, rows[0], &specs[..3], state, compact_limits);
-        let bottom =
-            render_api_stat_card_row(frame, rows[1], &specs[3..], state, compact_limits);
+        let bottom = render_api_stat_card_row(frame, rows[1], &specs[3..], state, compact_limits);
         top.or(bottom)
     }
 }
@@ -3131,7 +3130,11 @@ fn usage_cards_height(state: &AppState, width: u16) -> u16 {
     total
 }
 
-fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> Option<WeeklyPaceHover> {
+fn render_usage_cards(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &AppState,
+) -> Option<WeeklyPaceHover> {
     let mut weekly_hover: Option<WeeklyPaceHover> = None;
     let formatter = state.formatter();
     let today_now = match state.usage_zone {
@@ -3195,13 +3198,13 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> Op
                     ])
                     .split(row1);
                 if let Some(hover) = render_limits_card(
-                        frame,
-                        cards[0],
-                        state,
-                        uses_compact_limit_lines(card_layout.min_card_width),
-                    ) {
-                        weekly_hover = Some(hover);
-                    };
+                    frame,
+                    cards[0],
+                    state,
+                    uses_compact_limit_lines(card_layout.min_card_width),
+                ) {
+                    weekly_hover = Some(hover);
+                };
                 for (title, target) in [
                     (today_title.as_str(), cards[1]),
                     ("LAST_7_DAYS", cards[2]),
@@ -3221,13 +3224,13 @@ fn render_usage_cards(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> Op
                     ])
                     .split(row1);
                 if let Some(hover) = render_limits_card(
-                        frame,
-                        top[0],
-                        state,
-                        uses_compact_limit_lines(card_layout.min_card_width),
-                    ) {
-                        weekly_hover = Some(hover);
-                    };
+                    frame,
+                    top[0],
+                    state,
+                    uses_compact_limit_lines(card_layout.min_card_width),
+                ) {
+                    weekly_hover = Some(hover);
+                };
                 render_pending(frame, &today_title, top[1]);
                 render_pending(frame, "LAST_7_DAYS", top[2]);
             }
@@ -5763,7 +5766,12 @@ fn weekly_pace_band(
 /// Split `Weekly:   89% (resets...)` / `7d: 89% | ...` into label word, mid, percent, suffix.
 fn split_weekly_limit_line_parts(plain: &str) -> (String, String, String, String) {
     let Some(percent_end) = plain.find('%').map(|index| index + 1) else {
-        return (plain.to_string(), String::new(), String::new(), String::new());
+        return (
+            plain.to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+        );
     };
     let bytes = plain.as_bytes();
     let mut percent_start = percent_end.saturating_sub(1);
@@ -5821,9 +5829,7 @@ fn style_weekly_limit_line(plain: &str, band: WeeklyPaceBand, emphasize: bool) -
         WeeklyPaceBand::Orange => {
             spans.push(Span::styled(
                 label,
-                Style::default()
-                    .fg(Color::White)
-                    .bg(WEEKLY_PACE_ORANGE_BG),
+                Style::default().fg(Color::White).bg(WEEKLY_PACE_ORANGE_BG),
             ));
             if !mid.is_empty() {
                 spans.push(Span::styled(mid, Style::default().fg(WEEKLY_PACE_ORANGE)));
@@ -5894,7 +5900,10 @@ fn weekly_line_hit_rect(card_area: Rect, line_index: usize) -> Option<Rect> {
         .y
         .saturating_add(LIMITS_CARD_CONTENT_TOP)
         .saturating_add(line_index as u16);
-    let bottom = card_area.y.saturating_add(card_area.height).saturating_sub(1);
+    let bottom = card_area
+        .y
+        .saturating_add(card_area.height)
+        .saturating_sub(1);
     if y >= bottom {
         return None;
     }
@@ -6985,13 +6994,9 @@ mod tests {
 
         let (normal, now) = weekly_window_local_days(6.0, start, start, 15, 0);
         assert_eq!(weekly_pace_band(&normal, now), WeeklyPaceBand::Normal);
-        assert!(format_weekly_pace_tooltip(
-            &normal,
-            WeeklyPaceBand::Normal,
-            now,
-            formatter
-        )
-        .is_none());
+        assert!(
+            format_weekly_pace_tooltip(&normal, WeeklyPaceBand::Normal, now, formatter).is_none()
+        );
 
         let (orange, now) = weekly_window_local_days(10.0, start, start, 15, 0);
         assert_eq!(weekly_pace_band(&orange, now), WeeklyPaceBand::Orange);

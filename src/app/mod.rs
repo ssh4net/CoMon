@@ -8,7 +8,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Stdout;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -31,6 +31,11 @@ pub struct Config {
     pub usage_scan_limits: crate::usage::ScanLimits,
     pub rebuild_cache_on_start: bool,
     pub(crate) system_locale: SystemLocale,
+    pub(crate) history_project_roots: Vec<PathBuf>,
+    pub(crate) history_deep_depth: u8,
+    pub(crate) history_deep_max_depth: u8,
+    pub(crate) history_catalog_max_candidates: usize,
+    pub(crate) history_catalog_scan_budget_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,7 +96,16 @@ enum AppEvent {
     UsageUpdated(Result<LocalUsageSnapshot>),
     LimitsUpdated(Result<AccountRateLimits>),
     AccountUsageUpdated(Result<AccountUsage>),
-    AccountApiUnavailable { message: String, is_error: bool },
+    AccountApiUnavailable {
+        message: String,
+        is_error: bool,
+    },
+    HistoryCatalogProgress(crate::read::catalog::CatalogProgress),
+    HistoryCatalogUpdated {
+        strict: crate::read::scan::Catalog,
+        snapshot: crate::read::catalog::CatalogSnapshot,
+    },
+    HistoryCatalogFailed(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +121,10 @@ pub(crate) enum ActiveScreen {
 pub(crate) enum UiClickAction {
     SetScreen(ActiveScreen),
     SetDisplayStyle(DisplayStyle),
+    SetHistoryProjectMode(crate::read::catalog::ProjectViewMode),
+    DecreaseHistoryDepth,
+    IncreaseHistoryDepth,
+    HistoryDepthWheel,
     SetMetric(UsageMetric),
     SetRange(ChartRange),
     SetUsageZone(UsageZone),
@@ -263,11 +281,10 @@ pub(crate) struct AppState {
     pub(crate) account_usage_error: Option<String>,
     pub(crate) account_usage_notice: Option<String>,
     pub(crate) account_usage_enabled: bool,
-    pub(crate) read_sessions_dir: PathBuf,
     pub(crate) read_browser: crate::read::tui::BrowserState,
 }
 
-const STATE_STORE_SCHEMA_VERSION: u32 = 1;
+const STATE_STORE_SCHEMA_VERSION: u32 = 2;
 const STATE_STORE_FILE_NAME: &str = "state.json";
 const STATE_SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
 pub(crate) const DEFAULT_ACTIVITY_PROJECT_LIMIT: usize = 5;
@@ -294,6 +311,11 @@ struct PersistedUiState {
     no_sessions_confirm_dismissed: bool,
     display_style: DisplayStyle,
     skip_quit_confirmation: bool,
+    history_project_view_mode: crate::read::catalog::ProjectViewMode,
+    history_deep_depth: u8,
+    history_selected_projects: BTreeSet<String>,
+    history_explicitly_excluded_projects: BTreeSet<String>,
+    history_expanded_remote_groups: BTreeSet<String>,
 }
 
 impl PersistedUiState {
@@ -311,6 +333,11 @@ impl PersistedUiState {
             no_sessions_confirm_dismissed: false,
             display_style: DisplayStyle::Classic,
             skip_quit_confirmation: false,
+            history_project_view_mode: crate::read::catalog::ProjectViewMode::Strict,
+            history_deep_depth: crate::read::catalog::DEFAULT_DEEP_DEPTH,
+            history_selected_projects: BTreeSet::new(),
+            history_explicitly_excluded_projects: BTreeSet::new(),
+            history_expanded_remote_groups: BTreeSet::new(),
         }
     }
 
@@ -328,6 +355,14 @@ impl PersistedUiState {
             no_sessions_confirm_dismissed: state.no_sessions_confirm_dismissed,
             display_style: state.display_style,
             skip_quit_confirmation: state.skip_quit_confirmation,
+            history_project_view_mode: state.read_browser.project_mode(),
+            history_deep_depth: state.read_browser.deep_depth(),
+            history_selected_projects: state.read_browser.selected_projects().clone(),
+            history_explicitly_excluded_projects: state
+                .read_browser
+                .explicitly_excluded_projects()
+                .clone(),
+            history_expanded_remote_groups: state.read_browser.expanded_remote_groups().clone(),
         }
     }
 }
@@ -365,6 +400,14 @@ struct StoredGlobalState {
     #[serde(default)]
     skip_quit_confirmation: bool,
     last_workspace_path: Option<String>,
+    history_project_view_mode: Option<String>,
+    history_deep_depth: Option<u8>,
+    #[serde(default)]
+    history_selected_projects: Vec<String>,
+    #[serde(default)]
+    history_explicitly_excluded_projects: Vec<String>,
+    #[serde(default)]
+    history_expanded_remote_groups: Vec<String>,
     updated_at: i64,
 }
 
@@ -389,12 +432,18 @@ async fn run_inner(
     let (evt_tx, mut evt_rx) = mpsc::channel::<AppEvent>(64);
     let (usage_refresh_tx, usage_refresh_rx) = mpsc::channel::<()>(1);
     let (limits_refresh_tx, limits_refresh_rx) = mpsc::channel::<()>(1);
+    let (catalog_refresh_tx, catalog_refresh_rx) = mpsc::channel::<()>(1);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let restored_ui_state =
-        load_persisted_ui_state(&config.comon_home, config.workspace_path.as_deref())
-            .unwrap_or_else(|_| {
-                PersistedUiState::default_for_workspace(config.workspace_path.clone())
-            });
+    let restored_ui_state = load_persisted_ui_state_with_history_depth(
+        &config.comon_home,
+        config.workspace_path.as_deref(),
+        config.history_deep_depth,
+    )
+    .unwrap_or_else(|_| {
+        let mut defaults = PersistedUiState::default_for_workspace(config.workspace_path.clone());
+        defaults.history_deep_depth = config.history_deep_depth;
+        defaults
+    });
 
     let scan_cache_db_path = config.comon_home.join("comon.db");
     if config.rebuild_cache_on_start {
@@ -403,7 +452,143 @@ async fn run_inner(
     let read_config = read::Config {
         sessions_dir: config.read_sessions_dir.clone(),
     };
-    let read_browser = read::build_browser(&read_config)?;
+    let mut read_browser = read::build_browser(&read_config)?;
+    read_browser.restore_project_state(
+        restored_ui_state.history_project_view_mode,
+        restored_ui_state.history_deep_depth,
+        restored_ui_state.history_selected_projects.clone(),
+        restored_ui_state
+            .history_explicitly_excluded_projects
+            .clone(),
+        restored_ui_state.history_expanded_remote_groups.clone(),
+    );
+
+    // Spawn HISTORY project-catalog worker. STRICT remains available immediately;
+    // cached and freshly discovered projects arrive asynchronously.
+    {
+        let evt_tx = evt_tx.clone();
+        let sessions_dir = config.read_sessions_dir.clone();
+        let search_roots = config.history_project_roots.clone();
+        let excluded_roots = vec![
+            config.codex_home.join("sessions"),
+            config.comon_home.clone(),
+        ];
+        let max_depth = config
+            .history_deep_max_depth
+            .max(config.history_deep_depth)
+            .clamp(1, crate::read::catalog::MAX_DEEP_DEPTH);
+        let max_candidates = config.history_catalog_max_candidates;
+        let progress_interval_ms = config.history_catalog_scan_budget_ms;
+        let cache_db_path = scan_cache_db_path.clone();
+        let catalog_cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let cancelled = catalog_cancelled.clone();
+            let mut cancel_shutdown_rx = shutdown_rx.clone();
+            tokio::spawn(async move {
+                if !*cancel_shutdown_rx.borrow() {
+                    let _ = cancel_shutdown_rx.changed().await;
+                }
+                cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+        }
+        let mut catalog_refresh_rx = catalog_refresh_rx;
+        let mut shutdown_rx = shutdown_rx.clone();
+        let initial_strict = read_browser.strict_catalog_clone();
+        tokio::spawn(async move {
+            let initial_cache_path = cache_db_path.clone();
+            let initial_cache = tokio::task::spawn_blocking(move || {
+                crate::read::catalog::load_catalog_cache(&initial_cache_path)
+            })
+            .await;
+            if let Ok(Ok(Some(snapshot))) = initial_cache {
+                let _ = evt_tx
+                    .send(AppEvent::HistoryCatalogUpdated {
+                        strict: initial_strict,
+                        snapshot,
+                    })
+                    .await;
+            }
+            let scan_config = crate::read::catalog::CatalogScanConfig {
+                sessions_dir: sessions_dir.clone(),
+                search_roots,
+                excluded_roots,
+                max_depth,
+                max_candidates,
+                progress_interval_ms,
+                cache_db_path,
+                cancelled: catalog_cancelled,
+            };
+            let mut first_run = true;
+            let mut catch_up = false;
+            let mut reuse_cached_repositories = false;
+            loop {
+                if !first_run && !catch_up {
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => break,
+                        received = catalog_refresh_rx.recv() => {
+                            if received.is_none() { break; }
+                        }
+                    }
+                    reuse_cached_repositories = false;
+                }
+                first_run = false;
+                let progress_tx = evt_tx.clone();
+                let scan_config = scan_config.clone();
+                let scan_cancelled = scan_config.cancelled.clone();
+                let reuse_repositories = reuse_cached_repositories;
+                let result = tokio::task::spawn_blocking(move || {
+                    let strict = crate::read::scan::build_catalog(&scan_config.sessions_dir)?;
+                    let report_progress = |progress| {
+                        let _ =
+                            progress_tx.blocking_send(AppEvent::HistoryCatalogProgress(progress));
+                    };
+                    let snapshot = if reuse_repositories {
+                        crate::read::catalog::continue_project_catalog(
+                            &scan_config,
+                            &strict,
+                            report_progress,
+                        )?
+                    } else {
+                        crate::read::catalog::scan_project_catalog(
+                            &scan_config,
+                            &strict,
+                            report_progress,
+                        )?
+                    };
+                    Ok::<_, anyhow::Error>((strict, snapshot))
+                })
+                .await
+                .unwrap_or_else(|error| Err(anyhow!("project catalog task failed: {error}")));
+                match result {
+                    Ok((strict, snapshot)) => {
+                        catch_up = snapshot.sessions_scanned < snapshot.sessions_total;
+                        reuse_cached_repositories = catch_up;
+                        if evt_tx
+                            .send(AppEvent::HistoryCatalogUpdated { strict, snapshot })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        if scan_cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        catch_up = false;
+                        reuse_cached_repositories = false;
+                        if evt_tx
+                            .send(AppEvent::HistoryCatalogFailed(error.to_string()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // Spawn usage worker.
     {
@@ -674,7 +859,6 @@ async fn run_inner(
         account_usage_error: None,
         account_usage_notice: None,
         account_usage_enabled: true,
-        read_sessions_dir: config.read_sessions_dir.clone(),
         read_browser,
     };
 
@@ -698,6 +882,7 @@ async fn run_inner(
                         input,
                         &usage_refresh_tx,
                         &limits_refresh_tx,
+                        &catalog_refresh_tx,
                     )? {
                         InputOutcome::Continue(should_redraw) => {
                             dirty |= should_redraw;
@@ -796,6 +981,7 @@ fn handle_input_event(
     event: Event,
     usage_refresh_tx: &mpsc::Sender<()>,
     limits_refresh_tx: &mpsc::Sender<()>,
+    catalog_refresh_tx: &mpsc::Sender<()>,
 ) -> Result<InputOutcome> {
     if let Some(desired_skip_confirmation) = state.quit_preference_prompt {
         return match event {
@@ -908,6 +1094,15 @@ fn handle_input_event(
             _ => None,
         };
         if let Some(older) = wheel_direction {
+            if state.active_screen == ActiveScreen::Read
+                && ui_click_action_at(&state.ui_hit_targets, mouse.column, mouse.row)
+                    == Some(UiClickAction::HistoryDepthWheel)
+            {
+                let changed = state
+                    .read_browser
+                    .change_deep_depth(if older { 1 } else { -1 });
+                return Ok(InputOutcome::Continue(changed));
+            }
             let changed = match state.active_screen {
                 ActiveScreen::Usage
                     if state
@@ -998,10 +1193,7 @@ fn handle_input_event(
             (KeyCode::Char('r'), _) | (KeyCode::F(5), _)
                 if state.active_screen == ActiveScreen::Read =>
             {
-                let read_config = read::Config {
-                    sessions_dir: state.read_sessions_dir.clone(),
-                };
-                state.read_browser = read::build_browser(&read_config)?;
+                let _ = catalog_refresh_tx.try_send(());
                 return Ok(InputOutcome::Continue(true));
             }
             _ => {}
@@ -1101,6 +1293,10 @@ fn apply_ui_click_action(state: &mut AppState, action: UiClickAction) -> bool {
             state.display_style = style;
             changed
         }
+        UiClickAction::SetHistoryProjectMode(mode) => state.read_browser.set_project_mode(mode),
+        UiClickAction::DecreaseHistoryDepth => state.read_browser.change_deep_depth(-1),
+        UiClickAction::IncreaseHistoryDepth => state.read_browser.change_deep_depth(1),
+        UiClickAction::HistoryDepthWheel => false,
         UiClickAction::SetMetric(metric) => {
             let changed = state.metric != metric;
             state.metric = metric;
@@ -1701,6 +1897,18 @@ fn handle_app_event(state: &mut AppState, evt: AppEvent) -> bool {
             }
             true
         }
+        AppEvent::HistoryCatalogProgress(progress) => {
+            state.read_browser.set_catalog_progress(progress);
+            true
+        }
+        AppEvent::HistoryCatalogUpdated { strict, snapshot } => {
+            state.read_browser.apply_catalog_snapshot(strict, snapshot);
+            true
+        }
+        AppEvent::HistoryCatalogFailed(error) => {
+            state.read_browser.set_catalog_error(error);
+            true
+        }
     }
 }
 
@@ -1708,13 +1916,27 @@ fn missing_app_server_message() -> &'static str {
     "Codex App Server not found; usage/history still work. Install Codex CLI or pass --codex-bin/--app-server-bin."
 }
 
+#[cfg(test)]
 fn load_persisted_ui_state(
     comon_home: &Path,
     workspace_hint: Option<&Path>,
 ) -> Result<PersistedUiState> {
+    load_persisted_ui_state_with_history_depth(
+        comon_home,
+        workspace_hint,
+        crate::read::catalog::DEFAULT_DEEP_DEPTH,
+    )
+}
+
+fn load_persisted_ui_state_with_history_depth(
+    comon_home: &Path,
+    workspace_hint: Option<&Path>,
+    history_deep_depth: u8,
+) -> Result<PersistedUiState> {
     let store = load_or_bootstrap_state_store(comon_home)?;
     let mut state =
         PersistedUiState::default_for_workspace(workspace_hint.map(|path| path.to_path_buf()));
+    state.history_deep_depth = history_deep_depth.clamp(1, crate::read::catalog::MAX_DEEP_DEPTH);
 
     if let Some(metric_text) = store.global.metric.as_deref() {
         if let Some(metric) = usage_metric_from_store(metric_text) {
@@ -1761,6 +1983,32 @@ fn load_persisted_ui_state(
         }
     }
     state.skip_quit_confirmation = store.global.skip_quit_confirmation;
+    if let Some(mode_text) = store.global.history_project_view_mode.as_deref() {
+        if let Some(mode) = crate::read::catalog::ProjectViewMode::from_store(mode_text) {
+            state.history_project_view_mode = mode;
+        }
+    }
+    if let Some(depth) = store.global.history_deep_depth {
+        state.history_deep_depth = depth.clamp(1, crate::read::catalog::MAX_DEEP_DEPTH);
+    }
+    state.history_selected_projects = store
+        .global
+        .history_selected_projects
+        .iter()
+        .cloned()
+        .collect();
+    state.history_explicitly_excluded_projects = store
+        .global
+        .history_explicitly_excluded_projects
+        .iter()
+        .cloned()
+        .collect();
+    state.history_expanded_remote_groups = store
+        .global
+        .history_expanded_remote_groups
+        .iter()
+        .cloned()
+        .collect();
 
     if let Some(workspace_path) = state.workspace_path.as_ref() {
         let workspace_key = workspace_path.to_string_lossy();
@@ -1796,6 +2044,25 @@ fn save_persisted_ui_state(comon_home: &Path, state: &PersistedUiState) -> Resul
     );
     store.global.display_style = Some(state.display_style.store_value().to_string());
     store.global.skip_quit_confirmation = state.skip_quit_confirmation;
+    store.global.history_project_view_mode =
+        Some(state.history_project_view_mode.store_value().to_string());
+    store.global.history_deep_depth = Some(
+        state
+            .history_deep_depth
+            .clamp(1, crate::read::catalog::MAX_DEEP_DEPTH),
+    );
+    store.global.history_selected_projects =
+        state.history_selected_projects.iter().cloned().collect();
+    store.global.history_explicitly_excluded_projects = state
+        .history_explicitly_excluded_projects
+        .iter()
+        .cloned()
+        .collect();
+    store.global.history_expanded_remote_groups = state
+        .history_expanded_remote_groups
+        .iter()
+        .cloned()
+        .collect();
     store.global.last_workspace_path = workspace_path_text.clone();
     store.global.updated_at = now;
 
@@ -1822,13 +2089,15 @@ fn load_or_bootstrap_state_store(comon_home: &Path) -> Result<StateStore> {
         .with_context(|| format!("Unable to read state store {}", store_path.display()))?;
     let store = serde_json::from_slice::<StateStore>(&bytes)
         .with_context(|| format!("Unable to parse state store {}", store_path.display()))?;
-    if store.schema_version != STATE_STORE_SCHEMA_VERSION {
+    if store.schema_version > STATE_STORE_SCHEMA_VERSION {
         anyhow::bail!(
-            "Unsupported comon state schema version: {} (expected {})",
+            "Unsupported comon state schema version: {} (maximum {})",
             store.schema_version,
             STATE_STORE_SCHEMA_VERSION
         );
     }
+    let mut store = store;
+    store.schema_version = STATE_STORE_SCHEMA_VERSION;
     Ok(store)
 }
 
@@ -2182,6 +2451,60 @@ mod tests {
         save_persisted_ui_state(&comon_home, &state).expect("save persisted ui state");
         let loaded = load_persisted_ui_state(&comon_home, None).expect("load persisted ui state");
         assert!(loaded.skip_quit_confirmation);
+
+        let _ = std::fs::remove_dir_all(comon_home);
+    }
+
+    #[test]
+    fn history_project_controls_round_trip_through_state_store() {
+        let comon_home = make_temp_dir("history-project-controls");
+        let mut state = PersistedUiState::default_for_workspace(None);
+        state.history_project_view_mode = crate::read::catalog::ProjectViewMode::Custom;
+        state.history_deep_depth = 5;
+        state
+            .history_selected_projects
+            .insert("remote:example.com/team/project".to_string());
+        state
+            .history_explicitly_excluded_projects
+            .insert("path:/home/example/hidden".to_string());
+
+        save_persisted_ui_state(&comon_home, &state).expect("save persisted ui state");
+        let loaded = load_persisted_ui_state(&comon_home, None).expect("load persisted ui state");
+        assert_eq!(
+            loaded.history_project_view_mode,
+            crate::read::catalog::ProjectViewMode::Custom
+        );
+        assert_eq!(loaded.history_deep_depth, 5);
+        assert_eq!(
+            loaded.history_selected_projects,
+            state.history_selected_projects
+        );
+        assert_eq!(
+            loaded.history_explicitly_excluded_projects,
+            state.history_explicitly_excluded_projects
+        );
+
+        let _ = std::fs::remove_dir_all(comon_home);
+    }
+
+    #[test]
+    fn state_schema_one_migrates_by_applying_catalog_defaults() {
+        let comon_home = make_temp_dir("state-schema-one");
+        let mut store = StateStore {
+            schema_version: 1,
+            ..StateStore::default()
+        };
+        store.global.display_style = Some(DisplayStyle::SystemFull.store_value().to_string());
+        write_state_store(&comon_home, &store).expect("write legacy state");
+
+        let loaded = load_persisted_ui_state_with_history_depth(&comon_home, None, 4)
+            .expect("load legacy state");
+        assert_eq!(loaded.display_style, DisplayStyle::SystemFull);
+        assert_eq!(
+            loaded.history_project_view_mode,
+            crate::read::catalog::ProjectViewMode::Strict
+        );
+        assert_eq!(loaded.history_deep_depth, 4);
 
         let _ = std::fs::remove_dir_all(comon_home);
     }

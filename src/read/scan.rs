@@ -24,8 +24,15 @@ pub(crate) struct Catalog {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProjectRecord {
+    pub(crate) stable_id: String,
+    pub(crate) logical_name: String,
     pub(crate) display_path: String,
+    pub(crate) checkouts: Vec<String>,
     pub(crate) sessions: Vec<SessionSummary>,
+    pub(crate) owner_session_count: usize,
+    pub(crate) confidence: u8,
+    pub(crate) source_flags: u32,
+    pub(crate) missing: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -133,9 +140,24 @@ fn finish_project_builders(grouped: BTreeMap<String, ProjectBuilder>) -> Vec<Pro
             .first()
             .map(|session| session.cwd.clone())
             .unwrap_or_else(|| "<unknown>".to_string());
+        let stable_id = format!("path:{}", normalize_project_key(&display_path));
+        let logical_name = Path::new(&display_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&display_path)
+            .to_string();
+        let owner_session_count = builder.sessions.len();
         projects.push(ProjectRecord {
+            stable_id,
+            logical_name,
+            checkouts: vec![display_path.clone()],
             display_path,
             sessions: builder.sessions,
+            owner_session_count,
+            confidence: 100,
+            source_flags: crate::read::catalog::SOURCE_OWNER,
+            missing: false,
         });
     }
 
@@ -200,14 +222,13 @@ pub(crate) fn load_session_detail(path: &Path) -> Result<SessionDetail> {
                         "function_call_output" => {
                             detail.tool_outputs += 1;
                         }
-                        "reasoning" => {
+                        "reasoning"
                             if payload
                                 .get("encrypted_content")
                                 .and_then(Value::as_str)
-                                .is_some()
-                            {
-                                detail.reasoning_encrypted = true;
-                            }
+                                .is_some() =>
+                        {
+                            detail.reasoning_encrypted = true;
                         }
                         _ => {}
                     }

@@ -2750,37 +2750,122 @@ fn control_group_label(label: &'static str) -> Span<'static> {
 }
 
 fn render_history_style_controls(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
-    let area = crate::read::tui::history_style_controls_area(area);
-    if area.width == 0 {
+    let controls_area = crate::read::tui::history_style_controls_area(area);
+    if controls_area.width == 0 {
         return;
     }
-    let segments = [
-        ("  ", None),
-        (" STYLE ", None),
-        (
-            " CLASS ",
-            Some(UiClickAction::SetDisplayStyle(DisplayStyle::Classic)),
-        ),
-        (
-            " SCOMP ",
-            Some(UiClickAction::SetDisplayStyle(DisplayStyle::SystemCompact)),
-        ),
-        (
-            " SFULL ",
-            Some(UiClickAction::SetDisplayStyle(DisplayStyle::SystemFull)),
-        ),
-    ];
-    let spans = vec![
-        Span::raw("  "),
-        control_group_label("STYLE"),
-        pill("CLASS", state.display_style == DisplayStyle::Classic),
-        pill("SCOMP", state.display_style == DisplayStyle::SystemCompact),
-        pill("SFULL", state.display_style == DisplayStyle::SystemFull),
-    ];
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-    state
-        .ui_hit_targets
-        .extend(right_aligned_targets(area, &segments));
+    use crate::read::catalog::ProjectViewMode;
+    let mode = state.read_browser.project_mode();
+    if controls_area.width >= 68 {
+        let segments = [
+            (" PROJECTS ", None),
+            (
+                " STRICT ",
+                Some(UiClickAction::SetHistoryProjectMode(
+                    ProjectViewMode::Strict,
+                )),
+            ),
+            (
+                " DEEP  ",
+                Some(UiClickAction::SetHistoryProjectMode(ProjectViewMode::Deep)),
+            ),
+            (
+                " FULL ",
+                Some(UiClickAction::SetHistoryProjectMode(ProjectViewMode::Full)),
+            ),
+            (
+                " CUSTOM ",
+                Some(UiClickAction::SetHistoryProjectMode(
+                    ProjectViewMode::Custom,
+                )),
+            ),
+            (" ", None),
+            (" STYLE ", None),
+            (
+                " CLASS ",
+                Some(UiClickAction::SetDisplayStyle(DisplayStyle::Classic)),
+            ),
+            (
+                " SCOMP ",
+                Some(UiClickAction::SetDisplayStyle(DisplayStyle::SystemCompact)),
+            ),
+            (
+                " SFULL ",
+                Some(UiClickAction::SetDisplayStyle(DisplayStyle::SystemFull)),
+            ),
+        ];
+        let spans = vec![
+            control_group_label("PROJECTS"),
+            pill("STRICT", mode == ProjectViewMode::Strict),
+            pill("DEEP ", mode == ProjectViewMode::Deep),
+            pill("FULL", mode == ProjectViewMode::Full),
+            pill("CUSTOM", mode == ProjectViewMode::Custom),
+            Span::raw(" "),
+            control_group_label("STYLE"),
+            pill("CLASS", state.display_style == DisplayStyle::Classic),
+            pill("SCOMP", state.display_style == DisplayStyle::SystemCompact),
+            pill("SFULL", state.display_style == DisplayStyle::SystemFull),
+        ];
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).alignment(Alignment::Right),
+            controls_area,
+        );
+        state
+            .ui_hit_targets
+            .extend(right_aligned_targets(controls_area, &segments));
+
+        if mode == ProjectViewMode::Deep {
+            let depth_area = crate::read::tui::history_depth_controls_area(area);
+            let depth = format!(" {} ", state.read_browser.deep_depth());
+            let depth_segments = [
+                (" DEPTH ", Some(UiClickAction::HistoryDepthWheel)),
+                (" - ", Some(UiClickAction::DecreaseHistoryDepth)),
+                (depth.as_str(), Some(UiClickAction::HistoryDepthWheel)),
+                (" + ", Some(UiClickAction::IncreaseHistoryDepth)),
+            ];
+            let depth_spans = vec![
+                control_group_label("DEPTH"),
+                pill("-", false),
+                pill(&state.read_browser.deep_depth().to_string(), true),
+                pill("+", false),
+            ];
+            frame.render_widget(Paragraph::new(Line::from(depth_spans)), depth_area);
+            state
+                .ui_hit_targets
+                .extend(right_aligned_targets(depth_area, &depth_segments));
+        }
+    } else {
+        let segments = [
+            ("  ", None),
+            (" STYLE ", None),
+            (
+                " CLASS ",
+                Some(UiClickAction::SetDisplayStyle(DisplayStyle::Classic)),
+            ),
+            (
+                " SCOMP ",
+                Some(UiClickAction::SetDisplayStyle(DisplayStyle::SystemCompact)),
+            ),
+            (
+                " SFULL ",
+                Some(UiClickAction::SetDisplayStyle(DisplayStyle::SystemFull)),
+            ),
+        ];
+        let spans = vec![
+            Span::raw("  "),
+            control_group_label("STYLE"),
+            pill("CLASS", state.display_style == DisplayStyle::Classic),
+            pill("SCOMP", state.display_style == DisplayStyle::SystemCompact),
+            pill("SFULL", state.display_style == DisplayStyle::SystemFull),
+        ];
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).alignment(Alignment::Right),
+            controls_area,
+        );
+        state
+            .ui_hit_targets
+            .extend(right_aligned_targets(controls_area, &segments));
+    }
 }
 
 #[derive(Debug)]
@@ -5387,7 +5472,7 @@ fn render_limit_reset_details(frame: &mut Frame<'_>, area: Rect, state: &AppStat
                         Style::default().fg(Color::Gray),
                     )),
                 ]),
-                Some(credits) if credits.is_empty() => Text::from(Line::from(Span::styled(
+                Some([]) => Text::from(Line::from(Span::styled(
                     "No reset credits are currently available.",
                     Style::default().fg(Color::Gray),
                 ))),

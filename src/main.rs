@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::path::PathBuf;
 
-const USER_CONFIG_SCHEMA_VERSION: u32 = 1;
+const USER_CONFIG_SCHEMA_VERSION: u32 = 2;
 const USER_CONFIG_FILE_NAME: &str = "config.json";
 const DEFAULT_USAGE_DAYS: u32 = 30;
 const DEFAULT_REFRESH_USAGE_SECS: u64 = 300;
@@ -22,6 +22,8 @@ const DEFAULT_MAX_SESSION_TOTAL_MIB: u64 = 256;
 const DEFAULT_MAX_SESSION_FILES: usize = 10_000;
 const DEFAULT_MAX_JSONL_LINE_KIB: u64 = 512;
 const DEFAULT_SCAN_TIME_BUDGET_MS: u64 = 1500;
+const DEFAULT_HISTORY_CATALOG_MAX_CANDIDATES: usize = 10_000;
+const DEFAULT_HISTORY_CATALOG_SCAN_BUDGET_MS: u64 = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -37,6 +39,11 @@ struct UserConfig {
     scan_time_budget_ms: u64,
     full_scan: bool,
     scan_cache_max_entries: usize,
+    history_project_roots: Vec<PathBuf>,
+    history_deep_depth: u8,
+    history_deep_max_depth: u8,
+    history_catalog_max_candidates: usize,
+    history_catalog_scan_budget_ms: u64,
 }
 
 impl Default for UserConfig {
@@ -53,8 +60,21 @@ impl Default for UserConfig {
             scan_time_budget_ms: DEFAULT_SCAN_TIME_BUDGET_MS,
             full_scan: false,
             scan_cache_max_entries: usage::DEFAULT_SCAN_CACHE_MAX_ENTRIES,
+            history_project_roots: default_history_project_roots(),
+            history_deep_depth: read::catalog::DEFAULT_DEEP_DEPTH,
+            history_deep_max_depth: read::catalog::MAX_DEEP_DEPTH,
+            history_catalog_max_candidates: DEFAULT_HISTORY_CATALOG_MAX_CANDIDATES,
+            history_catalog_scan_budget_ms: DEFAULT_HISTORY_CATALOG_SCAN_BUDGET_MS,
         }
     }
+}
+
+fn default_history_project_roots() -> Vec<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .into_iter()
+        .collect()
 }
 
 fn validate_dir(path: &std::path::Path, label: &str) -> Result<PathBuf> {
@@ -122,14 +142,20 @@ fn load_or_bootstrap_user_config(comon_home: &Path) -> Result<UserConfig> {
     crate::storage::enforce_private_file_if_exists(&path)?;
     let bytes = std::fs::read(&path)
         .with_context(|| format!("Unable to read user config {}", path.display()))?;
-    let config = serde_json::from_slice::<UserConfig>(&bytes)
+    let mut config = serde_json::from_slice::<UserConfig>(&bytes)
         .with_context(|| format!("Unable to parse user config {}", path.display()))?;
-    if config.schema_version != USER_CONFIG_SCHEMA_VERSION {
+    if config.schema_version > USER_CONFIG_SCHEMA_VERSION {
         anyhow::bail!(
-            "Unsupported comon config schema version: {} (expected {})",
+            "Unsupported comon config schema version: {} (maximum {})",
             config.schema_version,
             USER_CONFIG_SCHEMA_VERSION
         );
+    }
+    if config.schema_version < USER_CONFIG_SCHEMA_VERSION {
+        config.schema_version = USER_CONFIG_SCHEMA_VERSION;
+        let encoded = serde_json::to_vec_pretty(&config)
+            .with_context(|| format!("Unable to migrate user config {}", path.display()))?;
+        crate::storage::write_private_file(&path, &encoded)?;
     }
     Ok(config)
 }
@@ -374,6 +400,18 @@ async fn main() -> Result<()> {
         usage_scan_limits,
         rebuild_cache_on_start: args.rebuild_cache_on_start,
         system_locale,
+        history_project_roots: user_config.history_project_roots,
+        history_deep_depth: user_config.history_deep_depth.clamp(
+            1,
+            user_config
+                .history_deep_max_depth
+                .clamp(1, read::catalog::MAX_DEEP_DEPTH),
+        ),
+        history_deep_max_depth: user_config
+            .history_deep_max_depth
+            .clamp(1, read::catalog::MAX_DEEP_DEPTH),
+        history_catalog_max_candidates: user_config.history_catalog_max_candidates.max(1),
+        history_catalog_scan_budget_ms: user_config.history_catalog_scan_budget_ms.max(25),
     };
 
     app::run(config).await
@@ -449,5 +487,37 @@ mod tests {
         let filtered = resolve_workspace_filter(Some(plain.as_path()));
         assert_eq!(filtered, Some(expected));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn user_config_schema_one_migrates_without_losing_scan_settings() {
+        let comon_home = make_temp_dir("config-migration");
+        let path = comon_home.join(USER_CONFIG_FILE_NAME);
+        let legacy = serde_json::json!({
+            "schema_version": 1,
+            "usage_days": 45,
+            "refresh_usage_secs": 600
+        });
+        crate::storage::write_private_file(
+            &path,
+            &serde_json::to_vec_pretty(&legacy).expect("encode legacy config"),
+        )
+        .expect("write legacy config");
+
+        let migrated = load_or_bootstrap_user_config(&comon_home).expect("migrate config");
+        assert_eq!(migrated.schema_version, USER_CONFIG_SCHEMA_VERSION);
+        assert_eq!(migrated.usage_days, 45);
+        assert_eq!(migrated.refresh_usage_secs, 600);
+        assert_eq!(
+            migrated.history_deep_depth,
+            read::catalog::DEFAULT_DEEP_DEPTH
+        );
+        assert!(!migrated.history_project_roots.is_empty());
+
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read migrated config"))
+                .expect("parse migrated config");
+        assert_eq!(persisted["schema_version"], USER_CONFIG_SCHEMA_VERSION);
+        let _ = std::fs::remove_dir_all(comon_home);
     }
 }

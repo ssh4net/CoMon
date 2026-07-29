@@ -1,4 +1,5 @@
-mod scan;
+pub(crate) mod catalog;
+pub(crate) mod scan;
 pub(crate) mod tui;
 
 use anyhow::{Context, Result};

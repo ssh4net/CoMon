@@ -4536,6 +4536,7 @@ fn render_hover_tooltip(frame: &mut Frame<'_>, bounds: Rect, mouse: (u16, u16), 
     );
 }
 
+#[cfg(test)]
 fn chart_tooltip_rect(bounds: Rect, mouse: (u16, u16), content_width: u16) -> Option<Rect> {
     hover_tooltip_rect(bounds, mouse, content_width, 1)
 }

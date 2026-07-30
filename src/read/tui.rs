@@ -69,7 +69,8 @@ pub(crate) struct BrowserState {
 }
 
 impl BrowserState {
-    pub(crate) fn new(catalog: Catalog) -> Self {
+    pub(crate) fn new(mut catalog: Catalog) -> Self {
+        sort_catalog_by_display_path(&mut catalog);
         let mut project_state = ListState::default();
         project_state.select(if catalog.projects.is_empty() {
             None
@@ -196,10 +197,11 @@ impl BrowserState {
 
     fn apply_catalog_snapshot_with_source(
         &mut self,
-        strict: Catalog,
+        mut strict: Catalog,
         snapshot: CatalogSnapshot,
         from_cache: bool,
     ) {
+        sort_catalog_by_display_path(&mut strict);
         self.strict_catalog = strict;
         self.discovery = Some(snapshot);
         self.catalog_from_cache = from_cache;
@@ -354,6 +356,14 @@ struct LogicalProjectBuilder {
     confidence: u8,
     source_flags: u32,
     missing: bool,
+}
+
+fn sort_catalog_by_display_path(catalog: &mut Catalog) {
+    catalog.projects.sort_by(|left, right| {
+        left.display_path
+            .cmp(&right.display_path)
+            .then_with(|| left.stable_id.cmp(&right.stable_id))
+    });
 }
 
 fn build_discovery_catalog(
@@ -928,6 +938,7 @@ fn render_projects_view(
         .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
         .split(area);
 
+    let project_label_width = usize::from(columns[0].width.saturating_sub(5));
     let items = state
         .catalog
         .projects
@@ -954,9 +965,10 @@ fn render_projects_view(
             } else {
                 ""
             };
+            let label = project_list_label(project, state.project_mode, project_label_width);
             ListItem::new(Line::from(format!(
                 "{checkbox}{}{checkout_count}{marker}",
-                project.logical_name
+                label
             )))
         })
         .collect::<Vec<_>>();
@@ -994,6 +1006,45 @@ fn render_projects_view(
         project_list_area: columns[0],
         session_list_area: Rect::default(),
     }
+}
+
+fn project_list_label(project: &ProjectRecord, mode: ProjectViewMode, max_width: usize) -> String {
+    match mode {
+        ProjectViewMode::Strict => truncate_path_from_left(&project.display_path, max_width),
+        ProjectViewMode::Deep | ProjectViewMode::Full | ProjectViewMode::Custom => {
+            project.logical_name.clone()
+        }
+    }
+}
+
+fn truncate_path_from_left(path: &str, max_width: usize) -> String {
+    let path_width = UnicodeWidthStr::width(path);
+    if path_width <= max_width {
+        return path.to_string();
+    }
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+
+    let suffix_width = max_width.saturating_sub(3);
+    let mut suffix_start = path.len();
+    let mut used_width = 0usize;
+    for (index, character) in path.char_indices().rev() {
+        let character_width = UnicodeWidthStr::width(character.encode_utf8(&mut [0; 4]));
+        if used_width.saturating_add(character_width) > suffix_width {
+            break;
+        }
+        suffix_start = index;
+        used_width = used_width.saturating_add(character_width);
+    }
+
+    let suffix = &path[suffix_start..];
+    let component_start = suffix
+        .char_indices()
+        .find(|(_, character)| matches!(character, '/' | '\\'))
+        .map(|(index, _)| suffix_start.saturating_add(index))
+        .unwrap_or(suffix_start);
+    format!("...{}", &path[component_start..])
 }
 
 fn render_sessions_view(
@@ -1533,7 +1584,8 @@ fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
 mod tests {
     use super::{
         build_discovery_catalog, header_line_area, history_depth_controls_area,
-        history_style_controls_area, BrowserClickTarget, BrowserState, DOUBLE_CLICK_WINDOW,
+        history_style_controls_area, project_list_label, sort_catalog_by_display_path,
+        BrowserClickTarget, BrowserState, DOUBLE_CLICK_WINDOW,
     };
     use crate::read::catalog::{
         CatalogSnapshot, ProjectCheckout, ProjectViewMode, SessionProjectLink, SOURCE_REPOSITORY,
@@ -1601,6 +1653,56 @@ mod tests {
         assert_eq!(
             history_style_controls_area(Rect::new(2, 1, 20, 3)),
             Rect::default()
+        );
+    }
+
+    #[test]
+    fn strict_project_labels_keep_paths_and_truncate_from_the_left() {
+        let project = strict_project(
+            "/Volumes/Dev/dev/Photonia",
+            session("/sessions/photonia.jsonl", "/Volumes/Dev/dev/Photonia"),
+        );
+
+        assert_eq!(
+            project_list_label(&project, ProjectViewMode::Strict, 80),
+            "/Volumes/Dev/dev/Photonia"
+        );
+        assert_eq!(
+            project_list_label(&project, ProjectViewMode::Strict, 18),
+            ".../dev/Photonia"
+        );
+        assert_eq!(
+            project_list_label(&project, ProjectViewMode::Deep, 18),
+            "Photonia"
+        );
+    }
+
+    #[test]
+    fn strict_catalog_sorts_projects_by_full_path() {
+        let mut catalog = Catalog {
+            sessions_dir: PathBuf::from("/sessions"),
+            projects: vec![
+                strict_project(
+                    "/Volumes/Dev/dev/Zeta",
+                    session("/sessions/z.jsonl", "/Volumes/Dev/dev/Zeta"),
+                ),
+                strict_project(
+                    "/Volumes/Dev/dev/Alpha",
+                    session("/sessions/a.jsonl", "/Volumes/Dev/dev/Alpha"),
+                ),
+            ],
+            files_scanned: 2,
+            files_skipped: 0,
+        };
+
+        sort_catalog_by_display_path(&mut catalog);
+        assert_eq!(
+            catalog
+                .projects
+                .iter()
+                .map(|project| project.display_path.as_str())
+                .collect::<Vec<_>>(),
+            ["/Volumes/Dev/dev/Alpha", "/Volumes/Dev/dev/Zeta"]
         );
     }
 

@@ -83,7 +83,7 @@ Config precedence:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 3,
   "usage_days": 30,
   "refresh_usage_secs": 300,
   "refresh_limits_secs": 60,
@@ -93,9 +93,31 @@ Config precedence:
   "max_jsonl_line_kib": 512,
   "scan_time_budget_ms": 1500,
   "full_scan": false,
-  "scan_cache_max_entries": 50000
+  "scan_cache_max_entries": 50000,
+  "history_project_roots": [],
+  "history_deep_depth": 2,
+  "history_deep_max_depth": 8
 }
 ```
+
+### Optional Deep repository discovery
+
+Usage and Strict History reconstruct from Codex session logs and do not crawl
+project folders. Deep/Full History discovery is opt-in: add only the developer
+roots you intend to scan, for example:
+
+```json
+{
+  "history_project_roots": ["/Volumes/Dev/dev"]
+}
+```
+
+From the History screen, press `r` or `F5` and confirm the listed roots before
+CoMon enumerates them. Cached Deep/Full results remain available at startup but
+are marked as cached until explicitly refreshed. Do not use your whole home
+directory as a discovery root unless you deliberately want CoMon to inspect
+all of its accessible subfolders; macOS can request access to protected folders
+inside such a root.
 
 Example:
 

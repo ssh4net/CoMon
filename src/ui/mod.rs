@@ -30,8 +30,6 @@ use std::io::{self, Stdout};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use unicode_width::UnicodeWidthStr;
 
-/// Orange used for weekly pace warning bands (distinct from yellow/red).
-const WEEKLY_PACE_ORANGE: Color = Color::Rgb(204, 102, 0);
 const WEEKLY_PACE_ORANGE_BG: Color = Color::Rgb(160, 80, 0);
 
 const ACTIVITY_PROJECT_HEIGHT: u16 = 9;
@@ -196,7 +194,9 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
         }
     }
 
-    if state.quit_confirm_open {
+    if state.history_catalog_scan_prompt {
+        render_history_catalog_scan_confirmation(frame, area, state);
+    } else if state.quit_confirm_open {
         render_quit_confirmation(frame, area, state);
     } else if state.quit_preference_prompt.is_some() {
         render_quit_preference_confirmation(frame, area, state);
@@ -448,7 +448,7 @@ fn render_api_stats(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     let weekly_hover = render_api_stat_cards(frame, chunks[1], state, &account_usage);
     render_api_stat_chart(frame, chunks[2], &account_usage, state);
     if let Some(hover) = weekly_hover {
-        render_hover_tooltip(frame, area, hover.mouse, &hover.text);
+        render_weekly_pace_tooltip(frame, area, hover.mouse, &hover.text);
     }
 }
 
@@ -1981,7 +1981,7 @@ fn render_usage(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     render_usage_chart(frame, chunks[2], state);
     render_top_models(frame, chunks[3], state);
     if let Some(hover) = weekly_hover {
-        render_hover_tooltip(frame, area, hover.mouse, &hover.text);
+        render_weekly_pace_tooltip(frame, area, hover.mouse, &hover.text);
     }
 }
 
@@ -2019,7 +2019,7 @@ fn render_activity(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     let weekly_hover = render_usage_cards(frame, chunks[1], state);
     render_activity_heatmaps(frame, chunks[2], state);
     if let Some(hover) = weekly_hover {
-        render_hover_tooltip(frame, area, hover.mouse, &hover.text);
+        render_weekly_pace_tooltip(frame, area, hover.mouse, &hover.text);
     }
 }
 
@@ -4578,6 +4578,20 @@ fn render_chart_tooltip(frame: &mut Frame<'_>, bounds: Rect, mouse: (u16, u16), 
 }
 
 fn render_hover_tooltip(frame: &mut Frame<'_>, bounds: Rect, mouse: (u16, u16), text: &str) {
+    render_hover_tooltip_with_horizontal_padding(frame, bounds, mouse, text, 0);
+}
+
+fn render_weekly_pace_tooltip(frame: &mut Frame<'_>, bounds: Rect, mouse: (u16, u16), text: &str) {
+    render_hover_tooltip_with_horizontal_padding(frame, bounds, mouse, text, 1);
+}
+
+fn render_hover_tooltip_with_horizontal_padding(
+    frame: &mut Frame<'_>,
+    bounds: Rect,
+    mouse: (u16, u16),
+    text: &str,
+    horizontal_padding: u16,
+) {
     let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
     if lines.is_empty() {
         return;
@@ -4589,10 +4603,20 @@ fn render_hover_tooltip(frame: &mut Frame<'_>, bounds: Rect, mouse: (u16, u16), 
         .unwrap_or(0)
         .min(u16::MAX as usize) as u16;
     let content_height = lines.len().min(u16::MAX as usize) as u16;
-    let Some(area) = hover_tooltip_rect(bounds, mouse, content_width, content_height) else {
+    let Some(area) = hover_tooltip_rect_with_horizontal_padding(
+        bounds,
+        mouse,
+        content_width,
+        content_height,
+        horizontal_padding,
+    ) else {
         return;
     };
-    let inner_width = area.width.saturating_sub(2).max(1) as usize;
+    let inner_width = area
+        .width
+        .saturating_sub(2)
+        .saturating_sub(horizontal_padding.saturating_mul(2))
+        .max(1) as usize;
     let styled_lines: Vec<Line<'static>> = lines
         .into_iter()
         .map(|line| {
@@ -4606,6 +4630,12 @@ fn render_hover_tooltip(frame: &mut Frame<'_>, bounds: Rect, mouse: (u16, u16), 
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::White))
+        .padding(Padding {
+            left: horizontal_padding,
+            right: horizontal_padding,
+            top: 0,
+            bottom: 0,
+        })
         .style(Style::default().bg(Color::Black));
     let alignment = if content_height <= 1 {
         Alignment::Center
@@ -4632,10 +4662,24 @@ fn hover_tooltip_rect(
     content_width: u16,
     content_height: u16,
 ) -> Option<Rect> {
-    if bounds.width < 3 || bounds.height < 3 {
+    hover_tooltip_rect_with_horizontal_padding(bounds, mouse, content_width, content_height, 0)
+}
+
+fn hover_tooltip_rect_with_horizontal_padding(
+    bounds: Rect,
+    mouse: (u16, u16),
+    content_width: u16,
+    content_height: u16,
+    horizontal_padding: u16,
+) -> Option<Rect> {
+    let horizontal_frame = 2u16.saturating_add(horizontal_padding.saturating_mul(2));
+    let min_width = horizontal_frame.saturating_add(1);
+    if bounds.width < min_width || bounds.height < 3 {
         return None;
     }
-    let width = content_width.saturating_add(2).clamp(3, bounds.width);
+    let width = content_width
+        .saturating_add(horizontal_frame)
+        .clamp(min_width, bounds.width);
     let height = content_height.saturating_add(2).clamp(3, bounds.height);
     let right = bounds.x.saturating_add(bounds.width);
     let bottom = bounds.y.saturating_add(bounds.height);
@@ -4928,6 +4972,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
         ActiveScreen::Read => Text::from(vec![
             Line::from("Keys:"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
+            Line::from("  r/F5 - discover/refresh repositories (asks first)"),
             Line::from("  Mouse - click tabs/quit"),
             Line::from("  q    - quit (confirm)"),
         ]),
@@ -4991,6 +5036,104 @@ fn render_no_sessions_overlay(frame: &mut Frame<'_>, area: Rect, state: &AppStat
             .alignment(Alignment::Left)
             .wrap(Wrap { trim: true }),
         popup,
+    );
+}
+
+fn render_history_catalog_scan_confirmation(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut AppState,
+) {
+    state.ui_hit_targets.clear();
+
+    let desired_height =
+        u16::try_from(state.history_project_roots.len().saturating_add(12)).unwrap_or(u16::MAX);
+    let max_height = area.height.saturating_sub(2).max(8);
+    let popup = centered_rect(area.width.min(92), desired_height.min(max_height), area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .title(Span::styled(
+                " Repository scan warning ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        popup,
+    );
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "CoMon will scan these folders for Git repositories.",
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(
+            "macOS may ask to access protected folders.",
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(
+            "Continue only if you trust these folders.",
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(
+            "Configured roots:",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+    ];
+    for root in &state.history_project_roots {
+        lines.push(Line::from(format!("- {}", root.display())));
+    }
+    lines.extend([
+        Line::from(Span::styled(
+            format!(
+                "Search depth: {}; maximum folders: {}.",
+                state.history_catalog_max_depth, state.history_catalog_max_directories
+            ),
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(Span::styled(
+            "Enter/Y: scan. Esc/N: cancel.",
+            Style::default().fg(Color::Gray),
+        )),
+    ]);
+
+    let message_area = Rect::new(
+        popup.x.saturating_add(2),
+        popup.y.saturating_add(1),
+        popup.width.saturating_sub(4),
+        popup.height.saturating_sub(4),
+    );
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: true }),
+        message_area,
+    );
+
+    let buttons_area = Rect::new(
+        popup.x.saturating_add(1),
+        popup.y.saturating_add(popup.height.saturating_sub(2)),
+        popup.width.saturating_sub(2),
+        1,
+    );
+    let segments = [
+        (" YES ", Some(UiClickAction::ConfirmHistoryCatalogScan)),
+        ("   ", None),
+        (" NO ", Some(UiClickAction::CancelHistoryCatalogScan)),
+    ];
+    state
+        .ui_hit_targets
+        .extend(centered_targets(buttons_area, &segments));
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            pill("YES", false),
+            Span::raw("   "),
+            pill("NO", true),
+        ]))
+        .alignment(Alignment::Center),
+        buttons_area,
     );
 }
 
@@ -5914,18 +6057,9 @@ fn style_weekly_limit_line(plain: &str, band: WeeklyPaceBand, emphasize: bool) -
         }
         WeeklyPaceBand::Orange => {
             spans.push(Span::styled(
-                label,
+                format!("{label}{mid}{percent}"),
                 Style::default().fg(Color::White).bg(WEEKLY_PACE_ORANGE_BG),
             ));
-            if !mid.is_empty() {
-                spans.push(Span::styled(mid, Style::default().fg(WEEKLY_PACE_ORANGE)));
-            }
-            if !percent.is_empty() {
-                spans.push(Span::styled(
-                    percent,
-                    Style::default().fg(WEEKLY_PACE_ORANGE),
-                ));
-            }
             if !suffix.is_empty() {
                 spans.push(Span::styled(suffix, gray));
             }
@@ -6016,7 +6150,6 @@ fn format_weekly_pace_tooltip(
     window: &crate::codex_rpc::RateLimitWindow,
     band: WeeklyPaceBand,
     now_unix_secs: i64,
-    formatter: DisplayFormatter<'_>,
 ) -> Option<String> {
     if matches!(band, WeeklyPaceBand::Normal) {
         return None;
@@ -6032,48 +6165,26 @@ fn format_weekly_pace_tooltip(
     if allowed < 0.5 {
         allowed = 0.5;
     }
-    let pace_x = (used / allowed).clamp(0.0, 99.0);
-    let (start_secs, reset_secs, window_mins) = weekly_window_bounds_secs(window)?;
-    let day_mins = 24.0 * 60.0;
-    let window_days = (window_mins / day_mins).max(1.0);
-    let day_budget = 100.0 / window_days;
-    let days_used = if day_budget > 0.0 {
-        used / day_budget
-    } else {
-        0.0
-    };
-    let local_day = weekly_local_day_index(start_secs, now_unix_secs, reset_secs)? as f64;
-    let reset_phrase = resets_label(window.resets_at, formatter)
-        .map(|label| format!(" ({label})"))
-        .unwrap_or_default();
-
     let used_i = used.round() as i64;
     let allowed_i = allowed.round() as i64;
-    let pace_label = format!("{:.1}x", pace_x);
-    let days_used_label = if days_used >= 10.0 {
-        format!("{:.0}", days_used)
-    } else {
-        format!("{:.1}", days_used)
-    };
-    let days_elapsed_label = if local_day <= 1.0 {
-        "local day 1 of the weekly window".to_string()
-    } else {
-        format!("local day {local_day:.0} of the weekly window")
-    };
-
-    let text = match band {
+    let (headline, advice) = match band {
         WeeklyPaceBand::Normal => return None,
-        WeeklyPaceBand::Yellow => format!(
-            "Weekly pace is elevated.\nUsed {used_i}% vs ~{allowed_i}% unlocked through {days_elapsed_label} (~{pace_label} fair pace)."
+        WeeklyPaceBand::Yellow => (
+            "Weekly use is above the fair pace.",
+            "Use less until the weekly limit resets.",
         ),
-        WeeklyPaceBand::Orange => format!(
-            "You have used about {days_used_label} day-shares of the weekly limit on {days_elapsed_label} (~{pace_label} unlocked pace).\nThe weekly limit may run out before the reset{reset_phrase}."
+        WeeklyPaceBand::Orange => (
+            "Weekly use is high.",
+            "The weekly limit may end before it resets.",
         ),
-        WeeklyPaceBand::Red => format!(
-            "You already used near {days_used_label}x a full day's share of the weekly limit (~{pace_label} unlocked pace).\nWeekly limits may finish faster than the reset day{reset_phrase}."
+        WeeklyPaceBand::Red => (
+            "Weekly use is very high.",
+            "The weekly limit may end before it resets.",
         ),
     };
-    Some(text)
+    Some(format!(
+        "{headline}\nUsed: {used_i}%. Fair share now: ~{allowed_i}%.\n{advice}"
+    ))
 }
 
 fn limits_card_paragraph(
@@ -6126,7 +6237,7 @@ fn limits_card_paragraph(
             .map(|window| weekly_pace_band(window, now))
             .unwrap_or(WeeklyPaceBand::Normal);
         if let Some(window) = weekly_window {
-            tooltip = format_weekly_pace_tooltip(window, band, now, formatter);
+            tooltip = format_weekly_pace_tooltip(window, band, now);
         }
 
         let mut push_line = |text: &str, is_value: bool| {
@@ -7073,32 +7184,34 @@ mod tests {
     }
 
     #[test]
-    fn weekly_pace_tooltip_explains_orange_and_red_without_normal() {
+    fn weekly_pace_tooltip_uses_three_simple_lines() {
         let start = NaiveDate::from_ymd_opt(2026, 7, 20).expect("date");
-        let locale = crate::locale::SystemLocale::default();
-        let formatter = DisplayFormatter::new(DisplayStyle::Classic, &locale);
 
         let (normal, now) = weekly_window_local_days(6.0, start, start, 15, 0);
         assert_eq!(weekly_pace_band(&normal, now), WeeklyPaceBand::Normal);
-        assert!(
-            format_weekly_pace_tooltip(&normal, WeeklyPaceBand::Normal, now, formatter).is_none()
-        );
+        assert!(format_weekly_pace_tooltip(&normal, WeeklyPaceBand::Normal, now).is_none());
+
+        let (yellow, now) = weekly_window_local_days(8.0, start, start, 15, 0);
+        assert_eq!(weekly_pace_band(&yellow, now), WeeklyPaceBand::Yellow);
+        let yellow_text =
+            format_weekly_pace_tooltip(&yellow, WeeklyPaceBand::Yellow, now).expect("yellow");
+        assert_eq!(yellow_text.lines().count(), 3);
+        assert!(yellow_text.contains("fair pace"));
 
         let (orange, now) = weekly_window_local_days(10.0, start, start, 15, 0);
         assert_eq!(weekly_pace_band(&orange, now), WeeklyPaceBand::Orange);
         let orange_text =
-            format_weekly_pace_tooltip(&orange, WeeklyPaceBand::Orange, now, formatter)
-                .expect("orange tooltip");
-        assert!(orange_text.contains("day-shares"));
-        assert!(orange_text.contains("may run out"));
-        assert!(orange_text.contains('\n'));
+            format_weekly_pace_tooltip(&orange, WeeklyPaceBand::Orange, now).expect("orange");
+        assert_eq!(orange_text.lines().count(), 3);
+        assert!(orange_text.contains("Weekly use is high."));
+        assert!(orange_text.contains("may end before it resets"));
 
         let (red, now) = weekly_window_local_days(17.0, start, start, 15, 0);
         assert_eq!(weekly_pace_band(&red, now), WeeklyPaceBand::Red);
-        let red_text =
-            format_weekly_pace_tooltip(&red, WeeklyPaceBand::Red, now, formatter).expect("red");
-        assert!(red_text.to_lowercase().contains("faster") || red_text.contains("day's share"));
-        assert!(red_text.contains('\n'));
+        let red_text = format_weekly_pace_tooltip(&red, WeeklyPaceBand::Red, now).expect("red");
+        assert_eq!(red_text.lines().count(), 3);
+        assert!(red_text.contains("Weekly use is very high."));
+        assert!(red_text.contains("Fair share now"));
     }
 
     #[test]
@@ -7122,17 +7235,11 @@ mod tests {
         assert_eq!(yellow.spans[1].style.fg, Some(Color::Gray));
 
         let orange = style_weekly_limit_line(plain, WeeklyPaceBand::Orange, false);
-        assert!(orange.spans.len() >= 3);
-        assert_eq!(orange.spans[0].content.as_ref(), "Weekly");
+        assert_eq!(orange.spans.len(), 2);
+        assert_eq!(orange.spans[0].content.as_ref(), "Weekly:   83%");
         assert_eq!(orange.spans[0].style.bg, Some(WEEKLY_PACE_ORANGE_BG));
         assert_eq!(orange.spans[0].style.fg, Some(Color::White));
-        let percent_span = orange
-            .spans
-            .iter()
-            .find(|span| span.content.as_ref().ends_with('%'))
-            .expect("percent span");
-        assert_eq!(percent_span.style.fg, Some(WEEKLY_PACE_ORANGE));
-        assert_eq!(percent_span.style.bg, None);
+        assert_eq!(orange.spans[1].style.fg, Some(Color::Gray));
 
         let red = style_weekly_limit_line(plain, WeeklyPaceBand::Red, false);
         assert_eq!(red.spans.len(), 2);
@@ -7142,8 +7249,9 @@ mod tests {
         assert_eq!(red.spans[1].style.fg, Some(Color::Gray));
 
         let compact = style_weekly_limit_line("7d: 50% | 12:14", WeeklyPaceBand::Orange, false);
-        assert_eq!(compact.spans[0].content.as_ref(), "7d");
+        assert_eq!(compact.spans[0].content.as_ref(), "7d: 50%");
         assert_eq!(compact.spans[0].style.bg, Some(WEEKLY_PACE_ORANGE_BG));
+        assert_eq!(compact.spans[0].style.fg, Some(Color::White));
     }
 
     #[test]
@@ -7260,6 +7368,14 @@ mod tests {
         assert_eq!(
             chart_tooltip_rect(Rect::new(2, 2, 20, 10), (20, 3), 10),
             Some(Rect::new(8, 4, 12, 3))
+        );
+    }
+
+    #[test]
+    fn weekly_pace_tooltip_reserves_single_cell_horizontal_margins() {
+        assert_eq!(
+            hover_tooltip_rect_with_horizontal_padding(Rect::new(2, 2, 20, 10), (20, 3), 10, 3, 1),
+            Some(Rect::new(6, 4, 14, 5))
         );
     }
 

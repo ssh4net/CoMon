@@ -104,6 +104,7 @@ enum AppEvent {
     HistoryCatalogUpdated {
         strict: crate::read::scan::Catalog,
         snapshot: crate::read::catalog::CatalogSnapshot,
+        from_cache: bool,
     },
     HistoryCatalogFailed(String),
 }
@@ -122,6 +123,8 @@ pub(crate) enum UiClickAction {
     SetScreen(ActiveScreen),
     SetDisplayStyle(DisplayStyle),
     SetHistoryProjectMode(crate::read::catalog::ProjectViewMode),
+    ConfirmHistoryCatalogScan,
+    CancelHistoryCatalogScan,
     DecreaseHistoryDepth,
     IncreaseHistoryDepth,
     HistoryDepthWheel,
@@ -261,6 +264,11 @@ pub(crate) struct AppState {
     pub(crate) quit_dont_ask_again: bool,
     pub(crate) skip_quit_confirmation: bool,
     pub(crate) quit_preference_prompt: Option<bool>,
+    pub(crate) history_project_roots: Vec<PathBuf>,
+    pub(crate) history_catalog_max_depth: u8,
+    pub(crate) history_catalog_max_directories: usize,
+    pub(crate) history_catalog_config_path: PathBuf,
+    pub(crate) history_catalog_scan_prompt: bool,
     pub(crate) display_style: DisplayStyle,
     pub(crate) system_locale: SystemLocale,
     pub(crate) mouse_position: Option<(u16, u16)>,
@@ -463,8 +471,15 @@ async fn run_inner(
         restored_ui_state.history_expanded_remote_groups.clone(),
     );
 
-    // Spawn HISTORY project-catalog worker. STRICT remains available immediately;
-    // cached and freshly discovered projects arrive asynchronously.
+    let history_catalog_max_depth = config
+        .history_deep_max_depth
+        .max(config.history_deep_depth)
+        .clamp(1, crate::read::catalog::MAX_DEEP_DEPTH);
+    let history_catalog_max_directories =
+        crate::read::catalog::max_directories_for_candidates(config.history_catalog_max_candidates);
+
+    // Load a cached HISTORY catalog on startup. Filesystem discovery waits for
+    // an explicit user confirmation so normal startup never crawls project roots.
     {
         let evt_tx = evt_tx.clone();
         let sessions_dir = config.read_sessions_dir.clone();
@@ -473,10 +488,7 @@ async fn run_inner(
             config.codex_home.join("sessions"),
             config.comon_home.clone(),
         ];
-        let max_depth = config
-            .history_deep_max_depth
-            .max(config.history_deep_depth)
-            .clamp(1, crate::read::catalog::MAX_DEEP_DEPTH);
+        let max_depth = history_catalog_max_depth;
         let max_candidates = config.history_catalog_max_candidates;
         let progress_interval_ms = config.history_catalog_scan_budget_ms;
         let cache_db_path = scan_cache_db_path.clone();
@@ -505,6 +517,7 @@ async fn run_inner(
                     .send(AppEvent::HistoryCatalogUpdated {
                         strict: initial_strict,
                         snapshot,
+                        from_cache: true,
                     })
                     .await;
             }
@@ -518,11 +531,10 @@ async fn run_inner(
                 cache_db_path,
                 cancelled: catalog_cancelled,
             };
-            let mut first_run = true;
             let mut catch_up = false;
             let mut reuse_cached_repositories = false;
             loop {
-                if !first_run && !catch_up {
+                if !catch_up {
                     tokio::select! {
                         _ = shutdown_rx.changed() => break,
                         received = catalog_refresh_rx.recv() => {
@@ -531,7 +543,6 @@ async fn run_inner(
                     }
                     reuse_cached_repositories = false;
                 }
-                first_run = false;
                 let progress_tx = evt_tx.clone();
                 let scan_config = scan_config.clone();
                 let scan_cancelled = scan_config.cancelled.clone();
@@ -564,7 +575,11 @@ async fn run_inner(
                         catch_up = snapshot.sessions_scanned < snapshot.sessions_total;
                         reuse_cached_repositories = catch_up;
                         if evt_tx
-                            .send(AppEvent::HistoryCatalogUpdated { strict, snapshot })
+                            .send(AppEvent::HistoryCatalogUpdated {
+                                strict,
+                                snapshot,
+                                from_cache: false,
+                            })
                             .await
                             .is_err()
                         {
@@ -842,6 +857,11 @@ async fn run_inner(
         quit_dont_ask_again: false,
         skip_quit_confirmation: restored_ui_state.skip_quit_confirmation,
         quit_preference_prompt: None,
+        history_project_roots: config.history_project_roots.clone(),
+        history_catalog_max_depth,
+        history_catalog_max_directories,
+        history_catalog_config_path: config.comon_home.join("config.json"),
+        history_catalog_scan_prompt: false,
         display_style: restored_ui_state.display_style,
         system_locale: config.system_locale.clone(),
         mouse_position: None,
@@ -983,6 +1003,54 @@ fn handle_input_event(
     limits_refresh_tx: &mpsc::Sender<()>,
     catalog_refresh_tx: &mpsc::Sender<()>,
 ) -> Result<InputOutcome> {
+    if state.history_catalog_scan_prompt {
+        return match event {
+            Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+                match ui_click_action_at(&state.ui_hit_targets, mouse.column, mouse.row) {
+                    Some(UiClickAction::ConfirmHistoryCatalogScan) => {
+                        state.history_catalog_scan_prompt = false;
+                        if catalog_refresh_tx.try_send(()).is_err() {
+                            state.read_browser.set_catalog_notice(
+                                "Repository discovery is already queued or running.".to_string(),
+                            );
+                        }
+                        Ok(InputOutcome::Continue(true))
+                    }
+                    Some(UiClickAction::CancelHistoryCatalogScan) => {
+                        state.history_catalog_scan_prompt = false;
+                        Ok(InputOutcome::Continue(true))
+                    }
+                    _ => Ok(InputOutcome::Continue(false)),
+                }
+            }
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    state.history_catalog_scan_prompt = false;
+                    if catalog_refresh_tx.try_send(()).is_err() {
+                        state.read_browser.set_catalog_notice(
+                            "Repository discovery is already queued or running.".to_string(),
+                        );
+                    }
+                    Ok(InputOutcome::Continue(true))
+                }
+                KeyCode::Esc
+                | KeyCode::Char('n')
+                | KeyCode::Char('N')
+                | KeyCode::Char('q')
+                | KeyCode::Char('Q') => {
+                    state.history_catalog_scan_prompt = false;
+                    Ok(InputOutcome::Continue(true))
+                }
+                KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
+                    Ok(InputOutcome::Quit)
+                }
+                _ => Ok(InputOutcome::Continue(false)),
+            },
+            Event::Resize(_, _) => Ok(InputOutcome::Continue(true)),
+            _ => Ok(InputOutcome::Continue(false)),
+        };
+    }
+
     if let Some(desired_skip_confirmation) = state.quit_preference_prompt {
         return match event {
             Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
@@ -1193,8 +1261,7 @@ fn handle_input_event(
             (KeyCode::Char('r'), _) | (KeyCode::F(5), _)
                 if state.active_screen == ActiveScreen::Read =>
             {
-                let _ = catalog_refresh_tx.try_send(());
-                return Ok(InputOutcome::Continue(true));
+                return Ok(InputOutcome::Continue(request_history_catalog_scan(state)));
             }
             _ => {}
         }
@@ -1274,6 +1341,18 @@ fn ui_click_action_at(targets: &[UiHitTarget], column: u16, row: u16) -> Option<
         .map(|target| target.action)
 }
 
+fn request_history_catalog_scan(state: &mut AppState) -> bool {
+    if state.history_project_roots.is_empty() {
+        state.read_browser.set_catalog_notice(format!(
+            "Repository discovery is disabled. Add history_project_roots to {}.",
+            state.history_catalog_config_path.display()
+        ));
+        return true;
+    }
+    state.history_catalog_scan_prompt = true;
+    true
+}
+
 fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
     column >= area.x
         && column < area.x.saturating_add(area.width)
@@ -1294,6 +1373,7 @@ fn apply_ui_click_action(state: &mut AppState, action: UiClickAction) -> bool {
             changed
         }
         UiClickAction::SetHistoryProjectMode(mode) => state.read_browser.set_project_mode(mode),
+        UiClickAction::ConfirmHistoryCatalogScan | UiClickAction::CancelHistoryCatalogScan => false,
         UiClickAction::DecreaseHistoryDepth => state.read_browser.change_deep_depth(-1),
         UiClickAction::IncreaseHistoryDepth => state.read_browser.change_deep_depth(1),
         UiClickAction::HistoryDepthWheel => false,
@@ -1901,8 +1981,18 @@ fn handle_app_event(state: &mut AppState, evt: AppEvent) -> bool {
             state.read_browser.set_catalog_progress(progress);
             true
         }
-        AppEvent::HistoryCatalogUpdated { strict, snapshot } => {
-            state.read_browser.apply_catalog_snapshot(strict, snapshot);
+        AppEvent::HistoryCatalogUpdated {
+            strict,
+            snapshot,
+            from_cache,
+        } => {
+            if from_cache {
+                state
+                    .read_browser
+                    .apply_cached_catalog_snapshot(strict, snapshot);
+            } else {
+                state.read_browser.apply_catalog_snapshot(strict, snapshot);
+            }
             true
         }
         AppEvent::HistoryCatalogFailed(error) => {

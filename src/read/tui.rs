@@ -55,6 +55,8 @@ pub(crate) struct BrowserState {
     explicitly_excluded_projects: BTreeSet<String>,
     expanded_remote_groups: BTreeSet<String>,
     discovery: Option<CatalogSnapshot>,
+    catalog_from_cache: bool,
+    catalog_notice: Option<String>,
     scan_progress: Option<CatalogProgress>,
     scan_error: Option<String>,
     view: ViewMode,
@@ -98,6 +100,8 @@ impl BrowserState {
             explicitly_excluded_projects: BTreeSet::new(),
             expanded_remote_groups: BTreeSet::new(),
             discovery: None,
+            catalog_from_cache: false,
+            catalog_notice: None,
             scan_progress: None,
             scan_error: None,
             view: ViewMode::Projects,
@@ -179,8 +183,27 @@ impl BrowserState {
     }
 
     pub(crate) fn apply_catalog_snapshot(&mut self, strict: Catalog, snapshot: CatalogSnapshot) {
+        self.apply_catalog_snapshot_with_source(strict, snapshot, false);
+    }
+
+    pub(crate) fn apply_cached_catalog_snapshot(
+        &mut self,
+        strict: Catalog,
+        snapshot: CatalogSnapshot,
+    ) {
+        self.apply_catalog_snapshot_with_source(strict, snapshot, true);
+    }
+
+    fn apply_catalog_snapshot_with_source(
+        &mut self,
+        strict: Catalog,
+        snapshot: CatalogSnapshot,
+        from_cache: bool,
+    ) {
         self.strict_catalog = strict;
         self.discovery = Some(snapshot);
+        self.catalog_from_cache = from_cache;
+        self.catalog_notice = None;
         self.scan_progress = None;
         self.scan_error = None;
         self.seed_custom_from_strict();
@@ -188,7 +211,13 @@ impl BrowserState {
     }
 
     pub(crate) fn set_catalog_progress(&mut self, progress: CatalogProgress) {
+        self.catalog_notice = None;
         self.scan_progress = Some(progress);
+        self.scan_error = None;
+    }
+
+    pub(crate) fn set_catalog_notice(&mut self, notice: String) {
+        self.catalog_notice = Some(notice);
         self.scan_error = None;
     }
 
@@ -1388,7 +1417,7 @@ fn render_footer(
 ) {
     let base = match state.view {
         ViewMode::Projects => {
-            "Projects: [p] mode, [+/-] depth, [space] select in FULL, wheel, double-click/enter open, r/F5 rescan"
+            "Projects: [p] mode, [+/-] depth, [space] select in FULL, wheel, double-click/enter open, r/F5 discover/refresh"
         }
         ViewMode::Sessions => {
             "Sessions: up/down or wheel, double-click .. / backspace / left / esc back, q quit"
@@ -1422,6 +1451,15 @@ fn render_footer(
             "PROJECT_SCAN ERROR: {}",
             truncate_single_line(scan_error, 80)
         )
+    } else if let Some(notice) = &state.catalog_notice {
+        truncate_single_line(notice, 100)
+    } else if state.catalog_from_cache
+        && state.discovery.is_some()
+        && state.project_mode != ProjectViewMode::Strict
+    {
+        "DEEP CATALOG CACHED - r/F5 TO REFRESH".to_string()
+    } else if state.discovery.is_none() && state.project_mode != ProjectViewMode::Strict {
+        "DEEP CATALOG NOT SCANNED - r/F5 TO DISCOVER".to_string()
     } else if state.discovery.as_ref().is_some_and(|snapshot| {
         snapshot.sessions_total > 0 && snapshot.sessions_scanned < snapshot.sessions_total
     }) {

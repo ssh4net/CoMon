@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+- Deep/Full History repository discovery is now opt-in: startup uses only the
+  cached catalog, new configurations have no discovery roots, and `r`/`F5`
+  presents the exact roots and limits for confirmation before a filesystem scan.
+- Changed the orange Weekly pace warning to highlight the complete `Weekly: ##%`
+  value with an orange background and white text, matching the red warning's
+  treatment.
 - Fixed project attribution to use recorded session context only: sandbox permissions, tool working directories, and referenced command paths cannot create project memberships or relink Session history. The v12 cache migration rebuilds derived usage from raw session logs.
 
 ## 0.4.4 - 2026-07-26

@@ -21,6 +21,10 @@ const MAX_COMMAND_BYTES: usize = 64 * 1024;
 const MAX_RELATED_PROJECTS_PER_SESSION: usize = 64;
 const EVIDENCE_PASS_BYTES: u64 = 256 * 1024 * 1024;
 
+pub(crate) fn max_directories_for_candidates(max_candidates: usize) -> usize {
+    max_candidates.saturating_mul(5).clamp(10_000, 50_000)
+}
+
 pub(crate) const SOURCE_OWNER: u32 = 1 << 0;
 pub(crate) const SOURCE_REPOSITORY: u32 = 1 << 1;
 pub(crate) const SOURCE_WORKDIR: u32 = 1 << 2;
@@ -459,7 +463,7 @@ where
     };
     let _ = root_meta;
     let mut queue = VecDeque::from([(root.to_path_buf(), 0u8)]);
-    let max_directories = max_candidates.saturating_mul(5).clamp(10_000, 50_000);
+    let max_directories = max_directories_for_candidates(max_candidates);
     while let Some((dir, depth)) = queue.pop_front() {
         if cancelled.load(Ordering::Relaxed) {
             anyhow::bail!("project catalog scan cancelled");
@@ -1530,6 +1534,8 @@ mod tests {
         )
         .expect("git config");
         std::fs::create_dir_all(&sessions).expect("sessions");
+        let project_workdir =
+            std::fs::canonicalize(&project).expect("canonicalize project workdir");
         let session_path = sessions.join("session.jsonl");
         let body = format!(
             "{}\n{}\n",
@@ -1547,7 +1553,7 @@ mod tests {
                     "type": "function_call",
                     "name": "exec_command",
                     "arguments": serde_json::json!({
-                        "workdir": project,
+                        "workdir": project_workdir,
                         "cmd": "cargo test"
                     }).to_string()
                 }

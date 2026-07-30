@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::path::PathBuf;
 
-const USER_CONFIG_SCHEMA_VERSION: u32 = 2;
+const USER_CONFIG_SCHEMA_VERSION: u32 = 3;
 const USER_CONFIG_FILE_NAME: &str = "config.json";
 const DEFAULT_USAGE_DAYS: u32 = 30;
 const DEFAULT_REFRESH_USAGE_SECS: u64 = 300;
@@ -60,21 +60,15 @@ impl Default for UserConfig {
             scan_time_budget_ms: DEFAULT_SCAN_TIME_BUDGET_MS,
             full_scan: false,
             scan_cache_max_entries: usage::DEFAULT_SCAN_CACHE_MAX_ENTRIES,
-            history_project_roots: default_history_project_roots(),
+            // Repository discovery is intentionally opt-in. Session history and
+            // usage are reconstructed from Codex logs without crawling $HOME.
+            history_project_roots: Vec::new(),
             history_deep_depth: read::catalog::DEFAULT_DEEP_DEPTH,
             history_deep_max_depth: read::catalog::MAX_DEEP_DEPTH,
             history_catalog_max_candidates: DEFAULT_HISTORY_CATALOG_MAX_CANDIDATES,
             history_catalog_scan_budget_ms: DEFAULT_HISTORY_CATALOG_SCAN_BUDGET_MS,
         }
     }
-}
-
-fn default_history_project_roots() -> Vec<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .into_iter()
-        .collect()
 }
 
 fn validate_dir(path: &std::path::Path, label: &str) -> Result<PathBuf> {
@@ -490,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn user_config_schema_one_migrates_without_losing_scan_settings() {
+    fn user_config_schema_one_migrates_with_discovery_disabled() {
         let comon_home = make_temp_dir("config-migration");
         let path = comon_home.join(USER_CONFIG_FILE_NAME);
         let legacy = serde_json::json!({
@@ -512,12 +506,36 @@ mod tests {
             migrated.history_deep_depth,
             read::catalog::DEFAULT_DEEP_DEPTH
         );
-        assert!(!migrated.history_project_roots.is_empty());
+        assert!(migrated.history_project_roots.is_empty());
 
         let persisted: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).expect("read migrated config"))
                 .expect("parse migrated config");
         assert_eq!(persisted["schema_version"], USER_CONFIG_SCHEMA_VERSION);
+        let _ = std::fs::remove_dir_all(comon_home);
+    }
+
+    #[test]
+    fn user_config_schema_two_preserves_explicit_discovery_roots() {
+        let comon_home = make_temp_dir("config-discovery-root-migration");
+        let path = comon_home.join(USER_CONFIG_FILE_NAME);
+        let legacy = serde_json::json!({
+            "schema_version": 2,
+            "history_project_roots": ["/Volumes/Dev/dev"]
+        });
+        crate::storage::write_private_file(
+            &path,
+            &serde_json::to_vec_pretty(&legacy).expect("encode legacy config"),
+        )
+        .expect("write legacy config");
+
+        let migrated = load_or_bootstrap_user_config(&comon_home).expect("migrate config");
+        assert_eq!(migrated.schema_version, USER_CONFIG_SCHEMA_VERSION);
+        assert_eq!(
+            migrated.history_project_roots,
+            vec![PathBuf::from("/Volumes/Dev/dev")]
+        );
+
         let _ = std::fs::remove_dir_all(comon_home);
     }
 }

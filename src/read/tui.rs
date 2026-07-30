@@ -1,9 +1,14 @@
 use crate::locale::{DisplayFormatter, DisplayStyle};
+use crate::read::catalog::{
+    CatalogProgress, CatalogScanPhase, CatalogSnapshot, ProjectViewMode, SOURCE_NOISY_TREE,
+};
 use crate::read::scan::{
     load_session_detail, truncate_single_line, Catalog, ProjectRecord, SessionDetail,
     SessionSummary,
 };
-use crate::usage::{format_compact_kmb, format_duration, LocalUsageSnapshot};
+use crate::usage::{
+    format_compact_kmb, format_duration, normalize_project_key, LocalUsageSnapshot,
+};
 use anyhow::Result;
 use chrono::{DateTime, Local};
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
@@ -14,7 +19,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
@@ -42,7 +47,16 @@ struct UiLayout {
 
 #[derive(Debug)]
 pub(crate) struct BrowserState {
+    strict_catalog: Catalog,
     catalog: Catalog,
+    project_mode: ProjectViewMode,
+    deep_depth: u8,
+    selected_projects: BTreeSet<String>,
+    explicitly_excluded_projects: BTreeSet<String>,
+    expanded_remote_groups: BTreeSet<String>,
+    discovery: Option<CatalogSnapshot>,
+    scan_progress: Option<CatalogProgress>,
+    scan_error: Option<String>,
     view: ViewMode,
     project_state: ListState,
     session_state: ListState,
@@ -76,7 +90,16 @@ impl BrowserState {
         ));
 
         Self {
+            strict_catalog: catalog.clone(),
             catalog,
+            project_mode: ProjectViewMode::Strict,
+            deep_depth: crate::read::catalog::DEFAULT_DEEP_DEPTH,
+            selected_projects: BTreeSet::new(),
+            explicitly_excluded_projects: BTreeSet::new(),
+            expanded_remote_groups: BTreeSet::new(),
+            discovery: None,
+            scan_progress: None,
+            scan_error: None,
             view: ViewMode::Projects,
             project_state,
             session_state,
@@ -85,6 +108,159 @@ impl BrowserState {
             layout: UiLayout::default(),
             last_click: None,
         }
+    }
+
+    pub(crate) fn restore_project_state(
+        &mut self,
+        mode: ProjectViewMode,
+        depth: u8,
+        selected: BTreeSet<String>,
+        excluded: BTreeSet<String>,
+        expanded: BTreeSet<String>,
+    ) {
+        self.project_mode = mode;
+        self.deep_depth = depth.clamp(1, crate::read::catalog::MAX_DEEP_DEPTH);
+        self.selected_projects = selected;
+        self.explicitly_excluded_projects = excluded;
+        self.expanded_remote_groups = expanded;
+        self.seed_custom_from_strict();
+        self.rebuild_visible_catalog();
+    }
+
+    pub(crate) fn project_mode(&self) -> ProjectViewMode {
+        self.project_mode
+    }
+
+    pub(crate) fn deep_depth(&self) -> u8 {
+        self.deep_depth
+    }
+
+    pub(crate) fn selected_projects(&self) -> &BTreeSet<String> {
+        &self.selected_projects
+    }
+
+    pub(crate) fn explicitly_excluded_projects(&self) -> &BTreeSet<String> {
+        &self.explicitly_excluded_projects
+    }
+
+    pub(crate) fn expanded_remote_groups(&self) -> &BTreeSet<String> {
+        &self.expanded_remote_groups
+    }
+
+    pub(crate) fn strict_catalog_clone(&self) -> Catalog {
+        self.strict_catalog.clone()
+    }
+
+    pub(crate) fn set_project_mode(&mut self, mode: ProjectViewMode) -> bool {
+        if self.project_mode == mode {
+            return false;
+        }
+        self.project_mode = mode;
+        self.rebuild_visible_catalog();
+        true
+    }
+
+    pub(crate) fn cycle_project_mode(&mut self) -> bool {
+        self.set_project_mode(self.project_mode.toggled())
+    }
+
+    pub(crate) fn change_deep_depth(&mut self, delta: i8) -> bool {
+        let current = i16::from(self.deep_depth);
+        let next = (current + i16::from(delta))
+            .clamp(1, i16::from(crate::read::catalog::MAX_DEEP_DEPTH)) as u8;
+        if next == self.deep_depth {
+            return false;
+        }
+        self.deep_depth = next;
+        if self.project_mode == ProjectViewMode::Deep {
+            self.rebuild_visible_catalog();
+        }
+        true
+    }
+
+    pub(crate) fn apply_catalog_snapshot(&mut self, strict: Catalog, snapshot: CatalogSnapshot) {
+        self.strict_catalog = strict;
+        self.discovery = Some(snapshot);
+        self.scan_progress = None;
+        self.scan_error = None;
+        self.seed_custom_from_strict();
+        self.rebuild_visible_catalog();
+    }
+
+    pub(crate) fn set_catalog_progress(&mut self, progress: CatalogProgress) {
+        self.scan_progress = Some(progress);
+        self.scan_error = None;
+    }
+
+    pub(crate) fn set_catalog_error(&mut self, error: String) {
+        self.scan_progress = None;
+        self.scan_error = Some(error);
+    }
+
+    fn seed_custom_from_strict(&mut self) {
+        for project in &self.strict_catalog.projects {
+            let stable_id = self
+                .discovery
+                .as_ref()
+                .and_then(|snapshot| {
+                    snapshot.checkouts.iter().find(|checkout| {
+                        checkout.checkout_key == normalize_project_key(&project.display_path)
+                    })
+                })
+                .map(|checkout| checkout.stable_id.as_str())
+                .unwrap_or(&project.stable_id);
+            if !self.explicitly_excluded_projects.contains(stable_id) {
+                self.selected_projects.insert(stable_id.to_string());
+            }
+        }
+    }
+
+    fn toggle_selected_project(&mut self, index: usize) -> bool {
+        if self.project_mode != ProjectViewMode::Full {
+            return false;
+        }
+        let Some(stable_id) = self
+            .catalog
+            .projects
+            .get(index)
+            .map(|project| project.stable_id.clone())
+        else {
+            return false;
+        };
+        if self.selected_projects.remove(&stable_id) {
+            self.explicitly_excluded_projects.insert(stable_id);
+        } else {
+            self.explicitly_excluded_projects.remove(&stable_id);
+            self.selected_projects.insert(stable_id);
+        }
+        true
+    }
+
+    fn rebuild_visible_catalog(&mut self) {
+        let selected_id = self
+            .selected_project()
+            .map(|project| project.stable_id.clone());
+        self.catalog = match self.project_mode {
+            ProjectViewMode::Strict => self.strict_catalog.clone(),
+            mode => build_discovery_catalog(
+                &self.strict_catalog,
+                self.discovery.as_ref(),
+                mode,
+                self.deep_depth,
+                &self.selected_projects,
+            ),
+        };
+        let next_index = selected_id
+            .as_deref()
+            .and_then(|stable_id| {
+                self.catalog
+                    .projects
+                    .iter()
+                    .position(|project| project.stable_id == stable_id)
+            })
+            .or_else(|| (!self.catalog.projects.is_empty()).then_some(0));
+        self.project_state.select(next_index);
+        sync_session_selection(self);
     }
 
     fn selected_project_index(&self) -> Option<usize> {
@@ -138,6 +314,188 @@ impl BrowserState {
     }
 }
 
+#[derive(Default)]
+struct LogicalProjectBuilder {
+    stable_id: String,
+    logical_name: String,
+    checkouts: Vec<String>,
+    checkout_keys: BTreeSet<String>,
+    owner_sessions: Vec<SessionSummary>,
+    related_sessions: Vec<SessionSummary>,
+    confidence: u8,
+    source_flags: u32,
+    missing: bool,
+}
+
+fn build_discovery_catalog(
+    strict: &Catalog,
+    discovery: Option<&CatalogSnapshot>,
+    mode: ProjectViewMode,
+    deep_depth: u8,
+    selected_projects: &BTreeSet<String>,
+) -> Catalog {
+    let Some(discovery) = discovery else {
+        return strict.clone();
+    };
+    let mut sessions_by_path = BTreeMap::new();
+    let mut strict_by_checkout = BTreeMap::new();
+    for (project_index, project) in strict.projects.iter().enumerate() {
+        strict_by_checkout.insert(normalize_project_key(&project.display_path), project_index);
+        for session in &project.sessions {
+            sessions_by_path.insert(
+                session.file_path.to_string_lossy().into_owned(),
+                session.clone(),
+            );
+        }
+    }
+
+    let mut groups: BTreeMap<String, LogicalProjectBuilder> = BTreeMap::new();
+    let mut checkout_to_group = BTreeMap::new();
+    for checkout in &discovery.checkouts {
+        let include = match mode {
+            ProjectViewMode::Strict => false,
+            ProjectViewMode::Deep => {
+                !checkout.missing
+                    && checkout.discovery_depth <= deep_depth
+                    && (checkout.deep_eligible || selected_projects.contains(&checkout.stable_id))
+            }
+            ProjectViewMode::Full => true,
+            ProjectViewMode::Custom => selected_projects.contains(&checkout.stable_id),
+        };
+        if !include {
+            continue;
+        }
+        let group =
+            groups
+                .entry(checkout.stable_id.clone())
+                .or_insert_with(|| LogicalProjectBuilder {
+                    stable_id: checkout.stable_id.clone(),
+                    logical_name: checkout.logical_name.clone(),
+                    missing: true,
+                    ..LogicalProjectBuilder::default()
+                });
+        group.checkouts.push(checkout.display_path.clone());
+        group.checkout_keys.insert(checkout.checkout_key.clone());
+        group.confidence = group.confidence.max(checkout.confidence);
+        group.source_flags |= checkout.source_flags;
+        group.missing &= checkout.missing;
+        checkout_to_group.insert(checkout.checkout_key.clone(), checkout.stable_id.clone());
+    }
+
+    let mut consumed_strict = BTreeSet::new();
+    for (stable_id, group) in groups.iter_mut() {
+        for checkout_key in &group.checkout_keys {
+            let Some(index) = strict_by_checkout.get(checkout_key).copied() else {
+                continue;
+            };
+            consumed_strict.insert(index);
+            group
+                .owner_sessions
+                .extend(strict.projects[index].sessions.iter().cloned());
+            group.source_flags |= crate::read::catalog::SOURCE_OWNER;
+            group.confidence = 100;
+        }
+        if selected_projects.contains(stable_id) {
+            group.source_flags |= crate::read::catalog::SOURCE_USER_SELECTED;
+        }
+    }
+
+    for link in &discovery.links {
+        let Some(stable_id) = checkout_to_group.get(&link.checkout_key) else {
+            continue;
+        };
+        let Some(session) = sessions_by_path.get(&link.session_path) else {
+            continue;
+        };
+        let Some(group) = groups.get_mut(stable_id) else {
+            continue;
+        };
+        if group
+            .owner_sessions
+            .iter()
+            .any(|owner| owner.file_path == session.file_path)
+            || group
+                .related_sessions
+                .iter()
+                .any(|related| related.file_path == session.file_path)
+        {
+            continue;
+        }
+        group.related_sessions.push(session.clone());
+    }
+
+    let mut projects = groups
+        .into_values()
+        .map(|mut group| {
+            group.checkouts.sort();
+            group.checkouts.dedup();
+            group.owner_sessions.sort_by(session_order);
+            group.related_sessions.sort_by(session_order);
+            let owner_session_count = group.owner_sessions.len();
+            let mut sessions = group.owner_sessions;
+            sessions.extend(group.related_sessions);
+            let display_path = group
+                .checkouts
+                .first()
+                .cloned()
+                .unwrap_or_else(|| group.logical_name.clone());
+            ProjectRecord {
+                stable_id: group.stable_id,
+                logical_name: group.logical_name,
+                display_path,
+                checkouts: group.checkouts,
+                sessions,
+                owner_session_count,
+                confidence: group.confidence,
+                source_flags: group.source_flags,
+                missing: group.missing,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for (index, project) in strict.projects.iter().enumerate() {
+        if consumed_strict.contains(&index) {
+            continue;
+        }
+        let include = match mode {
+            ProjectViewMode::Strict => true,
+            ProjectViewMode::Deep | ProjectViewMode::Full => true,
+            ProjectViewMode::Custom => {
+                let checkout_key = normalize_project_key(&project.display_path);
+                let effective_id = discovery
+                    .checkouts
+                    .iter()
+                    .find(|checkout| checkout.checkout_key == checkout_key)
+                    .map(|checkout| checkout.stable_id.as_str())
+                    .unwrap_or(&project.stable_id);
+                selected_projects.contains(effective_id)
+            }
+        };
+        if include {
+            projects.push(project.clone());
+        }
+    }
+    projects.sort_by(|left, right| {
+        left.logical_name
+            .to_ascii_lowercase()
+            .cmp(&right.logical_name.to_ascii_lowercase())
+            .then_with(|| left.display_path.cmp(&right.display_path))
+    });
+    Catalog {
+        sessions_dir: strict.sessions_dir.clone(),
+        projects,
+        files_scanned: strict.files_scanned,
+        files_skipped: strict.files_skipped,
+    }
+}
+
+fn session_order(left: &SessionSummary, right: &SessionSummary) -> std::cmp::Ordering {
+    right
+        .started_at_sort_key_ms
+        .cmp(&left.started_at_sort_key_ms)
+        .then_with(|| left.file_path.cmp(&right.file_path))
+}
+
 pub(crate) fn handle_event(state: &mut BrowserState, event: Event) -> Result<bool> {
     match event {
         Event::Key(key) => {
@@ -154,6 +512,20 @@ pub(crate) fn handle_event(state: &mut BrowserState, event: Event) -> Result<boo
 
 fn handle_key_event(state: &mut BrowserState, code: KeyCode) -> bool {
     match code {
+        KeyCode::Char('p') | KeyCode::Char('P') if state.view == ViewMode::Projects => {
+            return state.cycle_project_mode();
+        }
+        KeyCode::Char(' ') if state.view == ViewMode::Projects => {
+            return state
+                .selected_project_index()
+                .is_some_and(|index| state.toggle_selected_project(index));
+        }
+        KeyCode::Char('+') | KeyCode::Char('=') if state.view == ViewMode::Projects => {
+            return state.change_deep_depth(1);
+        }
+        KeyCode::Char('-') if state.view == ViewMode::Projects => {
+            return state.change_deep_depth(-1);
+        }
         KeyCode::Esc | KeyCode::Backspace | KeyCode::Left if state.view == ViewMode::Sessions => {
             close_selected_project(state);
             return true;
@@ -216,6 +588,14 @@ fn handle_mouse_event(state: &mut BrowserState, mouse: MouseEvent) -> bool {
             let now = Instant::now();
             if rect_contains(state.layout.project_list_area, mouse.column, mouse.row) {
                 if let Some(index) = click_project_row(state, mouse.row) {
+                    let content = inner_rect(state.layout.project_list_area);
+                    if state.project_mode == ProjectViewMode::Full
+                        && mouse.column >= content.x.saturating_add(3)
+                        && mouse.column < content.x.saturating_add(7)
+                    {
+                        state.last_click = None;
+                        return state.toggle_selected_project(index);
+                    }
                     if state.register_click(BrowserClickTarget::Project(index), now) {
                         open_selected_project(state);
                     }
@@ -416,8 +796,12 @@ fn render_header(
 ) {
     let line_area = header_line_area(area);
     let controls = history_style_controls_area(area);
+    let controls_gap = if controls.width > 0 { 2 } else { 0 };
     let content_area = Rect {
-        width: line_area.width.saturating_sub(controls.width),
+        width: line_area
+            .width
+            .saturating_sub(controls.width)
+            .saturating_sub(controls_gap),
         ..line_area
     };
     let summary = format!(
@@ -470,15 +854,34 @@ fn header_line_area(area: Rect) -> Rect {
 }
 
 pub(crate) fn history_style_controls_area(area: Rect) -> Rect {
-    const WIDTH: u16 = 30;
     let line = header_line_area(area);
-    if line.width < WIDTH {
+    let width = if line.width >= 68 {
+        68
+    } else if line.width >= 30 {
+        30
+    } else {
+        0
+    };
+    if width == 0 {
         return Rect::default();
     }
     Rect {
-        x: line.x.saturating_add(line.width - WIDTH),
+        x: line.x.saturating_add(line.width - width),
         y: line.y,
-        width: WIDTH,
+        width,
+        height: 1,
+    }
+}
+
+pub(crate) fn history_depth_controls_area(area: Rect) -> Rect {
+    let controls = history_style_controls_area(area);
+    if controls.width < 68 {
+        return Rect::default();
+    }
+    Rect {
+        x: controls.x.saturating_add(18),
+        y: controls.y.saturating_add(1),
+        width: 16,
         height: 1,
     }
 }
@@ -500,7 +903,33 @@ fn render_projects_view(
         .catalog
         .projects
         .iter()
-        .map(|project| ListItem::new(Line::from(project.display_path.clone())))
+        .map(|project| {
+            let checkbox = if state.project_mode == ProjectViewMode::Full {
+                if state.selected_projects.contains(&project.stable_id) {
+                    "[x] "
+                } else {
+                    "[ ] "
+                }
+            } else {
+                ""
+            };
+            let checkout_count = if project.checkouts.len() > 1 {
+                format!("  ({})", formatter.format_usize(project.checkouts.len()))
+            } else {
+                String::new()
+            };
+            let marker = if project.missing {
+                "  MISSING"
+            } else if project.source_flags & SOURCE_NOISY_TREE != 0 && project.confidence < 70 {
+                "  LOW"
+            } else {
+                ""
+            };
+            ListItem::new(Line::from(format!(
+                "{checkbox}{}{checkout_count}{marker}",
+                project.logical_name
+            )))
+        })
         .collect::<Vec<_>>();
 
     let list = List::new(items)
@@ -553,9 +982,14 @@ fn render_sessions_view(
     let items = project
         .map(|project| {
             std::iter::once(ListItem::new(Line::from("..")))
-                .chain(project.sessions.iter().map(|session| {
+                .chain(project.sessions.iter().enumerate().map(|(index, session)| {
+                    let relation = if index < project.owner_session_count {
+                        "O"
+                    } else {
+                        "R"
+                    };
                     let label = format!(
-                        "{}  {}",
+                        "{relation}  {}  {}",
                         session_started_label(session, formatter),
                         truncate_single_line(&session.title, 64)
                     );
@@ -618,16 +1052,31 @@ fn render_project_detail(
         .map(|session| session_started_label(session, formatter))
         .unwrap_or_else(|| "--".to_string());
 
-    let usage_summary =
-        usage.and_then(|snapshot| snapshot.project_usage_for_path(&project.display_path));
-    let expected_files = project.sessions.len();
-    let indexed_files = usage_summary
-        .map(|summary| summary.indexed_files)
-        .unwrap_or(0);
+    let mut usage_totals = (0i64, 0i64, 0i64, 0i64, 0usize);
+    let mut usage_paths = BTreeSet::new();
+    if let Some(snapshot) = usage {
+        for path in &project.checkouts {
+            let key = normalize_project_key(path);
+            if !usage_paths.insert(key) {
+                continue;
+            }
+            if let Some(summary) = snapshot.project_usage_for_path(path) {
+                usage_totals.0 = usage_totals.0.saturating_add(summary.total_tokens);
+                usage_totals.1 = usage_totals.1.saturating_add(summary.cached_input_tokens);
+                usage_totals.2 = usage_totals.2.saturating_add(summary.agent_time_ms);
+                usage_totals.3 = usage_totals.3.saturating_add(summary.agent_runs);
+                usage_totals.4 = usage_totals.4.saturating_add(summary.indexed_files);
+            }
+        }
+    }
+    let expected_files = project.owner_session_count;
+    let indexed_files = usage_totals.4;
     let scan_complete = usage.is_some_and(|snapshot| snapshot.scan_pending_files == 0);
     let usage_ready =
-        usage_error.is_none() && usage_summary.is_some() && indexed_files >= expected_files;
-    let project_scan = if usage_error.is_some() {
+        usage_error.is_none() && expected_files > 0 && indexed_files >= expected_files;
+    let project_scan = if expected_files == 0 {
+        "NO OWNER DATA".to_string()
+    } else if usage_error.is_some() {
         "ERROR".to_string()
     } else if usage_ready {
         "READY".to_string()
@@ -642,40 +1091,62 @@ fn render_project_detail(
     };
 
     let (consumed_tokens, activity) = if usage_ready {
-        let summary = usage_summary.expect("usage summary checked above");
-        let non_cached = summary
-            .total_tokens
-            .saturating_sub(summary.cached_input_tokens)
-            .max(0);
+        let non_cached = usage_totals.0.saturating_sub(usage_totals.1).max(0);
         (
             format!(
                 "{} total / {} non-cached",
-                format_project_count(summary.total_tokens, formatter),
+                format_project_count(usage_totals.0, formatter),
                 format_project_count(non_cached, formatter)
             ),
             format!(
                 "{} runs / {}",
-                formatter.format_count(summary.agent_runs),
-                format_duration(summary.agent_time_ms)
+                formatter.format_count(usage_totals.3),
+                format_duration(usage_totals.2)
             ),
         )
     } else {
         ("--".to_string(), "--".to_string())
     };
+    let discovery_label = if project.missing {
+        "MISSING".to_string()
+    } else if project.source_flags & crate::read::catalog::SOURCE_OWNER != 0 {
+        format!("OWNER | confidence {}", project.confidence)
+    } else if project.confidence >= 70 {
+        format!("STRONG | confidence {}", project.confidence)
+    } else {
+        format!("LOW | confidence {}", project.confidence)
+    };
 
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("PATH", Style::default().fg(Color::Gray)),
+            Span::styled("PROJECT", Style::default().fg(Color::Gray)),
             Span::raw("  "),
             Span::styled(
-                project.display_path.clone(),
+                project.logical_name.clone(),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
-            Span::styled("SESSIONS", Style::default().fg(Color::Gray)),
+            Span::styled("OWNER_SESSIONS", Style::default().fg(Color::Gray)),
             Span::raw("  "),
-            Span::raw(formatter.format_usize(project.sessions.len())),
+            Span::raw(formatter.format_usize(project.owner_session_count)),
+        ]),
+        Line::from(vec![
+            Span::styled("RELATED_SESSIONS", Style::default().fg(Color::Gray)),
+            Span::raw("  "),
+            Span::raw(
+                formatter.format_usize(
+                    project
+                        .sessions
+                        .len()
+                        .saturating_sub(project.owner_session_count),
+                ),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("DISCOVERY", Style::default().fg(Color::Gray)),
+            Span::raw("  "),
+            Span::raw(discovery_label),
         ]),
         Line::from(vec![
             Span::styled("LATEST", Style::default().fg(Color::Gray)),
@@ -703,12 +1174,26 @@ fn render_project_detail(
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            "RECENT",
+            "CHECKOUTS",
             Style::default()
                 .fg(Color::Gray)
                 .add_modifier(Modifier::BOLD),
         )),
     ];
+
+    for checkout in &project.checkouts {
+        lines.push(Line::from(format!("- {checkout}")));
+    }
+
+    lines.extend([
+        Line::from(""),
+        Line::from(Span::styled(
+            "RECENT",
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ]);
 
     for session in project.sessions.iter().take(10) {
         lines.push(Line::from(format!(
@@ -903,7 +1388,7 @@ fn render_footer(
 ) {
     let base = match state.view {
         ViewMode::Projects => {
-            "Projects: up/down or wheel, double-click/enter open, s/F2 switch, r/F5 rescan, q quit"
+            "Projects: [p] mode, [+/-] depth, [space] select in FULL, wheel, double-click/enter open, r/F5 rescan"
         }
         ViewMode::Sessions => {
             "Sessions: up/down or wheel, double-click .. / backspace / left / esc back, q quit"
@@ -915,11 +1400,60 @@ fn render_footer(
         .map(|text| truncate_single_line(text, 100))
         .unwrap_or_default();
     let style = format!("style [n]: {}", formatter.style_label());
-    let line = if error.is_empty() {
+    let catalog_status = if let Some(progress) = &state.scan_progress {
+        let phase = match progress.phase {
+            CatalogScanPhase::Repositories => "REPO_SCAN",
+            CatalogScanPhase::Sessions => "PROJECT_SCAN",
+            CatalogScanPhase::Saving => "CATALOG_SAVE",
+        };
+        if progress.total > 0 {
+            format!(
+                "{phase} {}/{} ({} projects)",
+                progress.completed, progress.total, progress.projects
+            )
+        } else {
+            format!(
+                "{phase} {} dirs ({} projects)",
+                progress.completed, progress.projects
+            )
+        }
+    } else if let Some(scan_error) = &state.scan_error {
+        format!(
+            "PROJECT_SCAN ERROR: {}",
+            truncate_single_line(scan_error, 80)
+        )
+    } else if state.discovery.as_ref().is_some_and(|snapshot| {
+        snapshot.sessions_total > 0 && snapshot.sessions_scanned < snapshot.sessions_total
+    }) {
+        let snapshot = state.discovery.as_ref().expect("snapshot checked above");
+        format!(
+            "PROJECT_INDEX {}/{}",
+            snapshot.sessions_scanned, snapshot.sessions_total
+        )
+    } else if state
+        .discovery
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.truncated)
+    {
+        "FULL SCAN REACHED DIRECTORY LIMIT".to_string()
+    } else if state.project_mode == ProjectViewMode::Deep {
+        format!("DEEP depth {}", state.deep_depth)
+    } else {
+        String::new()
+    };
+    let line = if error.is_empty() && catalog_status.is_empty() {
         Line::from(vec![
             Span::styled(base, Style::default().fg(Color::Gray)),
             Span::raw("  "),
             Span::styled(style, Style::default().fg(Color::Gray)),
+        ])
+    } else if !error.is_empty() {
+        Line::from(vec![
+            Span::styled(base, Style::default().fg(Color::Gray)),
+            Span::raw("  "),
+            Span::styled(style, Style::default().fg(Color::Gray)),
+            Span::raw("  "),
+            Span::styled(error, Style::default().fg(Color::Red)),
         ])
     } else {
         Line::from(vec![
@@ -927,7 +1461,7 @@ fn render_footer(
             Span::raw("  "),
             Span::styled(style, Style::default().fg(Color::Gray)),
             Span::raw("  "),
-            Span::styled(error, Style::default().fg(Color::Red)),
+            Span::styled(catalog_status, Style::default().fg(Color::Cyan)),
         ])
     };
     frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), area);
@@ -960,13 +1494,53 @@ fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        header_line_area, history_style_controls_area, BrowserClickTarget, BrowserState,
-        DOUBLE_CLICK_WINDOW,
+        build_discovery_catalog, header_line_area, history_depth_controls_area,
+        history_style_controls_area, BrowserClickTarget, BrowserState, DOUBLE_CLICK_WINDOW,
     };
-    use crate::read::scan::Catalog;
+    use crate::read::catalog::{
+        CatalogSnapshot, ProjectCheckout, ProjectViewMode, SessionProjectLink, SOURCE_REPOSITORY,
+        SOURCE_WORKDIR,
+    };
+    use crate::read::scan::{Catalog, ProjectRecord, SessionSummary};
     use ratatui::layout::Rect;
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    fn session(path: &str, cwd: &str) -> SessionSummary {
+        SessionSummary {
+            file_path: PathBuf::from(path),
+            session_id: path.to_string(),
+            cwd: cwd.to_string(),
+            title: path.to_string(),
+            started_at_raw: None,
+            started_at_label: "--".to_string(),
+            started_at_sort_key_ms: 0,
+            git_branch: None,
+            git_commit: None,
+            repo_url: None,
+            model_provider: None,
+            model: None,
+        }
+    }
+
+    fn strict_project(path: &str, session: SessionSummary) -> ProjectRecord {
+        ProjectRecord {
+            stable_id: format!("path:{path}"),
+            logical_name: PathBuf::from(path)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or(path)
+                .to_string(),
+            display_path: path.to_string(),
+            checkouts: vec![path.to_string()],
+            sessions: vec![session],
+            owner_session_count: 1,
+            confidence: 100,
+            source_flags: crate::read::catalog::SOURCE_OWNER,
+            missing: false,
+        }
+    }
 
     #[test]
     fn header_line_has_one_blank_row_above_and_below() {
@@ -980,7 +1554,11 @@ mod tests {
     fn history_style_controls_use_right_side_of_header_line() {
         assert_eq!(
             history_style_controls_area(Rect::new(2, 1, 100, 3)),
-            Rect::new(72, 2, 30, 1)
+            Rect::new(34, 2, 68, 1)
+        );
+        assert_eq!(
+            history_depth_controls_area(Rect::new(2, 1, 100, 3)),
+            Rect::new(52, 3, 16, 1)
         );
         assert_eq!(
             history_style_controls_area(Rect::new(2, 1, 20, 3)),
@@ -1004,5 +1582,104 @@ mod tests {
             BrowserClickTarget::Parent,
             now + DOUBLE_CLICK_WINDOW + Duration::from_millis(1)
         ));
+    }
+
+    #[test]
+    fn discovery_modes_preserve_exactly_one_owner_per_strict_session() {
+        let strict = Catalog {
+            sessions_dir: PathBuf::from("/sessions"),
+            projects: vec![
+                strict_project("/repo/a", session("/sessions/a.jsonl", "/repo/a")),
+                strict_project("/launcher", session("/sessions/b.jsonl", "/launcher")),
+            ],
+            files_scanned: 2,
+            files_skipped: 0,
+        };
+        let snapshot = CatalogSnapshot {
+            checkouts: vec![ProjectCheckout {
+                stable_id: "remote:example.com/team/a".to_string(),
+                checkout_key: "/repo/a".to_string(),
+                display_path: "/repo/a".to_string(),
+                remote_key: Some("example.com/team/a".to_string()),
+                logical_name: "team/a".to_string(),
+                discovery_depth: 1,
+                source_flags: SOURCE_REPOSITORY | SOURCE_WORKDIR,
+                confidence: 80,
+                deep_eligible: true,
+                first_seen: 1,
+                last_seen: 1,
+                missing: false,
+            }],
+            links: vec![SessionProjectLink {
+                session_path: "/sessions/b.jsonl".to_string(),
+                checkout_key: "/repo/a".to_string(),
+                evidence_mask: SOURCE_WORKDIR,
+                evidence_count: 1,
+                confidence: 80,
+            }],
+            ..CatalogSnapshot::default()
+        };
+        for mode in [ProjectViewMode::Deep, ProjectViewMode::Full] {
+            let catalog =
+                build_discovery_catalog(&strict, Some(&snapshot), mode, 2, &BTreeSet::new());
+            assert_eq!(
+                catalog
+                    .projects
+                    .iter()
+                    .map(|project| project.owner_session_count)
+                    .sum::<usize>(),
+                2
+            );
+            let logical = catalog
+                .projects
+                .iter()
+                .find(|project| project.stable_id == "remote:example.com/team/a")
+                .expect("logical project");
+            assert_eq!(logical.owner_session_count, 1);
+            assert_eq!(logical.sessions.len(), 2);
+        }
+    }
+
+    #[test]
+    fn custom_selection_respects_explicit_remote_exclusion() {
+        let strict = Catalog {
+            sessions_dir: PathBuf::from("/sessions"),
+            projects: vec![strict_project(
+                "/repo/a",
+                session("/sessions/a.jsonl", "/repo/a"),
+            )],
+            files_scanned: 1,
+            files_skipped: 0,
+        };
+        let snapshot = CatalogSnapshot {
+            checkouts: vec![ProjectCheckout {
+                stable_id: "remote:example.com/team/a".to_string(),
+                checkout_key: "/repo/a".to_string(),
+                display_path: "/repo/a".to_string(),
+                remote_key: Some("example.com/team/a".to_string()),
+                logical_name: "team/a".to_string(),
+                discovery_depth: 1,
+                source_flags: SOURCE_REPOSITORY | SOURCE_WORKDIR,
+                confidence: 80,
+                deep_eligible: true,
+                first_seen: 1,
+                last_seen: 1,
+                missing: false,
+            }],
+            ..CatalogSnapshot::default()
+        };
+        let mut browser = BrowserState::new(strict.clone());
+        browser.restore_project_state(
+            ProjectViewMode::Custom,
+            2,
+            BTreeSet::new(),
+            BTreeSet::from(["remote:example.com/team/a".to_string()]),
+            BTreeSet::new(),
+        );
+        browser.apply_catalog_snapshot(strict, snapshot);
+        assert!(browser.catalog.projects.is_empty());
+        assert!(!browser
+            .selected_projects
+            .contains("remote:example.com/team/a"));
     }
 }

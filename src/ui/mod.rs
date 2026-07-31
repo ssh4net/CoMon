@@ -1,6 +1,6 @@
 use crate::app::{
-    ActiveScreen, ApiStatGraph, ApiStatGrouping, AppState, ChartOrientation, UiClickAction,
-    UiHitTarget,
+    AccentTheme, ActiveScreen, ApiStatGraph, ApiStatGrouping, AppState, ChartOrientation,
+    UiClickAction, UiHitTarget,
 };
 use crate::locale::{DisplayFormatter, DisplayStyle};
 use crate::usage::{
@@ -35,14 +35,9 @@ const WEEKLY_PACE_ORANGE_BG: Color = Color::Rgb(160, 80, 0);
 const ACTIVITY_PROJECT_HEIGHT: u16 = 9;
 const ACTIVITY_PROJECT_STRIDE: u16 = 10;
 const ACTIVITY_WEEKDAY_LABEL_WIDTH: u16 = 4;
-const ACTIVITY_COLORS: [Color; 4] = [
-    Color::Indexed(23),
-    Color::Indexed(30),
-    Color::Indexed(37),
-    Color::Cyan,
-];
-const DARK_BAR_COLOR: Color = Color::Cyan;
-const LIGHT_BAR_COLOR: Color = Color::LightCyan;
+const ACTIVITY_BASE_COLORS: [Color; 3] =
+    [Color::Indexed(23), Color::Indexed(30), Color::Indexed(37)];
+const ACTIVITY_COLOR_LEVELS: usize = ACTIVITY_BASE_COLORS.len() + 1;
 const USAGE_HEADER_HEIGHT: u16 = 3;
 
 pub fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
@@ -182,6 +177,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
         ActiveScreen::Read => {
             let system_locale = state.system_locale.clone();
             let formatter = DisplayFormatter::new(state.display_style, &system_locale);
+            let (accent_color, _) = state.accent_colors();
             crate::read::tui::render(
                 frame,
                 inner,
@@ -189,6 +185,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
                 state.usage.as_ref(),
                 state.usage_error.as_deref(),
                 formatter,
+                accent_color,
             );
             render_history_style_controls(frame, inner, state);
         }
@@ -509,8 +506,9 @@ fn render_api_stat_controls(
             Some(UiClickAction::SetApiStatGrouping(ApiStatGrouping::Month)),
         ),
     ];
-    let mut spans = vec![control_group_label("VIEW"), bars, heat];
-    spans.push(control_group_label("GRAPH"));
+    let accent_color = state.accent_colors().0;
+    let mut spans = vec![control_group_label("VIEW", accent_color), bars, heat];
+    spans.push(control_group_label("GRAPH", accent_color));
     spans.extend([day, week, month]);
     if state.api_stat_graph == ApiStatGraph::Bars {
         segments.extend([
@@ -528,7 +526,7 @@ fn render_api_stat_controls(
                 )),
             ),
         ]);
-        spans.push(control_group_label("BARS"));
+        spans.push(control_group_label("BARS", accent_color));
         spans.extend([vert, horz]);
     }
     segments.extend([
@@ -548,9 +546,9 @@ fn render_api_stat_controls(
             Some(UiClickAction::SetDisplayStyle(DisplayStyle::SystemFull)),
         ),
     ]);
-    spans.push(control_group_label("ZONE"));
+    spans.push(control_group_label("ZONE", accent_color));
     spans.push(pill("UTC", true));
-    spans.push(control_group_label("STYLE"));
+    spans.push(control_group_label("STYLE", accent_color));
     spans.extend([classic, system_compact, system_full]);
 
     register_right_aligned_targets(state, chunks[0], &segments);
@@ -560,7 +558,7 @@ fn render_api_stat_controls(
     );
 
     if let Some(text) = reset_summary {
-        render_reset_summary(frame, chunks[1], text);
+        render_reset_summary(frame, chunks[1], text, state.accent_colors().0);
     }
 }
 
@@ -1298,6 +1296,7 @@ fn render_api_grouped_vertical_bars(
     if area.width < 3 || area.height < 3 {
         return;
     }
+    let (accent_color, accent_bright_color) = state.accent_colors();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(2), Constraint::Length(1)])
@@ -1336,9 +1335,9 @@ fn render_api_grouped_vertical_bars(
         }
         let width = bar_width.min(right.saturating_sub(x));
         let color = if index % 2 == 0 {
-            DARK_BAR_COLOR
+            accent_color
         } else {
-            LIGHT_BAR_COLOR
+            accent_bright_color
         };
         let filled = ((bars_area.height as f64)
             * (point.tokens as f64 / max_value as f64).clamp(0.0, 1.0))
@@ -1402,6 +1401,7 @@ fn render_api_grouped_horizontal_bars(
     if area.width < 18 || area.height == 0 {
         return;
     }
+    let (accent_color, accent_bright_color) = state.accent_colors();
     let row_height = horizontal_bar_height(points.len(), area.height);
     let max_value = points
         .iter()
@@ -1455,9 +1455,9 @@ fn render_api_grouped_horizontal_bars(
         let filled = ((bar_width as f64) * (point.tokens as f64 / max_value as f64).clamp(0.0, 1.0))
             .round() as u16;
         let color = if index % 2 == 0 {
-            DARK_BAR_COLOR
+            accent_color
         } else {
-            LIGHT_BAR_COLOR
+            accent_bright_color
         };
         for y in row_y..row_y.saturating_add(row_height).min(area.y + area.height) {
             for offset in 0..bar_width {
@@ -1594,6 +1594,7 @@ fn render_api_stat_heatmap(
     let visible_start = calendar_start + ChronoDuration::weeks(week_start as i64);
     let grid_x = inner.x.saturating_add(ACTIVITY_WEEKDAY_LABEL_WIDTH);
     let max_value = values.values().copied().max().unwrap_or(0);
+    let accent_color = state.accent_colors().0;
     let buf = frame.buffer_mut();
 
     let mut next_free_x = grid_x;
@@ -1642,7 +1643,7 @@ fn render_api_stat_heatmap(
             let tokens = values.get(&date).copied().unwrap_or(0);
             let level = api_stat_color_level(tokens, max_value);
             let x = grid_x.saturating_add((week as u16).saturating_mul(cell_width));
-            write_activity_cell(buf, x, y, cell_width, level);
+            write_activity_cell(buf, x, y, cell_width, level, accent_color);
         }
     }
 
@@ -1690,8 +1691,8 @@ fn api_stat_color_level(value: u64, max_value: u64) -> usize {
     if value == 0 || max_value == 0 {
         return 0;
     }
-    let level = ((value as f64 / max_value as f64) * ACTIVITY_COLORS.len() as f64).ceil() as usize;
-    level.clamp(1, ACTIVITY_COLORS.len())
+    let level = ((value as f64 / max_value as f64) * ACTIVITY_COLOR_LEVELS as f64).ceil() as usize;
+    level.clamp(1, ACTIVITY_COLOR_LEVELS)
 }
 
 fn render_api_daily_chart(
@@ -1726,6 +1727,7 @@ fn render_api_daily_chart(
         update_api_stat_viewport(state, area, buckets.len(), visible_capacity);
     let visible = &buckets[visible_start..visible_end];
     let formatter = state.formatter();
+    let (accent_color, accent_bright_color) = state.accent_colors();
     let count_label = if buckets.is_empty() {
         " NO DAILY DATA ".to_string()
     } else {
@@ -1818,9 +1820,9 @@ fn render_api_daily_chart(
         }
         let width = bar_width.min(right.saturating_sub(x));
         let fill_bg = if index % 2 == 0 {
-            DARK_BAR_COLOR
+            accent_color
         } else {
-            LIGHT_BAR_COLOR
+            accent_bright_color
         };
         let filled_height = ((bars_area.height as f64)
             * (bucket.tokens as f64 / max_value as f64).clamp(0.0, 1.0))
@@ -2056,7 +2058,7 @@ fn render_activity_controls(
     );
 
     if let Some(text) = reset_summary {
-        render_reset_summary(frame, chunks[1], text);
+        render_reset_summary(frame, chunks[1], text, state.accent_colors().0);
     }
 }
 
@@ -2092,9 +2094,10 @@ fn render_flat_activity_controls(
         ],
     );
 
-    let mut spans = vec![control_group_label("VIEW")];
+    let accent_color = state.accent_colors().0;
+    let mut spans = vec![control_group_label("VIEW", accent_color)];
     spans.extend(metric_pills);
-    spans.push(control_group_label("PROJECTS"));
+    spans.push(control_group_label("PROJECTS", accent_color));
     spans.extend(activity_project_control_spans(project_count));
     frame.render_widget(
         Paragraph::new(Line::from(spans)).alignment(Alignment::Right),
@@ -2246,6 +2249,7 @@ fn render_activity_heatmaps(frame: &mut Frame<'_>, area: Rect, state: &mut AppSt
         .min(snapshot.project_activity.len())
         .min(fit_by_height as usize);
 
+    let accent_color = state.accent_colors().0;
     let mut y = inner.y;
     for project in snapshot.project_activity.iter().take(visible_projects) {
         let slot = Rect {
@@ -2263,6 +2267,7 @@ fn render_activity_heatmaps(frame: &mut Frame<'_>, area: Rect, state: &mut AppSt
             snapshot.activity_first_weekday,
             state.formatter(),
             state.activity_week_offset,
+            accent_color,
         );
         y = y.saturating_add(ACTIVITY_PROJECT_STRIDE);
         if y >= inner.y.saturating_add(inner.height) {
@@ -2290,6 +2295,7 @@ fn render_project_activity_heatmap(
     first_weekday: Weekday,
     formatter: DisplayFormatter<'_>,
     week_offset_from_newest: usize,
+    accent_color: Color,
 ) {
     if area.height < ACTIVITY_PROJECT_HEIGHT || area.width <= ACTIVITY_WEEKDAY_LABEL_WIDTH {
         return;
@@ -2357,7 +2363,7 @@ fn render_project_activity_heatmap(
             let value = activity_day_value(day, metric);
             let level = activity_color_level(value, max_value);
             let x = grid_x.saturating_add((week as u16).saturating_mul(cell_width));
-            write_activity_cell(buf, x, y, cell_width, level);
+            write_activity_cell(buf, x, y, cell_width, level, accent_color);
         }
     }
 }
@@ -2505,8 +2511,8 @@ fn activity_color_level(value: i64, max_value: i64) -> usize {
     if value <= 0 || max_value <= 0 {
         return 0;
     }
-    let level = ((value as f64 / max_value as f64) * ACTIVITY_COLORS.len() as f64).ceil() as usize;
-    level.clamp(1, ACTIVITY_COLORS.len())
+    let level = ((value as f64 / max_value as f64) * ACTIVITY_COLOR_LEVELS as f64).ceil() as usize;
+    level.clamp(1, ACTIVITY_COLOR_LEVELS)
 }
 
 fn activity_day_cell_width(grid_width: u16, weeks_total: usize) -> u16 {
@@ -2562,9 +2568,13 @@ fn write_activity_cell(
     y: u16,
     width: u16,
     level: usize,
+    accent_color: Color,
 ) {
     let style = if level > 0 {
-        Style::default().bg(ACTIVITY_COLORS[level - 1])
+        Style::default().bg(ACTIVITY_BASE_COLORS
+            .get(level.saturating_sub(1))
+            .copied()
+            .unwrap_or(accent_color))
     } else {
         Style::default()
     };
@@ -2648,7 +2658,7 @@ fn render_usage_controls(
     );
 
     if let Some(text) = reset_summary {
-        render_reset_summary(frame, chunks[1], text);
+        render_reset_summary(frame, chunks[1], text, state.accent_colors().0);
     }
 }
 
@@ -2723,15 +2733,16 @@ fn render_flat_usage_controls(
         ],
     );
 
-    let mut spans = vec![control_group_label("VIEW")];
+    let accent_color = state.accent_colors().0;
+    let mut spans = vec![control_group_label("VIEW", accent_color)];
     spans.extend(pills[0..3].iter().cloned());
-    spans.push(control_group_label("GRAPH"));
+    spans.push(control_group_label("GRAPH", accent_color));
     spans.extend(pills[3..6].iter().cloned());
-    spans.push(control_group_label("BARS"));
+    spans.push(control_group_label("BARS", accent_color));
     spans.extend(pills[6..8].iter().cloned());
-    spans.push(control_group_label("ZONE"));
+    spans.push(control_group_label("ZONE", accent_color));
     spans.extend(pills[8..10].iter().cloned());
-    spans.push(control_group_label("STYLE"));
+    spans.push(control_group_label("STYLE", accent_color));
     spans.extend(pills[10..13].iter().cloned());
     frame.render_widget(
         Paragraph::new(Line::from(spans)).alignment(Alignment::Right),
@@ -2739,12 +2750,12 @@ fn render_flat_usage_controls(
     );
 }
 
-fn control_group_label(label: &'static str) -> Span<'static> {
+fn control_group_label(label: &'static str, accent_color: Color) -> Span<'static> {
     Span::styled(
         format!(" {label} "),
         Style::default()
             .fg(Color::Black)
-            .bg(DARK_BAR_COLOR)
+            .bg(accent_color)
             .add_modifier(Modifier::BOLD),
     )
 }
@@ -2795,13 +2806,13 @@ fn render_history_style_controls(frame: &mut Frame<'_>, area: Rect, state: &mut 
             ),
         ];
         let spans = vec![
-            control_group_label("PROJECTS"),
+            control_group_label("PROJECTS", state.accent_colors().0),
             pill("STRICT", mode == ProjectViewMode::Strict),
             pill("DEEP ", mode == ProjectViewMode::Deep),
             pill("FULL", mode == ProjectViewMode::Full),
             pill("CUSTOM", mode == ProjectViewMode::Custom),
             Span::raw(" "),
-            control_group_label("STYLE"),
+            control_group_label("STYLE", state.accent_colors().0),
             pill("CLASS", state.display_style == DisplayStyle::Classic),
             pill("SCOMP", state.display_style == DisplayStyle::SystemCompact),
             pill("SFULL", state.display_style == DisplayStyle::SystemFull),
@@ -2824,7 +2835,7 @@ fn render_history_style_controls(frame: &mut Frame<'_>, area: Rect, state: &mut 
                 (" + ", Some(UiClickAction::IncreaseHistoryDepth)),
             ];
             let depth_spans = vec![
-                control_group_label("DEPTH"),
+                control_group_label("DEPTH", state.accent_colors().0),
                 pill("-", false),
                 pill(&state.read_browser.deep_depth().to_string(), true),
                 pill("+", false),
@@ -2853,7 +2864,7 @@ fn render_history_style_controls(frame: &mut Frame<'_>, area: Rect, state: &mut 
         ];
         let spans = vec![
             Span::raw("  "),
-            control_group_label("STYLE"),
+            control_group_label("STYLE", state.accent_colors().0),
             pill("CLASS", state.display_style == DisplayStyle::Classic),
             pill("SCOMP", state.display_style == DisplayStyle::SystemCompact),
             pill("SFULL", state.display_style == DisplayStyle::SystemFull),
@@ -3969,6 +3980,7 @@ fn format_usage_period_tooltip(
 
 fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     // Note: We draw bars manually to control label placement and padding.
+    let (accent_color, accent_bright_color) = state.accent_colors();
     let range_label = match state.range {
         ChartRange::Day => "Usage by day",
         ChartRange::Week => "Usage by ISO week",
@@ -4183,9 +4195,9 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
                 }
 
                 let fill_bg = if i % 2 == 0 {
-                    DARK_BAR_COLOR
+                    accent_color
                 } else {
-                    LIGHT_BAR_COLOR
+                    accent_bright_color
                 };
 
                 let ratio = (*value as f64) / (max_value as f64);
@@ -4438,9 +4450,9 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
                 let ratio = (*value as f64) / (max_value as f64);
                 let filled = ((bar_area.width as f64) * ratio.clamp(0.0, 1.0)).round() as u16;
                 let fill_bg = if idx % 2 == 0 {
-                    DARK_BAR_COLOR
+                    accent_color
                 } else {
-                    LIGHT_BAR_COLOR
+                    accent_bright_color
                 };
                 for yy in bar_area.y..bar_area.y.saturating_add(bar_area.height) {
                     for xx in bar_area.x..bar_area.x.saturating_add(bar_area.width) {
@@ -4653,16 +4665,7 @@ fn render_hover_tooltip_with_horizontal_padding(
 
 #[cfg(test)]
 fn chart_tooltip_rect(bounds: Rect, mouse: (u16, u16), content_width: u16) -> Option<Rect> {
-    hover_tooltip_rect(bounds, mouse, content_width, 1)
-}
-
-fn hover_tooltip_rect(
-    bounds: Rect,
-    mouse: (u16, u16),
-    content_width: u16,
-    content_height: u16,
-) -> Option<Rect> {
-    hover_tooltip_rect_with_horizontal_padding(bounds, mouse, content_width, content_height, 0)
+    hover_tooltip_rect_with_horizontal_padding(bounds, mouse, content_width, 1, 0)
 }
 
 fn hover_tooltip_rect_with_horizontal_padding(
@@ -4855,7 +4858,7 @@ fn format_minutes_hhmm(total_minutes: u64) -> String {
     format!("{:02}:{:02}", hours, minutes)
 }
 
-fn render_top_models(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+fn render_top_models(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     let formatter = state.formatter();
     let snapshot = state
         .usage
@@ -4894,7 +4897,46 @@ fn render_top_models(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             ));
         }
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    let swatch_width = 2u16;
+    let selector_width = u16::try_from(AccentTheme::ALL.len())
+        .unwrap_or(u16::MAX)
+        .saturating_mul(swatch_width);
+    let selector_visible = area.width > selector_width;
+    let models_area = Rect {
+        width: area.width.saturating_sub(if selector_visible {
+            selector_width.saturating_add(1)
+        } else {
+            0
+        }),
+        ..area
+    };
+    frame.render_widget(Paragraph::new(Line::from(spans)), models_area);
+
+    if selector_visible {
+        let selector_area = Rect::new(
+            area.x
+                .saturating_add(area.width)
+                .saturating_sub(selector_width),
+            area.y,
+            selector_width,
+            1,
+        );
+        let mut swatches = Vec::with_capacity(AccentTheme::ALL.len().saturating_mul(2));
+        for (index, theme) in AccentTheme::ALL.iter().copied().enumerate() {
+            let swatch_x = selector_area
+                .x
+                .saturating_add((index as u16).saturating_mul(swatch_width));
+            let swatch_area = Rect::new(swatch_x, selector_area.y, swatch_width, 1);
+            let (accent_color, accent_bright_color) = theme.colors();
+            state.ui_hit_targets.push(UiHitTarget {
+                area: swatch_area,
+                action: UiClickAction::SetAccentTheme(theme),
+            });
+            swatches.push(Span::styled(" ", Style::default().bg(accent_color)));
+            swatches.push(Span::styled(" ", Style::default().bg(accent_bright_color)));
+        }
+        frame.render_widget(Paragraph::new(Line::from(swatches)), selector_area);
+    }
 }
 
 fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) {
@@ -5541,10 +5583,10 @@ fn activity_controls_height(summary: Option<&str>, width: u16) -> u16 {
     1_u16.saturating_add(reset_summary_height(summary, width))
 }
 
-fn render_reset_summary(frame: &mut Frame<'_>, area: Rect, text: &str) {
+fn render_reset_summary(frame: &mut Frame<'_>, area: Rect, text: &str, accent_color: Color) {
     let line = Line::from(vec![
         Span::styled(" LIMIT RESETS ", Style::default().fg(Color::Gray)),
-        Span::styled(text.to_string(), Style::default().fg(Color::Cyan)),
+        Span::styled(text.to_string(), Style::default().fg(accent_color)),
     ]);
     frame.render_widget(
         Paragraph::new(Text::from(vec![line, Line::from("")])).wrap(Wrap { trim: true }),
@@ -5561,7 +5603,7 @@ fn render_limit_resets(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         .split(area);
 
     if let Some(text) = summary.as_deref() {
-        render_reset_summary(frame, chunks[0], text);
+        render_reset_summary(frame, chunks[0], text, state.accent_colors().0);
     }
     render_limit_reset_details(frame, chunks[1], state);
 }
@@ -5619,7 +5661,9 @@ fn render_limit_reset_details(frame: &mut Frame<'_>, area: Rect, state: &AppStat
                     "No reset credits are currently available.",
                     Style::default().fg(Color::Gray),
                 ))),
-                Some(credits) => reset_credit_details_text(credits, state.formatter()),
+                Some(credits) => {
+                    reset_credit_details_text(credits, state.formatter(), state.accent_colors().0)
+                }
             },
         }
     };
@@ -5636,6 +5680,7 @@ fn render_limit_reset_details(frame: &mut Frame<'_>, area: Rect, state: &AppStat
 fn reset_credit_details_text(
     credits: &[crate::codex_rpc::RateLimitResetCredit],
     formatter: DisplayFormatter<'_>,
+    accent_color: Color,
 ) -> Text<'static> {
     let mut lines = Vec::with_capacity(credits.len().saturating_mul(4));
     for (index, credit) in credits.iter().enumerate() {
@@ -5675,7 +5720,7 @@ fn reset_credit_details_text(
         }
         lines.push(Line::from(Span::styled(
             metadata,
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(accent_color),
         )));
 
         if let Some(description) = credit
@@ -6855,10 +6900,10 @@ mod tests {
     }
 
     #[test]
-    fn control_group_labels_include_cyan_side_spaces() {
-        let label = control_group_label("VIEW");
+    fn control_group_labels_use_the_selected_accent_color() {
+        let label = control_group_label("VIEW", Color::Magenta);
         assert_eq!(label.content.as_ref(), " VIEW ");
-        assert_eq!(label.style.bg, Some(DARK_BAR_COLOR));
+        assert_eq!(label.style.bg, Some(Color::Magenta));
         assert_eq!(label.style.fg, Some(Color::Black));
     }
 

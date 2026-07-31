@@ -6,6 +6,7 @@ use anyhow::{anyhow, Context, Result};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
+use ratatui::style::Color;
 use ratatui::Terminal;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -74,6 +75,42 @@ pub(crate) enum ApiStatGraph {
     Heat,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum AccentTheme {
+    #[default]
+    Cyan,
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Gray,
+}
+
+impl AccentTheme {
+    pub(crate) const ALL: [Self; 7] = [
+        Self::Cyan,
+        Self::Red,
+        Self::Green,
+        Self::Yellow,
+        Self::Blue,
+        Self::Magenta,
+        Self::Gray,
+    ];
+
+    pub(crate) fn colors(self) -> (Color, Color) {
+        match self {
+            Self::Cyan => (Color::Cyan, Color::LightCyan),
+            Self::Red => (Color::Red, Color::LightRed),
+            Self::Green => (Color::Green, Color::LightGreen),
+            Self::Yellow => (Color::Yellow, Color::LightYellow),
+            Self::Blue => (Color::Blue, Color::LightBlue),
+            Self::Magenta => (Color::Magenta, Color::LightMagenta),
+            Self::Gray => (Color::Gray, Color::White),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum UsageCommand {
     RefreshAll,
@@ -122,6 +159,7 @@ pub(crate) enum ActiveScreen {
 pub(crate) enum UiClickAction {
     SetScreen(ActiveScreen),
     SetDisplayStyle(DisplayStyle),
+    SetAccentTheme(AccentTheme),
     SetHistoryProjectMode(crate::read::catalog::ProjectViewMode),
     ConfirmHistoryCatalogScan,
     CancelHistoryCatalogScan,
@@ -270,6 +308,7 @@ pub(crate) struct AppState {
     pub(crate) history_catalog_config_path: PathBuf,
     pub(crate) history_catalog_scan_prompt: bool,
     pub(crate) display_style: DisplayStyle,
+    pub(crate) accent_theme: AccentTheme,
     pub(crate) system_locale: SystemLocale,
     pub(crate) mouse_position: Option<(u16, u16)>,
     pub(crate) ui_hit_targets: Vec<UiHitTarget>,
@@ -863,6 +902,7 @@ async fn run_inner(
         history_catalog_config_path: config.comon_home.join("config.json"),
         history_catalog_scan_prompt: false,
         display_style: restored_ui_state.display_style,
+        accent_theme: AccentTheme::default(),
         system_locale: config.system_locale.clone(),
         mouse_position: None,
         ui_hit_targets: Vec::new(),
@@ -1370,6 +1410,11 @@ fn apply_ui_click_action(state: &mut AppState, action: UiClickAction) -> bool {
         UiClickAction::SetDisplayStyle(style) => {
             let changed = state.display_style != style;
             state.display_style = style;
+            changed
+        }
+        UiClickAction::SetAccentTheme(theme) => {
+            let changed = state.accent_theme != theme;
+            state.accent_theme = theme;
             changed
         }
         UiClickAction::SetHistoryProjectMode(mode) => state.read_browser.set_project_mode(mode),
@@ -2307,6 +2352,10 @@ impl AppState {
         DisplayFormatter::new(self.display_style, &self.system_locale)
     }
 
+    pub(crate) fn accent_colors(&self) -> (Color, Color) {
+        self.accent_theme.colors()
+    }
+
     pub(crate) fn usage_updated_label(&self) -> Option<String> {
         let updated_at = self.usage_updated_at?;
         Some(crate::ui::format_updated_label(updated_at))
@@ -2329,6 +2378,25 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn accent_theme_exposes_requested_normal_and_bright_pairs() {
+        let expected = [
+            (AccentTheme::Cyan, Color::Cyan, Color::LightCyan),
+            (AccentTheme::Red, Color::Red, Color::LightRed),
+            (AccentTheme::Green, Color::Green, Color::LightGreen),
+            (AccentTheme::Yellow, Color::Yellow, Color::LightYellow),
+            (AccentTheme::Blue, Color::Blue, Color::LightBlue),
+            (AccentTheme::Magenta, Color::Magenta, Color::LightMagenta),
+            (AccentTheme::Gray, Color::Gray, Color::White),
+        ];
+
+        assert_eq!(AccentTheme::ALL.len(), expected.len());
+        for (index, (theme, accent, accent_bright)) in expected.iter().enumerate() {
+            assert_eq!(AccentTheme::ALL[index], *theme);
+            assert_eq!(theme.colors(), (*accent, *accent_bright));
+        }
+    }
 
     #[test]
     fn ui_hit_targets_include_left_top_and_exclude_right_bottom_edges() {

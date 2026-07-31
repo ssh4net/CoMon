@@ -807,6 +807,7 @@ pub(crate) fn render(
     usage: Option<&LocalUsageSnapshot>,
     usage_error: Option<&str>,
     formatter: DisplayFormatter<'_>,
+    accent_color: Color,
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -819,12 +820,20 @@ pub(crate) fn render(
 
     render_header(frame, chunks[0], state, formatter);
     state.layout = match state.view {
-        ViewMode::Projects => {
-            render_projects_view(frame, chunks[1], state, usage, usage_error, formatter)
+        ViewMode::Projects => render_projects_view(
+            frame,
+            chunks[1],
+            state,
+            usage,
+            usage_error,
+            formatter,
+            accent_color,
+        ),
+        ViewMode::Sessions => {
+            render_sessions_view(frame, chunks[1], state, formatter, accent_color)
         }
-        ViewMode::Sessions => render_sessions_view(frame, chunks[1], state, formatter),
     };
-    render_footer(frame, chunks[2], state, formatter);
+    render_footer(frame, chunks[2], state, formatter, accent_color);
 }
 
 fn render_header(
@@ -932,6 +941,7 @@ fn render_projects_view(
     usage: Option<&LocalUsageSnapshot>,
     usage_error: Option<&str>,
     formatter: DisplayFormatter<'_>,
+    accent_color: Color,
 ) -> UiLayout {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
@@ -978,12 +988,15 @@ fn render_projects_view(
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Projects ")
-                .border_style(active_border(state.view == ViewMode::Projects)),
+                .border_style(active_border(
+                    state.view == ViewMode::Projects,
+                    accent_color,
+                )),
         )
         .highlight_style(
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Cyan)
+                .bg(accent_color)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol(">> ");
@@ -1052,6 +1065,7 @@ fn render_sessions_view(
     area: Rect,
     state: &mut BrowserState,
     formatter: DisplayFormatter<'_>,
+    accent_color: Color,
 ) -> UiLayout {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
@@ -1083,12 +1097,12 @@ fn render_sessions_view(
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Sessions ")
-                .border_style(active_border(true)),
+                .border_style(active_border(true, accent_color)),
         )
         .highlight_style(
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Cyan)
+                .bg(accent_color)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol(">> ");
@@ -1465,6 +1479,7 @@ fn render_footer(
     area: Rect,
     state: &BrowserState,
     formatter: DisplayFormatter<'_>,
+    accent_color: Color,
 ) {
     let base = match state.view {
         ViewMode::Projects => {
@@ -1550,15 +1565,15 @@ fn render_footer(
             Span::raw("  "),
             Span::styled(style, Style::default().fg(Color::Gray)),
             Span::raw("  "),
-            Span::styled(catalog_status, Style::default().fg(Color::Cyan)),
+            Span::styled(catalog_status, Style::default().fg(accent_color)),
         ])
     };
     frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), area);
 }
 
-fn active_border(active: bool) -> Style {
+fn active_border(active: bool, accent_color: Color) -> Style {
     if active {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(accent_color)
     } else {
         Style::default()
     }

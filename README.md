@@ -155,8 +155,9 @@ comon --scan-time-budget-ms 1500 --max-jsonl-line-kib 512
 - `f` Toggle layout (Horz/Vert)
 - `z` / `F6` Toggle Usage zone (Local/UTC); APISTAT always uses server UTC
 - `n` Cycle display formatting (Classic/System Compact/System Full)
+- `c` Cycle the temporary color theme
 - Mouse wheel or arrow keys Scroll chart history (`PgUp`/`PgDn`, `Home`/`End` also work)
-- Mouse: click the top tabs, Usage/Activity controls (including the Usage style selector), or the bottom-right Quit action
+- Mouse: click the top tabs, Usage/Activity controls (including the Usage style selector), `#` bar-fill mode, color swatches, or the bottom-right Quit action
 - Mouse: hover a filled vertical chart bar to see its exact date and full locale-aware value
 - `s` / `F2` Switch between Usage and Session history
 - `r` / `F5` Refresh current screen

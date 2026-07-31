@@ -109,6 +109,34 @@ impl AccentTheme {
             Self::Gray => (Color::Gray, Color::White),
         }
     }
+
+    pub(crate) fn cycled(self) -> Self {
+        match self {
+            Self::Cyan => Self::Red,
+            Self::Red => Self::Green,
+            Self::Green => Self::Yellow,
+            Self::Yellow => Self::Blue,
+            Self::Blue => Self::Magenta,
+            Self::Magenta => Self::Gray,
+            Self::Gray => Self::Cyan,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum BarFillMode {
+    #[default]
+    Semigraphic,
+    DualColorBackground,
+}
+
+impl BarFillMode {
+    pub(crate) fn toggled(self) -> Self {
+        match self {
+            Self::Semigraphic => Self::DualColorBackground,
+            Self::DualColorBackground => Self::Semigraphic,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -160,6 +188,7 @@ pub(crate) enum UiClickAction {
     SetScreen(ActiveScreen),
     SetDisplayStyle(DisplayStyle),
     SetAccentTheme(AccentTheme),
+    ToggleBarFillMode,
     SetHistoryProjectMode(crate::read::catalog::ProjectViewMode),
     ConfirmHistoryCatalogScan,
     CancelHistoryCatalogScan,
@@ -309,6 +338,7 @@ pub(crate) struct AppState {
     pub(crate) history_catalog_scan_prompt: bool,
     pub(crate) display_style: DisplayStyle,
     pub(crate) accent_theme: AccentTheme,
+    pub(crate) bar_fill_mode: BarFillMode,
     pub(crate) system_locale: SystemLocale,
     pub(crate) mouse_position: Option<(u16, u16)>,
     pub(crate) ui_hit_targets: Vec<UiHitTarget>,
@@ -903,6 +933,7 @@ async fn run_inner(
         history_catalog_scan_prompt: false,
         display_style: restored_ui_state.display_style,
         accent_theme: AccentTheme::default(),
+        bar_fill_mode: BarFillMode::default(),
         system_locale: config.system_locale.clone(),
         mouse_position: None,
         ui_hit_targets: Vec::new(),
@@ -1298,6 +1329,10 @@ fn handle_input_event(
                 state.display_style = state.display_style.toggled();
                 return Ok(InputOutcome::Continue(true));
             }
+            (KeyCode::Char('c'), _) | (KeyCode::Char('C'), _) => {
+                state.accent_theme = state.accent_theme.cycled();
+                return Ok(InputOutcome::Continue(true));
+            }
             (KeyCode::Char('r'), _) | (KeyCode::F(5), _)
                 if state.active_screen == ActiveScreen::Read =>
             {
@@ -1416,6 +1451,10 @@ fn apply_ui_click_action(state: &mut AppState, action: UiClickAction) -> bool {
             let changed = state.accent_theme != theme;
             state.accent_theme = theme;
             changed
+        }
+        UiClickAction::ToggleBarFillMode => {
+            state.bar_fill_mode = state.bar_fill_mode.toggled();
+            true
         }
         UiClickAction::SetHistoryProjectMode(mode) => state.read_browser.set_project_mode(mode),
         UiClickAction::ConfirmHistoryCatalogScan | UiClickAction::CancelHistoryCatalogScan => false,
@@ -2396,6 +2435,28 @@ mod tests {
             assert_eq!(AccentTheme::ALL[index], *theme);
             assert_eq!(theme.colors(), (*accent, *accent_bright));
         }
+    }
+
+    #[test]
+    fn accent_theme_cycles_through_every_available_theme() {
+        let mut theme = AccentTheme::Cyan;
+        for expected in AccentTheme::ALL.iter().copied().skip(1) {
+            theme = theme.cycled();
+            assert_eq!(theme, expected);
+        }
+        assert_eq!(theme.cycled(), AccentTheme::Cyan);
+    }
+
+    #[test]
+    fn bar_fill_mode_toggles_between_semigraphic_and_background() {
+        assert_eq!(
+            BarFillMode::Semigraphic.toggled(),
+            BarFillMode::DualColorBackground
+        );
+        assert_eq!(
+            BarFillMode::DualColorBackground.toggled(),
+            BarFillMode::Semigraphic
+        );
     }
 
     #[test]

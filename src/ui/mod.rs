@@ -1,6 +1,6 @@
 use crate::app::{
-    AccentTheme, ActiveScreen, ApiStatGraph, ApiStatGrouping, AppState, ChartOrientation,
-    UiClickAction, UiHitTarget,
+    AccentTheme, ActiveScreen, ApiStatGraph, ApiStatGrouping, AppState, BarFillMode,
+    ChartOrientation, UiClickAction, UiHitTarget,
 };
 use crate::locale::{DisplayFormatter, DisplayStyle};
 use crate::usage::{
@@ -49,23 +49,43 @@ struct BarFill {
     value_style: Style,
 }
 
-fn alternating_bar_fill(index: usize, accent_color: Color, accent_bright_color: Color) -> BarFill {
-    if index.is_multiple_of(2) {
-        BarFill {
+fn alternating_bar_fill(
+    index: usize,
+    accent_color: Color,
+    accent_bright_color: Color,
+    mode: BarFillMode,
+) -> BarFill {
+    match (mode, index.is_multiple_of(2)) {
+        (BarFillMode::Semigraphic, true) => BarFill {
             glyph: TEXTURED_BAR_GLYPH,
             cell_style: Style::default().fg(accent_color),
             value_style: Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
-        }
-    } else {
-        BarFill {
+        },
+        (BarFillMode::Semigraphic, false) => BarFill {
             glyph: SOLID_BAR_GLYPH,
             cell_style: Style::default().fg(accent_bright_color),
             value_style: Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
-        }
+        },
+        (BarFillMode::DualColorBackground, true) => BarFill {
+            glyph: ' ',
+            cell_style: Style::default().bg(accent_color),
+            value_style: Style::default()
+                .fg(Color::Black)
+                .bg(accent_color)
+                .add_modifier(Modifier::BOLD),
+        },
+        (BarFillMode::DualColorBackground, false) => BarFill {
+            glyph: ' ',
+            cell_style: Style::default().bg(accent_bright_color),
+            value_style: Style::default()
+                .fg(Color::Black)
+                .bg(accent_bright_color)
+                .add_modifier(Modifier::BOLD),
+        },
     }
 }
 
@@ -1363,7 +1383,12 @@ fn render_api_grouped_vertical_bars(
             break;
         }
         let width = bar_width.min(right.saturating_sub(x));
-        let bar_fill = alternating_bar_fill(index, accent_color, accent_bright_color);
+        let bar_fill = alternating_bar_fill(
+            index,
+            accent_color,
+            accent_bright_color,
+            state.bar_fill_mode,
+        );
         let filled = ((bars_area.height as f64)
             * (point.tokens as f64 / max_value as f64).clamp(0.0, 1.0))
         .round() as u16;
@@ -1475,7 +1500,12 @@ fn render_api_grouped_horizontal_bars(
         let bar_x = area.x.saturating_add(label_width);
         let filled = ((bar_width as f64) * (point.tokens as f64 / max_value as f64).clamp(0.0, 1.0))
             .round() as u16;
-        let bar_fill = alternating_bar_fill(index, accent_color, accent_bright_color);
+        let bar_fill = alternating_bar_fill(
+            index,
+            accent_color,
+            accent_bright_color,
+            state.bar_fill_mode,
+        );
         for y in row_y..row_y.saturating_add(row_height).min(area.y + area.height) {
             for offset in 0..bar_width {
                 if let Some(cell) = buf.cell_mut((bar_x + offset, y)) {
@@ -1837,7 +1867,12 @@ fn render_api_daily_chart(
             break;
         }
         let width = bar_width.min(right.saturating_sub(x));
-        let bar_fill = alternating_bar_fill(index, accent_color, accent_bright_color);
+        let bar_fill = alternating_bar_fill(
+            index,
+            accent_color,
+            accent_bright_color,
+            state.bar_fill_mode,
+        );
         let filled_height = ((bars_area.height as f64)
             * (bucket.tokens as f64 / max_value as f64).clamp(0.0, 1.0))
         .round() as u16;
@@ -4204,7 +4239,8 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
                     break;
                 }
 
-                let bar_fill = alternating_bar_fill(i, accent_color, accent_bright_color);
+                let bar_fill =
+                    alternating_bar_fill(i, accent_color, accent_bright_color, state.bar_fill_mode);
 
                 let ratio = (*value as f64) / (max_value as f64);
                 let filled_h = ((bars_area.height as f64) * ratio.clamp(0.0, 1.0)).round() as u16;
@@ -4451,7 +4487,12 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
                 // Fill bar background according to ratio.
                 let ratio = (*value as f64) / (max_value as f64);
                 let filled = ((bar_area.width as f64) * ratio.clamp(0.0, 1.0)).round() as u16;
-                let bar_fill = alternating_bar_fill(idx, accent_color, accent_bright_color);
+                let bar_fill = alternating_bar_fill(
+                    idx,
+                    accent_color,
+                    accent_bright_color,
+                    state.bar_fill_mode,
+                );
                 for yy in bar_area.y..bar_area.y.saturating_add(bar_area.height) {
                     for xx in bar_area.x..bar_area.x.saturating_add(bar_area.width) {
                         if let Some(cell) = buf.cell_mut((xx, yy)) {
@@ -4896,10 +4937,13 @@ fn render_top_models(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
             ));
         }
     }
+    let mode_selector_width = 2u16;
     let swatch_width = 2u16;
-    let selector_width = u16::try_from(AccentTheme::ALL.len())
-        .unwrap_or(u16::MAX)
-        .saturating_mul(swatch_width);
+    let selector_width = mode_selector_width.saturating_add(
+        u16::try_from(AccentTheme::ALL.len())
+            .unwrap_or(u16::MAX)
+            .saturating_mul(swatch_width),
+    );
     let selector_visible = area.width > selector_width;
     let models_area = Rect {
         width: area.width.saturating_sub(if selector_visible {
@@ -4920,10 +4964,28 @@ fn render_top_models(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
             selector_width,
             1,
         );
-        let mut swatches = Vec::with_capacity(AccentTheme::ALL.len().saturating_mul(2));
+        let mode_area = Rect::new(selector_area.x, selector_area.y, 1, 1);
+        state.ui_hit_targets.push(UiHitTarget {
+            area: mode_area,
+            action: UiClickAction::ToggleBarFillMode,
+        });
+        let mode_style = match state.bar_fill_mode {
+            BarFillMode::Semigraphic => Style::default()
+                .fg(state.accent_colors().0)
+                .add_modifier(Modifier::BOLD),
+            BarFillMode::DualColorBackground => Style::default()
+                .fg(Color::White)
+                .bg(state.accent_colors().0)
+                .add_modifier(Modifier::BOLD),
+        };
+        let mut swatches =
+            Vec::with_capacity(AccentTheme::ALL.len().saturating_mul(2).saturating_add(2));
+        swatches.push(Span::styled("#", mode_style));
+        swatches.push(Span::raw(" "));
         for (index, theme) in AccentTheme::ALL.iter().copied().enumerate() {
             let swatch_x = selector_area
                 .x
+                .saturating_add(mode_selector_width)
                 .saturating_add((index as u16).saturating_mul(swatch_width));
             let swatch_area = Rect::new(swatch_x, selector_area.y, swatch_width, 1);
             let (accent_color, accent_bright_color) = theme.colors();
@@ -4967,6 +5029,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
             Line::from("  z/F6 - toggle calendar zone (Local/UTC)"),
             Line::from("  Wheel/arrows/PgUp/PgDn/Home/End - scroll periods"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
+            Line::from("  c    - cycle color theme; click # to toggle chart fill"),
             Line::from("  Mouse - click tabs/controls/format/quit"),
             Line::from("  r/F5 - refresh usage + limits"),
             Line::from("  s/F2 - switch screen"),
@@ -4981,6 +5044,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
             Line::from("  Left/Right or wheel - scroll weeks"),
             Line::from("  PgUp/PgDn/Home/End - jump through weeks"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
+            Line::from("  c    - cycle color theme; click # to toggle chart fill"),
             Line::from("  Mouse - click tabs/view/projects/quit"),
             Line::from("  r/F5 - refresh usage + limits"),
             Line::from("  s/F2 - switch screen"),
@@ -4996,6 +5060,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
             Line::from("  Wheel/arrows/PgUp/PgDn/Home/End - scroll periods"),
             Line::from("  r/F5 - refresh Codex account statistics"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
+            Line::from("  c    - cycle color theme; click # to toggle chart fill"),
             Line::from("  Mouse - click tabs; hover a daily bar for its exact value"),
             Line::from("  s/F2 - switch screen"),
             Line::from("  ?    - toggle help"),
@@ -5005,6 +5070,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
             Line::from("Keys:"),
             Line::from("  r/F5 - refresh reset credits"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
+            Line::from("  c    - cycle color theme; click # to toggle chart fill"),
             Line::from("  Mouse - click tabs/quit"),
             Line::from("  s/F2 - switch screen"),
             Line::from("  ?    - toggle help"),
@@ -5013,6 +5079,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
         ActiveScreen::Read => Text::from(vec![
             Line::from("Keys:"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
+            Line::from("  c    - cycle color theme; click # to toggle chart fill"),
             Line::from("  r/F5 - discover/refresh repositories (asks first)"),
             Line::from("  Mouse - click tabs/quit"),
             Line::from("  q    - quit (confirm)"),
@@ -6907,19 +6974,32 @@ mod tests {
     }
 
     #[test]
-    fn alternating_bars_use_textured_and_solid_pseudo_graphics() {
-        let textured = alternating_bar_fill(0, Color::Red, Color::LightRed);
+    fn alternating_bars_use_the_selected_fill_mode() {
+        let textured =
+            alternating_bar_fill(0, Color::Red, Color::LightRed, BarFillMode::Semigraphic);
         assert_eq!(textured.glyph, TEXTURED_BAR_GLYPH);
         assert_eq!(textured.cell_style.fg, Some(Color::Red));
         assert_eq!(textured.cell_style.bg, None);
         assert_eq!(textured.value_style.fg, Some(Color::White));
 
-        let solid = alternating_bar_fill(1, Color::Red, Color::LightRed);
+        let solid = alternating_bar_fill(1, Color::Red, Color::LightRed, BarFillMode::Semigraphic);
         assert_eq!(solid.glyph, SOLID_BAR_GLYPH);
         assert_eq!(solid.cell_style.fg, Some(Color::LightRed));
         assert_eq!(solid.cell_style.bg, None);
         assert_eq!(solid.value_style.fg, Some(Color::White));
         assert_eq!(solid.value_style.bg, None);
+
+        let background = alternating_bar_fill(
+            0,
+            Color::Red,
+            Color::LightRed,
+            BarFillMode::DualColorBackground,
+        );
+        assert_eq!(background.glyph, ' ');
+        assert_eq!(background.cell_style.fg, None);
+        assert_eq!(background.cell_style.bg, Some(Color::Red));
+        assert_eq!(background.value_style.fg, Some(Color::Black));
+        assert_eq!(background.value_style.bg, Some(Color::Red));
     }
 
     #[test]

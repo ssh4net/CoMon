@@ -364,6 +364,7 @@ pub(crate) struct AppState {
 const STATE_STORE_SCHEMA_VERSION: u32 = 2;
 const STATE_STORE_FILE_NAME: &str = "state.json";
 const STATE_SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
+const IDLE_UI_TICK: Duration = Duration::from_secs(1);
 pub(crate) const DEFAULT_ACTIVITY_PROJECT_LIMIT: usize = 5;
 pub(crate) const MIN_ACTIVITY_PROJECT_LIMIT: usize = 1;
 pub(crate) const MAX_ACTIVITY_PROJECT_LIMIT: usize = 50;
@@ -956,8 +957,6 @@ async fn run_inner(
     // Initial draw.
     terminal.draw(|f| crate::ui::render(f, &mut state))?;
 
-    let mut last_redraw = Instant::now();
-    let min_redraw = Duration::from_millis(50);
     let mut last_observed_ui_state = PersistedUiState::from_app_state(&state);
     let mut last_saved_ui_state = last_observed_ui_state.clone();
     let mut state_changed_at: Option<Instant> = None;
@@ -990,15 +989,14 @@ async fn run_inner(
                     dirty |= handle_app_event(&mut state, evt);
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                // periodic UI tick: allow relative-time labels to update
+            _ = tokio::time::sleep(IDLE_UI_TICK) => {
+                // Relative-time labels change at one-second resolution while idle.
                 dirty = true;
             }
         }
 
-        if dirty && last_redraw.elapsed() >= min_redraw {
+        if dirty {
             terminal.draw(|f| crate::ui::render(f, &mut state))?;
-            last_redraw = Instant::now();
         }
 
         let current_ui_state = PersistedUiState::from_app_state(&state);

@@ -38,7 +38,36 @@ const ACTIVITY_WEEKDAY_LABEL_WIDTH: u16 = 4;
 const ACTIVITY_BASE_COLORS: [Color; 3] =
     [Color::Indexed(23), Color::Indexed(30), Color::Indexed(37)];
 const ACTIVITY_COLOR_LEVELS: usize = ACTIVITY_BASE_COLORS.len() + 1;
+const TEXTURED_BAR_GLYPH: char = '\u{2591}';
+const SOLID_BAR_GLYPH: char = '\u{2588}';
 const USAGE_HEADER_HEIGHT: u16 = 3;
+
+#[derive(Clone)]
+struct BarFill {
+    glyph: char,
+    cell_style: Style,
+    value_style: Style,
+}
+
+fn alternating_bar_fill(index: usize, accent_color: Color, accent_bright_color: Color) -> BarFill {
+    if index.is_multiple_of(2) {
+        BarFill {
+            glyph: TEXTURED_BAR_GLYPH,
+            cell_style: Style::default().fg(accent_color),
+            value_style: Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        }
+    } else {
+        BarFill {
+            glyph: SOLID_BAR_GLYPH,
+            cell_style: Style::default().fg(accent_bright_color),
+            value_style: Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        }
+    }
+}
 
 pub fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
@@ -1334,11 +1363,7 @@ fn render_api_grouped_vertical_bars(
             break;
         }
         let width = bar_width.min(right.saturating_sub(x));
-        let color = if index % 2 == 0 {
-            accent_color
-        } else {
-            accent_bright_color
-        };
+        let bar_fill = alternating_bar_fill(index, accent_color, accent_bright_color);
         let filled = ((bars_area.height as f64)
             * (point.tokens as f64 / max_value as f64).clamp(0.0, 1.0))
         .round() as u16;
@@ -1352,7 +1377,8 @@ fn render_api_grouped_vertical_bars(
                 if let Some(cell) = buf.cell_mut((cell_x, y)) {
                     cell.set_char(' ');
                     if filled > 0 && y >= top {
-                        cell.set_style(Style::default().bg(color));
+                        cell.set_char(bar_fill.glyph)
+                            .set_style(bar_fill.cell_style.clone());
                     }
                 }
             }
@@ -1364,12 +1390,7 @@ fn render_api_grouped_vertical_bars(
             let value_y = bottom.saturating_sub(1);
             for (offset, ch) in value.chars().enumerate() {
                 if let Some(cell) = buf.cell_mut((value_x + offset as u16, value_y)) {
-                    cell.set_char(ch).set_style(
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(color)
-                            .add_modifier(Modifier::BOLD),
-                    );
+                    cell.set_char(ch).set_style(bar_fill.value_style.clone());
                 }
             }
         }
@@ -1454,17 +1475,14 @@ fn render_api_grouped_horizontal_bars(
         let bar_x = area.x.saturating_add(label_width);
         let filled = ((bar_width as f64) * (point.tokens as f64 / max_value as f64).clamp(0.0, 1.0))
             .round() as u16;
-        let color = if index % 2 == 0 {
-            accent_color
-        } else {
-            accent_bright_color
-        };
+        let bar_fill = alternating_bar_fill(index, accent_color, accent_bright_color);
         for y in row_y..row_y.saturating_add(row_height).min(area.y + area.height) {
             for offset in 0..bar_width {
                 if let Some(cell) = buf.cell_mut((bar_x + offset, y)) {
                     cell.set_char(' ');
                     if offset < filled {
-                        cell.set_style(Style::default().bg(color));
+                        cell.set_char(bar_fill.glyph)
+                            .set_style(bar_fill.cell_style.clone());
                     }
                 }
             }
@@ -1819,11 +1837,7 @@ fn render_api_daily_chart(
             break;
         }
         let width = bar_width.min(right.saturating_sub(x));
-        let fill_bg = if index % 2 == 0 {
-            accent_color
-        } else {
-            accent_bright_color
-        };
+        let bar_fill = alternating_bar_fill(index, accent_color, accent_bright_color);
         let filled_height = ((bars_area.height as f64)
             * (bucket.tokens as f64 / max_value as f64).clamp(0.0, 1.0))
         .round() as u16;
@@ -1837,7 +1851,8 @@ fn render_api_daily_chart(
                 if let Some(cell) = buf.cell_mut((cell_x, y)) {
                     cell.set_char(' ');
                     if filled_height > 0 && y >= top {
-                        cell.set_style(Style::default().bg(fill_bg));
+                        cell.set_char(bar_fill.glyph)
+                            .set_style(bar_fill.cell_style.clone());
                     }
                 }
             }
@@ -1850,12 +1865,7 @@ fn render_api_daily_chart(
             let value_y = bottom.saturating_sub(1);
             for (offset, ch) in value.chars().enumerate() {
                 if let Some(cell) = buf.cell_mut((value_x + offset as u16, value_y)) {
-                    cell.set_char(ch).set_style(
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(fill_bg)
-                            .add_modifier(Modifier::BOLD),
-                    );
+                    cell.set_char(ch).set_style(bar_fill.value_style.clone());
                 }
             }
         }
@@ -4194,11 +4204,7 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
                     break;
                 }
 
-                let fill_bg = if i % 2 == 0 {
-                    accent_color
-                } else {
-                    accent_bright_color
-                };
+                let bar_fill = alternating_bar_fill(i, accent_color, accent_bright_color);
 
                 let ratio = (*value as f64) / (max_value as f64);
                 let filled_h = ((bars_area.height as f64) * ratio.clamp(0.0, 1.0)).round() as u16;
@@ -4214,7 +4220,8 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
                         if let Some(cell) = buf.cell_mut((xx, yy)) {
                             cell.set_char(' ');
                             if filled_h > 0 && yy >= top_filled_y {
-                                cell.set_style(Style::default().bg(fill_bg));
+                                cell.set_char(bar_fill.glyph)
+                                    .set_style(bar_fill.cell_style.clone());
                             }
                         }
                     }
@@ -4252,12 +4259,7 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
                             break;
                         }
                         if let Some(cell) = buf.cell_mut((start_x + j as u16, text_y)) {
-                            cell.set_char(ch).set_style(
-                                Style::default()
-                                    .fg(Color::Black)
-                                    .bg(fill_bg)
-                                    .add_modifier(Modifier::BOLD),
-                            );
+                            cell.set_char(ch).set_style(bar_fill.value_style.clone());
                         }
                     }
                 }
@@ -4449,17 +4451,14 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
                 // Fill bar background according to ratio.
                 let ratio = (*value as f64) / (max_value as f64);
                 let filled = ((bar_area.width as f64) * ratio.clamp(0.0, 1.0)).round() as u16;
-                let fill_bg = if idx % 2 == 0 {
-                    accent_color
-                } else {
-                    accent_bright_color
-                };
+                let bar_fill = alternating_bar_fill(idx, accent_color, accent_bright_color);
                 for yy in bar_area.y..bar_area.y.saturating_add(bar_area.height) {
                     for xx in bar_area.x..bar_area.x.saturating_add(bar_area.width) {
                         if let Some(cell) = buf.cell_mut((xx, yy)) {
                             cell.set_char(' ');
                             if xx < bar_area.x.saturating_add(filled) {
-                                cell.set_style(Style::default().bg(fill_bg));
+                                cell.set_char(bar_fill.glyph)
+                                    .set_style(bar_fill.cell_style.clone());
                             }
                         }
                     }
@@ -6905,6 +6904,22 @@ mod tests {
         assert_eq!(label.content.as_ref(), " VIEW ");
         assert_eq!(label.style.bg, Some(Color::Magenta));
         assert_eq!(label.style.fg, Some(Color::Black));
+    }
+
+    #[test]
+    fn alternating_bars_use_textured_and_solid_pseudo_graphics() {
+        let textured = alternating_bar_fill(0, Color::Red, Color::LightRed);
+        assert_eq!(textured.glyph, TEXTURED_BAR_GLYPH);
+        assert_eq!(textured.cell_style.fg, Some(Color::Red));
+        assert_eq!(textured.cell_style.bg, None);
+        assert_eq!(textured.value_style.fg, Some(Color::White));
+
+        let solid = alternating_bar_fill(1, Color::Red, Color::LightRed);
+        assert_eq!(solid.glyph, SOLID_BAR_GLYPH);
+        assert_eq!(solid.cell_style.fg, Some(Color::LightRed));
+        assert_eq!(solid.cell_style.bg, None);
+        assert_eq!(solid.value_style.fg, Some(Color::White));
+        assert_eq!(solid.value_style.bg, None);
     }
 
     #[test]

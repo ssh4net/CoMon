@@ -58,7 +58,7 @@ fn alternating_bar_fill(
     match (mode, index.is_multiple_of(2)) {
         (BarFillMode::Semigraphic, true) => BarFill {
             glyph: TEXTURED_BAR_GLYPH,
-            cell_style: Style::default().fg(accent_color),
+            cell_style: Style::default().fg(accent_bright_color),
             value_style: Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
@@ -226,7 +226,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
         ActiveScreen::Read => {
             let system_locale = state.system_locale.clone();
             let formatter = DisplayFormatter::new(state.display_style, &system_locale);
-            let (accent_color, _) = state.accent_colors();
+            let accent_text_color = state.accent_text_color();
             crate::read::tui::render(
                 frame,
                 inner,
@@ -234,7 +234,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
                 state.usage.as_ref(),
                 state.usage_error.as_deref(),
                 formatter,
-                accent_color,
+                accent_text_color,
             );
             render_history_style_controls(frame, inner, state);
         }
@@ -555,7 +555,7 @@ fn render_api_stat_controls(
             Some(UiClickAction::SetApiStatGrouping(ApiStatGrouping::Month)),
         ),
     ];
-    let accent_color = state.accent_colors().0;
+    let accent_color = state.accent_text_color();
     let mut spans = vec![control_group_label("VIEW", accent_color), bars, heat];
     spans.push(control_group_label("GRAPH", accent_color));
     spans.extend([day, week, month]);
@@ -607,7 +607,7 @@ fn render_api_stat_controls(
     );
 
     if let Some(text) = reset_summary {
-        render_reset_summary(frame, chunks[1], text, state.accent_colors().0);
+        render_reset_summary(frame, chunks[1], text, state.accent_text_color());
     }
 }
 
@@ -2103,7 +2103,7 @@ fn render_activity_controls(
     );
 
     if let Some(text) = reset_summary {
-        render_reset_summary(frame, chunks[1], text, state.accent_colors().0);
+        render_reset_summary(frame, chunks[1], text, state.accent_text_color());
     }
 }
 
@@ -2139,7 +2139,7 @@ fn render_flat_activity_controls(
         ],
     );
 
-    let accent_color = state.accent_colors().0;
+    let accent_color = state.accent_text_color();
     let mut spans = vec![control_group_label("VIEW", accent_color)];
     spans.extend(metric_pills);
     spans.push(control_group_label("PROJECTS", accent_color));
@@ -2703,7 +2703,7 @@ fn render_usage_controls(
     );
 
     if let Some(text) = reset_summary {
-        render_reset_summary(frame, chunks[1], text, state.accent_colors().0);
+        render_reset_summary(frame, chunks[1], text, state.accent_text_color());
     }
 }
 
@@ -2778,7 +2778,7 @@ fn render_flat_usage_controls(
         ],
     );
 
-    let accent_color = state.accent_colors().0;
+    let accent_color = state.accent_text_color();
     let mut spans = vec![control_group_label("VIEW", accent_color)];
     spans.extend(pills[0..3].iter().cloned());
     spans.push(control_group_label("GRAPH", accent_color));
@@ -2851,13 +2851,13 @@ fn render_history_style_controls(frame: &mut Frame<'_>, area: Rect, state: &mut 
             ),
         ];
         let spans = vec![
-            control_group_label("PROJECTS", state.accent_colors().0),
+            control_group_label("PROJECTS", state.accent_text_color()),
             pill("STRICT", mode == ProjectViewMode::Strict),
             pill("DEEP ", mode == ProjectViewMode::Deep),
             pill("FULL", mode == ProjectViewMode::Full),
             pill("CUSTOM", mode == ProjectViewMode::Custom),
             Span::raw(" "),
-            control_group_label("STYLE", state.accent_colors().0),
+            control_group_label("STYLE", state.accent_text_color()),
             pill("CLASS", state.display_style == DisplayStyle::Classic),
             pill("SCOMP", state.display_style == DisplayStyle::SystemCompact),
             pill("SFULL", state.display_style == DisplayStyle::SystemFull),
@@ -2880,7 +2880,7 @@ fn render_history_style_controls(frame: &mut Frame<'_>, area: Rect, state: &mut 
                 (" + ", Some(UiClickAction::IncreaseHistoryDepth)),
             ];
             let depth_spans = vec![
-                control_group_label("DEPTH", state.accent_colors().0),
+                control_group_label("DEPTH", state.accent_text_color()),
                 pill("-", false),
                 pill(&state.read_browser.deep_depth().to_string(), true),
                 pill("+", false),
@@ -2909,7 +2909,7 @@ fn render_history_style_controls(frame: &mut Frame<'_>, area: Rect, state: &mut 
         ];
         let spans = vec![
             Span::raw("  "),
-            control_group_label("STYLE", state.accent_colors().0),
+            control_group_label("STYLE", state.accent_text_color()),
             pill("CLASS", state.display_style == DisplayStyle::Classic),
             pill("SCOMP", state.display_style == DisplayStyle::SystemCompact),
             pill("SFULL", state.display_style == DisplayStyle::SystemFull),
@@ -4971,11 +4971,11 @@ fn render_top_models(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
         });
         let mode_style = match state.bar_fill_mode {
             BarFillMode::Semigraphic => Style::default()
-                .fg(state.accent_colors().0)
+                .fg(state.accent_text_color())
                 .add_modifier(Modifier::BOLD),
             BarFillMode::DualColorBackground => Style::default()
                 .fg(Color::White)
-                .bg(state.accent_colors().0)
+                .bg(state.accent_text_color())
                 .add_modifier(Modifier::BOLD),
         };
         let mut swatches =
@@ -5669,7 +5669,7 @@ fn render_limit_resets(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         .split(area);
 
     if let Some(text) = summary.as_deref() {
-        render_reset_summary(frame, chunks[0], text, state.accent_colors().0);
+        render_reset_summary(frame, chunks[0], text, state.accent_text_color());
     }
     render_limit_reset_details(frame, chunks[1], state);
 }
@@ -5728,7 +5728,7 @@ fn render_limit_reset_details(frame: &mut Frame<'_>, area: Rect, state: &AppStat
                     Style::default().fg(Color::Gray),
                 ))),
                 Some(credits) => {
-                    reset_credit_details_text(credits, state.formatter(), state.accent_colors().0)
+                    reset_credit_details_text(credits, state.formatter(), state.accent_text_color())
                 }
             },
         }
@@ -6978,7 +6978,7 @@ mod tests {
         let textured =
             alternating_bar_fill(0, Color::Red, Color::LightRed, BarFillMode::Semigraphic);
         assert_eq!(textured.glyph, TEXTURED_BAR_GLYPH);
-        assert_eq!(textured.cell_style.fg, Some(Color::Red));
+        assert_eq!(textured.cell_style.fg, Some(Color::LightRed));
         assert_eq!(textured.cell_style.bg, None);
         assert_eq!(textured.value_style.fg, Some(Color::White));
 

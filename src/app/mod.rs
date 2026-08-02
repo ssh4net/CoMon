@@ -110,6 +110,10 @@ impl AccentTheme {
         }
     }
 
+    pub(crate) fn text_color(self) -> Color {
+        self.colors().1
+    }
+
     pub(crate) fn cycled(self) -> Self {
         match self {
             Self::Cyan => Self::Red,
@@ -2393,6 +2397,10 @@ impl AppState {
         self.accent_theme.colors()
     }
 
+    pub(crate) fn accent_text_color(&self) -> Color {
+        self.accent_theme.text_color()
+    }
+
     pub(crate) fn usage_updated_label(&self) -> Option<String> {
         let updated_at = self.usage_updated_at?;
         Some(crate::ui::format_updated_label(updated_at))
@@ -2432,6 +2440,7 @@ mod tests {
         for (index, (theme, accent, accent_bright)) in expected.iter().enumerate() {
             assert_eq!(AccentTheme::ALL[index], *theme);
             assert_eq!(theme.colors(), (*accent, *accent_bright));
+            assert_eq!(theme.text_color(), *accent_bright);
         }
     }
 

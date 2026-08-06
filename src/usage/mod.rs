@@ -619,6 +619,7 @@ pub fn compute_snapshot(
     let days = days.clamp(1, 90);
 
     let sessions_root = codex_home.join("sessions");
+    let archived_sessions_root = codex_home.join("archived_sessions");
     // The configured window controls summary cards and model shares. Charts are
     // expanded to the complete indexed history after cached rows are applied.
     let summary_day_keys = make_day_keys_for_zone(days, UsageZone::Local);
@@ -768,6 +769,7 @@ pub fn compute_snapshot(
         &candidate_paths,
         &planned_indices,
         &scan_cache_store,
+        &archived_sessions_root,
         limits.max_jsonl_line_bytes,
     );
     // Parent baseline discovery is bounded by the planned fork set and runs in
@@ -1120,11 +1122,65 @@ fn read_fork_metadata(path: &Path, max_jsonl_line_bytes: usize) -> Option<(Strin
     Some((parent_id, timestamp_ms))
 }
 
+/// Finds only requested archived parents for fork baseline recovery. Archived
+/// sessions deliberately never become scan candidates, cache rows, or progress
+/// totals: they provide historical baselines for active fork children only.
+fn find_archived_parent_paths(
+    archived_sessions_root: &Path,
+    parent_ids: &HashSet<String>,
+) -> HashMap<String, PathBuf> {
+    if parent_ids.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut found = HashMap::new();
+    let mut stack = vec![archived_sessions_root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(_) => continue,
+            };
+            let file_type = meta.file_type();
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file()
+                || meta.len() == 0
+                || path.extension().and_then(|ext| ext.to_str()) != Some("jsonl")
+            {
+                continue;
+            }
+            let Some(parent_id) = session_id_from_path(&path) else {
+                continue;
+            };
+            if parent_ids.contains(&parent_id) {
+                found.entry(parent_id).or_insert(path);
+                if found.len() == parent_ids.len() {
+                    return found;
+                }
+            }
+        }
+    }
+
+    found
+}
+
 fn resolve_fork_baselines(
     candidates: &[SessionFileCandidate],
     candidate_paths: &[String],
     planned_indices: &[usize],
     cache: &ScanCacheStore,
+    archived_sessions_root: &Path,
     max_jsonl_line_bytes: usize,
 ) -> HashMap<String, ForkResolution> {
     let id_to_path: HashMap<String, &Path> = candidates
@@ -1164,8 +1220,21 @@ fn resolve_fork_baselines(
         }
     }
 
+    let missing_parent_ids: HashSet<String> = requests
+        .keys()
+        .filter(|parent_id| !id_to_path.contains_key(parent_id.as_str()))
+        .cloned()
+        .collect();
+    let archived_parent_paths =
+        find_archived_parent_paths(archived_sessions_root, &missing_parent_ids);
+
     for (parent_id, mut parent_requests) in requests {
-        let Some(parent_path) = id_to_path.get(&parent_id).copied() else {
+        let parent_path = id_to_path.get(&parent_id).copied().or_else(|| {
+            archived_parent_paths
+                .get(&parent_id)
+                .map(|path| path.as_path())
+        });
+        let Some(parent_path) = parent_path else {
             continue;
         };
         parent_requests.sort_by_key(|(_, timestamp_ms)| *timestamp_ms);
@@ -4011,6 +4080,115 @@ mod tests {
             snapshot.days.iter().map(|day| day.agent_runs).sum::<i64>(),
             1
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn archived_parent_unblocks_cached_fork_without_becoming_an_indexed_session() {
+        let root = make_temp_dir("archived-fork-parent");
+        let codex_home = root.join("codex");
+        let sessions_root = codex_home.join("sessions");
+        let archived_sessions_root = codex_home.join("archived_sessions").join("2026/08/06");
+        let project = root.join("project");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions root");
+        std::fs::create_dir_all(&project).expect("create project");
+
+        let parent_id = "55555555-5555-4555-8555-555555555555";
+        let child_id = "66666666-6666-4666-8666-666666666666";
+        let child_path = sessions_root.join(format!("rollout-child-{child_id}.jsonl"));
+        let parent_path = archived_sessions_root.join(format!("rollout-parent-{parent_id}.jsonl"));
+        let fork_ms = Utc::now().timestamp_millis() - Duration::hours(1).num_milliseconds();
+
+        append_json_line(
+            &child_path,
+            serde_json::json!({
+                "type": "session_meta",
+                "timestamp": Utc.timestamp_millis_opt(fork_ms).single().unwrap().to_rfc3339(),
+                "payload": {
+                    "id": child_id,
+                    "forked_from_id": parent_id,
+                    "timestamp": Utc.timestamp_millis_opt(fork_ms).single().unwrap().to_rfc3339(),
+                    "cwd": project
+                }
+            }),
+        );
+        append_agent_message_line(&child_path, fork_ms + 50);
+        append_total_token_line(&child_path, fork_ms + 100, 1_500, 1_300, 130);
+        append_agent_message_line(&child_path, fork_ms + 1_500);
+        append_total_token_line(&child_path, fork_ms + 1_600, 1_700, 1_400, 150);
+
+        let cache_db_path = root.join("comon.db");
+        let blocked = compute_snapshot(
+            30,
+            &codex_home,
+            None,
+            default_test_limits(false),
+            Some(&cache_db_path),
+        )
+        .expect("blocked snapshot");
+        assert_eq!(blocked.scan_total_files, 1);
+        assert_eq!(blocked.scan_pending_files, 1);
+        assert_eq!(blocked.totals.last30_days_tokens, 0);
+
+        std::fs::create_dir_all(&archived_sessions_root).expect("create archived sessions root");
+        append_session_meta_line(
+            &parent_path,
+            fork_ms - 1_000,
+            &project.display().to_string(),
+        );
+        append_total_token_line(&parent_path, fork_ms - 100, 1_500, 1_300, 130);
+
+        let resolved = compute_snapshot(
+            30,
+            &codex_home,
+            None,
+            default_test_limits(false),
+            Some(&cache_db_path),
+        )
+        .expect("resolved snapshot");
+        assert_eq!(resolved.totals.last30_days_tokens, 220);
+        assert_eq!(resolved.scan_total_files, 1);
+        assert_eq!(resolved.scan_indexed_files, 1);
+        assert_eq!(resolved.scan_pending_files, 0);
+        let usage = resolved
+            .project_usage_for_path(&project.display().to_string())
+            .expect("child project usage");
+        assert_eq!(usage.total_tokens, 220);
+        assert_eq!(usage.indexed_files, 1);
+
+        let db = open_or_init_scan_cache_db(&cache_db_path).expect("open cache db");
+        let (store, _) = load_scan_cache_store(&db).expect("load cache store");
+        assert_eq!(store.entries.len(), 1, "archived parent must not be cached");
+        let child_entry = store
+            .entries
+            .get(&child_path.to_string_lossy().to_string())
+            .expect("child cache row");
+        assert!(child_entry.fully_parsed);
+        assert!(child_entry.file_offset > 0);
+        assert_eq!(
+            child_entry.parser_state.fork_parent_id.as_deref(),
+            Some(parent_id)
+        );
+        let baseline = child_entry
+            .parser_state
+            .fork_baseline
+            .expect("archived parent baseline");
+        assert_eq!(baseline.input, 1_500);
+        assert_eq!(baseline.cached, 1_300);
+        assert_eq!(baseline.output, 130);
+
+        let cached = compute_snapshot(
+            30,
+            &codex_home,
+            None,
+            default_test_limits(false),
+            Some(&cache_db_path),
+        )
+        .expect("cached snapshot");
+        assert_eq!(cached.totals.last30_days_tokens, 220);
+        assert_eq!(cached.scan_total_files, 1);
+        assert_eq!(cached.scan_pending_files, 0);
 
         let _ = std::fs::remove_dir_all(root);
     }

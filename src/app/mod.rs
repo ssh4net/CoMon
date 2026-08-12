@@ -114,6 +114,31 @@ impl AccentTheme {
         self.colors().1
     }
 
+    fn store_value(self) -> &'static str {
+        match self {
+            Self::Cyan => "cyan",
+            Self::Red => "red",
+            Self::Green => "green",
+            Self::Yellow => "yellow",
+            Self::Blue => "blue",
+            Self::Magenta => "magenta",
+            Self::Gray => "gray",
+        }
+    }
+
+    fn from_store(value: &str) -> Option<Self> {
+        match value {
+            "cyan" => Some(Self::Cyan),
+            "red" => Some(Self::Red),
+            "green" => Some(Self::Green),
+            "yellow" => Some(Self::Yellow),
+            "blue" => Some(Self::Blue),
+            "magenta" => Some(Self::Magenta),
+            "gray" => Some(Self::Gray),
+            _ => None,
+        }
+    }
+
     pub(crate) fn cycled(self) -> Self {
         match self {
             Self::Cyan => Self::Red,
@@ -139,6 +164,21 @@ impl BarFillMode {
         match self {
             Self::Semigraphic => Self::DualColorBackground,
             Self::DualColorBackground => Self::Semigraphic,
+        }
+    }
+
+    fn store_value(self) -> &'static str {
+        match self {
+            Self::Semigraphic => "semigraphic",
+            Self::DualColorBackground => "dual-color-background",
+        }
+    }
+
+    fn from_store(value: &str) -> Option<Self> {
+        match value {
+            "semigraphic" => Some(Self::Semigraphic),
+            "dual-color-background" => Some(Self::DualColorBackground),
+            _ => None,
         }
     }
 }
@@ -365,7 +405,7 @@ pub(crate) struct AppState {
     pub(crate) read_browser: crate::read::tui::BrowserState,
 }
 
-const STATE_STORE_SCHEMA_VERSION: u32 = 2;
+const STATE_STORE_SCHEMA_VERSION: u32 = 3;
 const STATE_STORE_FILE_NAME: &str = "state.json";
 const STATE_SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
 const IDLE_UI_TICK: Duration = Duration::from_secs(1);
@@ -392,6 +432,8 @@ struct PersistedUiState {
     workspace_path: Option<PathBuf>,
     no_sessions_confirm_dismissed: bool,
     display_style: DisplayStyle,
+    accent_theme: AccentTheme,
+    bar_fill_mode: BarFillMode,
     skip_quit_confirmation: bool,
     history_project_view_mode: crate::read::catalog::ProjectViewMode,
     history_deep_depth: u8,
@@ -414,6 +456,8 @@ impl PersistedUiState {
             workspace_path,
             no_sessions_confirm_dismissed: false,
             display_style: DisplayStyle::Classic,
+            accent_theme: AccentTheme::default(),
+            bar_fill_mode: BarFillMode::default(),
             skip_quit_confirmation: false,
             history_project_view_mode: crate::read::catalog::ProjectViewMode::Strict,
             history_deep_depth: crate::read::catalog::DEFAULT_DEEP_DEPTH,
@@ -436,6 +480,8 @@ impl PersistedUiState {
             workspace_path: state.workspace_path.clone(),
             no_sessions_confirm_dismissed: state.no_sessions_confirm_dismissed,
             display_style: state.display_style,
+            accent_theme: state.accent_theme,
+            bar_fill_mode: state.bar_fill_mode,
             skip_quit_confirmation: state.skip_quit_confirmation,
             history_project_view_mode: state.read_browser.project_mode(),
             history_deep_depth: state.read_browser.deep_depth(),
@@ -479,6 +525,8 @@ struct StoredGlobalState {
     api_stat_orientation: Option<String>,
     activity_project_limit: Option<usize>,
     display_style: Option<String>,
+    accent_theme: Option<String>,
+    bar_fill_mode: Option<String>,
     #[serde(default)]
     skip_quit_confirmation: bool,
     last_workspace_path: Option<String>,
@@ -937,8 +985,8 @@ async fn run_inner(
         history_catalog_config_path: config.comon_home.join("config.json"),
         history_catalog_scan_prompt: false,
         display_style: restored_ui_state.display_style,
-        accent_theme: AccentTheme::default(),
-        bar_fill_mode: BarFillMode::default(),
+        accent_theme: restored_ui_state.accent_theme,
+        bar_fill_mode: restored_ui_state.bar_fill_mode,
         system_locale: config.system_locale.clone(),
         mouse_position: None,
         ui_hit_targets: Vec::new(),
@@ -2158,6 +2206,16 @@ fn load_persisted_ui_state_with_history_depth(
             state.display_style = style;
         }
     }
+    if let Some(theme_text) = store.global.accent_theme.as_deref() {
+        if let Some(theme) = AccentTheme::from_store(theme_text) {
+            state.accent_theme = theme;
+        }
+    }
+    if let Some(mode_text) = store.global.bar_fill_mode.as_deref() {
+        if let Some(mode) = BarFillMode::from_store(mode_text) {
+            state.bar_fill_mode = mode;
+        }
+    }
     state.skip_quit_confirmation = store.global.skip_quit_confirmation;
     if let Some(mode_text) = store.global.history_project_view_mode.as_deref() {
         if let Some(mode) = crate::read::catalog::ProjectViewMode::from_store(mode_text) {
@@ -2219,6 +2277,8 @@ fn save_persisted_ui_state(comon_home: &Path, state: &PersistedUiState) -> Resul
             .clamp(MIN_ACTIVITY_PROJECT_LIMIT, MAX_ACTIVITY_PROJECT_LIMIT),
     );
     store.global.display_style = Some(state.display_style.store_value().to_string());
+    store.global.accent_theme = Some(state.accent_theme.store_value().to_string());
+    store.global.bar_fill_mode = Some(state.bar_fill_mode.store_value().to_string());
     store.global.skip_quit_confirmation = state.skip_quit_confirmation;
     store.global.history_project_view_mode =
         Some(state.history_project_view_mode.store_value().to_string());
@@ -2441,6 +2501,7 @@ mod tests {
             assert_eq!(AccentTheme::ALL[index], *theme);
             assert_eq!(theme.colors(), (*accent, *accent_bright));
             assert_eq!(theme.text_color(), *accent_bright);
+            assert_eq!(AccentTheme::from_store(theme.store_value()), Some(*theme));
         }
     }
 
@@ -2463,6 +2524,14 @@ mod tests {
         assert_eq!(
             BarFillMode::DualColorBackground.toggled(),
             BarFillMode::Semigraphic
+        );
+        assert_eq!(
+            BarFillMode::from_store(BarFillMode::Semigraphic.store_value()),
+            Some(BarFillMode::Semigraphic)
+        );
+        assert_eq!(
+            BarFillMode::from_store(BarFillMode::DualColorBackground.store_value()),
+            Some(BarFillMode::DualColorBackground)
         );
     }
 
@@ -2632,6 +2701,47 @@ mod tests {
         save_persisted_ui_state(&comon_home, &state).expect("save persisted ui state");
         let loaded = load_persisted_ui_state(&comon_home, None).expect("load persisted ui state");
         assert_eq!(loaded.display_style, DisplayStyle::SystemFull);
+
+        let _ = std::fs::remove_dir_all(comon_home);
+    }
+
+    #[test]
+    fn theme_settings_round_trip_through_state_store() {
+        let comon_home = make_temp_dir("theme-settings");
+        let mut state = PersistedUiState::default_for_workspace(None);
+        state.accent_theme = AccentTheme::Magenta;
+        state.bar_fill_mode = BarFillMode::DualColorBackground;
+
+        save_persisted_ui_state(&comon_home, &state).expect("save persisted ui state");
+        let loaded = load_persisted_ui_state(&comon_home, None).expect("load persisted ui state");
+        assert_eq!(loaded.accent_theme, AccentTheme::Magenta);
+        assert_eq!(loaded.bar_fill_mode, BarFillMode::DualColorBackground);
+
+        let _ = std::fs::remove_dir_all(comon_home);
+    }
+
+    #[test]
+    fn legacy_state_without_theme_settings_uses_defaults() {
+        let comon_home = make_temp_dir("legacy-theme-settings");
+        let path = comon_home.join(STATE_STORE_FILE_NAME);
+        let legacy = serde_json::json!({
+            "schema_version": 2,
+            "global": {
+                "display_style": "system-full",
+                "updated_at": 1
+            },
+            "workspaces": {}
+        });
+        crate::storage::write_private_file(
+            &path,
+            &serde_json::to_vec_pretty(&legacy).expect("encode legacy state"),
+        )
+        .expect("write legacy state");
+
+        let loaded = load_persisted_ui_state(&comon_home, None).expect("load legacy ui state");
+        assert_eq!(loaded.display_style, DisplayStyle::SystemFull);
+        assert_eq!(loaded.accent_theme, AccentTheme::Cyan);
+        assert_eq!(loaded.bar_fill_mode, BarFillMode::Semigraphic);
 
         let _ = std::fs::remove_dir_all(comon_home);
     }

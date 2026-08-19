@@ -17,7 +17,7 @@ See `CHANGELOG.md` for release history.
 
 ## Requirements
 
-- Rust toolchain (stable) installed.
+- Rust 1.88 or newer installed (the current stable toolchain is recommended).
 - C/C++ compiler toolchain available (needed to build bundled SQLite through `rusqlite`).
 - Codex CLI installed as `codex` on your `PATH`, or a discoverable/explicit Codex App Server executable (required only for live limits/credits).
   - Usage stats still work without Codex CLI (they only need the session logs on disk).

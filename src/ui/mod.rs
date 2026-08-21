@@ -19,6 +19,7 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
+    buffer::Buffer,
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
@@ -40,6 +41,9 @@ const ACTIVITY_BASE_COLORS: [Color; 3] =
 const ACTIVITY_COLOR_LEVELS: usize = ACTIVITY_BASE_COLORS.len() + 1;
 const TEXTURED_BAR_GLYPH: char = '\u{2591}';
 const SOLID_BAR_GLYPH: char = '\u{2588}';
+const WEEKLY_GAUGE_DAYS: usize = 7;
+const LIMIT_GAUGE_FILL: &str = "\u{2588}";
+const LIMIT_GAUGE_DIVIDER: &str = "\u{2595}";
 const USAGE_HEADER_HEIGHT: u16 = 3;
 
 #[derive(Clone)]
@@ -3346,8 +3350,16 @@ fn render_usage_cards(
                 ) {
                     weekly_hover = Some(hover);
                 };
+                render_today_card(
+                    frame,
+                    cards[1],
+                    state,
+                    &today_title,
+                    "INDEXING",
+                    Some(&progress),
+                    Some("Please wait"),
+                );
                 for (title, target) in [
-                    (today_title.as_str(), cards[1]),
                     ("LAST_7_DAYS", cards[2]),
                     ("LAST_30_DAYS", cards[3]),
                     (aux_title, cards[4]),
@@ -3372,7 +3384,15 @@ fn render_usage_cards(
                 ) {
                     weekly_hover = Some(hover);
                 };
-                render_pending(frame, &today_title, top[1]);
+                render_today_card(
+                    frame,
+                    top[1],
+                    state,
+                    &today_title,
+                    "INDEXING",
+                    Some(&progress),
+                    Some("Please wait"),
+                );
                 render_pending(frame, "LAST_7_DAYS", top[2]);
             }
         }
@@ -3487,14 +3507,14 @@ fn render_usage_cards(
                     ) {
                         weekly_hover = Some(hover);
                     };
-                    frame.render_widget(
-                        card(
-                            &today_title,
-                            &today_value,
-                            Some(&today_caption1),
-                            Some(&today_caption2),
-                        ),
+                    render_today_card(
+                        frame,
                         cards[1],
+                        state,
+                        &today_title,
+                        &today_value,
+                        Some(&today_caption1),
+                        Some(&today_caption2),
                     );
                     let runs7 = last7_runs_caption.as_deref();
                     let runs30 = last30_runs_caption.as_deref();
@@ -3539,14 +3559,14 @@ fn render_usage_cards(
                         weekly_hover = Some(hover);
                     };
                     let runs7 = last7_runs_caption.as_deref();
-                    frame.render_widget(
-                        card(
-                            &today_title,
-                            &today_value,
-                            Some(&today_caption1),
-                            Some(&today_caption2),
-                        ),
+                    render_today_card(
+                        frame,
                         top[1],
+                        state,
+                        &today_title,
+                        &today_value,
+                        Some(&today_caption1),
+                        Some(&today_caption2),
                     );
                     frame.render_widget(
                         card(
@@ -3637,14 +3657,14 @@ fn render_usage_cards(
                     ) {
                         weekly_hover = Some(hover);
                     };
-                    frame.render_widget(
-                        card(
-                            &today_title,
-                            &today_value,
-                            Some(&today_caption1),
-                            Some(&today_caption2),
-                        ),
+                    render_today_card(
+                        frame,
                         cards[1],
+                        state,
+                        &today_title,
+                        &today_value,
+                        Some(&today_caption1),
+                        Some(&today_caption2),
                     );
                     let runs7 = last7_runs_caption.as_deref();
                     let runs30 = last30_runs_caption.as_deref();
@@ -3686,14 +3706,14 @@ fn render_usage_cards(
                         weekly_hover = Some(hover);
                     };
                     let runs7 = last7_runs_caption.as_deref();
-                    frame.render_widget(
-                        card(
-                            &today_title,
-                            &today_value,
-                            Some(&today_caption1),
-                            Some(&today_caption2),
-                        ),
+                    render_today_card(
+                        frame,
                         top[1],
+                        state,
+                        &today_title,
+                        &today_value,
+                        Some(&today_caption1),
+                        Some(&today_caption2),
                     );
                     frame.render_widget(
                         card(
@@ -3822,14 +3842,14 @@ fn render_usage_cards(
                     ) {
                         weekly_hover = Some(hover);
                     };
-                    frame.render_widget(
-                        card(
-                            &today_title,
-                            &today_value,
-                            Some(&today_caption1),
-                            Some(&today_caption2),
-                        ),
+                    render_today_card(
+                        frame,
                         cards[1],
+                        state,
+                        &today_title,
+                        &today_value,
+                        Some(&today_caption1),
+                        Some(&today_caption2),
                     );
                     frame.render_widget(
                         card(
@@ -3868,14 +3888,14 @@ fn render_usage_cards(
                     ) {
                         weekly_hover = Some(hover);
                     };
-                    frame.render_widget(
-                        card(
-                            &today_title,
-                            &today_value,
-                            Some(&today_caption1),
-                            Some(&today_caption2),
-                        ),
+                    render_today_card(
+                        frame,
                         top[1],
+                        state,
+                        &today_title,
+                        &today_value,
+                        Some(&today_caption1),
+                        Some(&today_caption2),
                     );
                     frame.render_widget(
                         card(
@@ -5515,6 +5535,41 @@ fn card(
     card_with_captions(title, value, &[caption1, caption2])
 }
 
+fn render_today_card(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &AppState,
+    title: &str,
+    value: &str,
+    caption1: Option<&str>,
+    caption2: Option<&str>,
+) {
+    frame.render_widget(card(title, value, caption1, caption2), area);
+
+    let Some(first_content_line) = card_content_line_rect(area, 0) else {
+        return;
+    };
+    let mut gauge_line_index = usize::from(wrapped_line_count(value, first_content_line.width));
+    for caption in [caption1, caption2].into_iter().flatten() {
+        if !caption.trim().is_empty() {
+            gauge_line_index = gauge_line_index.saturating_add(usize::from(wrapped_line_count(
+                caption,
+                first_content_line.width,
+            )));
+        }
+    }
+    let Some(gauge_area) = card_content_line_rect(area, gauge_line_index) else {
+        return;
+    };
+
+    let limits = state
+        .limits_enabled
+        .then_some(state.limits.as_ref())
+        .flatten();
+    let gauge = limit_usage_gauge(limits, now_unix_secs());
+    render_limit_usage_gauge(frame.buffer_mut(), gauge_area, gauge);
+}
+
 fn today_card_title(formatter: DisplayFormatter<'_>, now: NaiveDateTime) -> String {
     format!(
         "TODAY_{}",
@@ -6218,18 +6273,18 @@ struct WeeklyPaceHover {
     text: String,
 }
 
-/// Card chrome for LIMITS matches `card_with_captions` (border 1 + pad top 1 / left 2).
-const LIMITS_CARD_CONTENT_TOP: u16 = 2;
-const LIMITS_CARD_CONTENT_LEFT: u16 = 3;
-const LIMITS_CARD_CONTENT_RIGHT_PAD: u16 = 2;
+/// Card chrome for `card_with_captions` (border 1 + pad top 1 / left 2).
+const CARD_CONTENT_TOP: u16 = 2;
+const CARD_CONTENT_LEFT: u16 = 3;
+const CARD_CONTENT_RIGHT_PAD: u16 = 2;
 
-fn weekly_line_hit_rect(card_area: Rect, line_index: usize) -> Option<Rect> {
+fn card_content_line_rect(card_area: Rect, line_index: usize) -> Option<Rect> {
     if card_area.width < 6 || card_area.height < 4 {
         return None;
     }
     let y = card_area
         .y
-        .saturating_add(LIMITS_CARD_CONTENT_TOP)
+        .saturating_add(CARD_CONTENT_TOP)
         .saturating_add(line_index as u16);
     let bottom = card_area
         .y
@@ -6238,13 +6293,165 @@ fn weekly_line_hit_rect(card_area: Rect, line_index: usize) -> Option<Rect> {
     if y >= bottom {
         return None;
     }
-    let x = card_area.x.saturating_add(LIMITS_CARD_CONTENT_LEFT);
+    let x = card_area.x.saturating_add(CARD_CONTENT_LEFT);
     let width = card_area
         .width
-        .saturating_sub(LIMITS_CARD_CONTENT_LEFT)
-        .saturating_sub(LIMITS_CARD_CONTENT_RIGHT_PAD)
+        .saturating_sub(CARD_CONTENT_LEFT)
+        .saturating_sub(CARD_CONTENT_RIGHT_PAD)
         .max(1);
     Some(Rect::new(x, y, width, 1))
+}
+
+fn weekly_line_hit_rect(card_area: Rect, line_index: usize) -> Option<Rect> {
+    card_content_line_rect(card_area, line_index)
+}
+
+fn gauge_divider_positions<const SEGMENTS: usize>(width: u16) -> Option<[u16; SEGMENTS]> {
+    if SEGMENTS == 0 || usize::from(width) < SEGMENTS {
+        return None;
+    }
+
+    let mut positions = [0_u16; SEGMENTS];
+    for (segment, position) in positions.iter_mut().enumerate() {
+        // Rounded cumulative fractions distribute remainder cells symmetrically.
+        let numerator = ((segment + 1) as u32) * u32::from(width);
+        *position = ((numerator + (SEGMENTS as u32 / 2)) / SEGMENTS as u32) as u16 - 1;
+    }
+    Some(positions)
+}
+
+fn gauge_filled_width(used_percent: Option<f64>, width: u16) -> u16 {
+    let Some(used_percent) = used_percent.filter(|value| value.is_finite()) else {
+        return 0;
+    };
+    ((used_percent.clamp(0.0, 100.0) * f64::from(width)) / 100.0).round() as u16
+}
+
+fn gauge_fill_color(band: WeeklyPaceBand) -> Color {
+    match band {
+        WeeklyPaceBand::Normal => Color::White,
+        WeeklyPaceBand::Yellow => Color::Yellow,
+        WeeklyPaceBand::Orange => WEEKLY_PACE_ORANGE_BG,
+        WeeklyPaceBand::Red => Color::Red,
+    }
+}
+
+fn render_segmented_usage_gauge<const SEGMENTS: usize>(
+    buffer: &mut Buffer,
+    area: Rect,
+    used_percent: Option<f64>,
+    band: WeeklyPaceBand,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let Some(dividers) = gauge_divider_positions::<SEGMENTS>(area.width) else {
+        return;
+    };
+
+    let filled_width = gauge_filled_width(used_percent, area.width);
+    let fill_color = gauge_fill_color(band);
+    let fill_style = Style::default().fg(fill_color);
+    let filled_divider_style = fill_style.add_modifier(Modifier::REVERSED);
+    let empty_divider_style = Style::default().fg(Color::DarkGray);
+    let mut next_divider = 0_usize;
+
+    for offset in 0..area.width {
+        let is_divider = next_divider < dividers.len() && offset == dividers[next_divider];
+        if is_divider {
+            next_divider += 1;
+        }
+
+        let cell = &mut buffer[(area.x.saturating_add(offset), area.y)];
+        cell.reset();
+        if is_divider {
+            cell.set_symbol(LIMIT_GAUGE_DIVIDER);
+            if offset < filled_width {
+                // Reverse-video makes the right-edge divider a cutout in the filled bar.
+                cell.set_style(filled_divider_style);
+            } else {
+                cell.set_style(empty_divider_style);
+            }
+        } else if offset < filled_width {
+            cell.set_symbol(LIMIT_GAUGE_FILL).set_style(fill_style);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LimitUsageGauge {
+    Weekly {
+        used_percent: Option<f64>,
+        band: WeeklyPaceBand,
+    },
+    Monthly {
+        used_percent: Option<f64>,
+    },
+}
+
+fn limit_usage_gauge(
+    limits: Option<&crate::codex_rpc::AccountRateLimits>,
+    now_unix_secs: i64,
+) -> LimitUsageGauge {
+    let Some(limits) = limits else {
+        return LimitUsageGauge::Weekly {
+            used_percent: None,
+            band: WeeklyPaceBand::Normal,
+        };
+    };
+    let (_, top_level_weekly_window) =
+        classify_rolling_windows(limits.primary.as_ref(), limits.secondary.as_ref());
+    if let Some(window) = top_level_weekly_window
+        .filter(|window| window.used_percent.is_some_and(|value| value.is_finite()))
+    {
+        return LimitUsageGauge::Weekly {
+            used_percent: window.used_percent,
+            band: weekly_pace_band(window, now_unix_secs),
+        };
+    }
+    if let Some(monthly) = limits.individual_limit.as_ref() {
+        let used_percent = monthly
+            .remaining_percent
+            .filter(|value| value.is_finite())
+            .map(|remaining| 100.0 - remaining);
+        return LimitUsageGauge::Monthly { used_percent };
+    }
+
+    let (short_window, weekly_window) = rolling_windows_for_limits(limits);
+    let usable_weekly_window =
+        weekly_window.filter(|window| window.used_percent.is_some_and(|value| value.is_finite()));
+    if let Some(window) = usable_weekly_window {
+        return LimitUsageGauge::Weekly {
+            used_percent: window.used_percent,
+            band: weekly_pace_band(window, now_unix_secs),
+        };
+    }
+    let has_usable_short_window = short_window
+        .is_some_and(|window| window.used_percent.is_some_and(|value| value.is_finite()));
+    if !has_usable_short_window {
+        if let Some(monthly) = individual_limit_for_limits(limits) {
+            let used_percent = monthly
+                .remaining_percent
+                .filter(|value| value.is_finite())
+                .map(|remaining| 100.0 - remaining);
+            return LimitUsageGauge::Monthly { used_percent };
+        }
+    }
+    LimitUsageGauge::Weekly {
+        used_percent: None,
+        band: WeeklyPaceBand::Normal,
+    }
+}
+
+fn render_limit_usage_gauge(buffer: &mut Buffer, area: Rect, gauge: LimitUsageGauge) {
+    match gauge {
+        LimitUsageGauge::Weekly { used_percent, band } => {
+            render_segmented_usage_gauge::<WEEKLY_GAUGE_DAYS>(buffer, area, used_percent, band);
+        }
+        LimitUsageGauge::Monthly { used_percent } => {
+            render_segmented_usage_gauge::<1>(buffer, area, used_percent, WeeklyPaceBand::Normal);
+        }
+    }
 }
 
 fn rect_contains(area: Rect, point: (u16, u16)) -> bool {
@@ -6404,16 +6611,23 @@ fn render_limits_card(
     Some(WeeklyPaceHover { mouse, text })
 }
 
+fn individual_limit_for_limits(
+    limits: &crate::codex_rpc::AccountRateLimits,
+) -> Option<&crate::codex_rpc::SpendControlLimitSnapshot> {
+    limits.individual_limit.as_ref().or_else(|| {
+        limits
+            .buckets
+            .iter()
+            .find_map(|bucket| bucket.individual_limit.as_ref())
+    })
+}
+
 fn format_individual_limit_compact_lines(
     l: &crate::codex_rpc::AccountRateLimits,
     compact: bool,
     formatter: DisplayFormatter<'_>,
 ) -> Option<(String, String)> {
-    let individual_limit = l.individual_limit.as_ref().or_else(|| {
-        l.buckets
-            .iter()
-            .find_map(|bucket| bucket.individual_limit.as_ref())
-    })?;
+    let individual_limit = individual_limit_for_limits(l)?;
 
     const LABEL_W: usize = 10;
     let remaining = individual_limit
@@ -7364,6 +7578,201 @@ mod tests {
         assert!(hit.width > 0);
         assert!(rect_contains(hit, (13, 23)));
         assert!(!rect_contains(hit, (13, 22)));
+    }
+
+    #[test]
+    fn weekly_gauge_dividers_evenly_fill_the_content_width() {
+        assert_eq!(
+            gauge_divider_positions::<WEEKLY_GAUGE_DAYS>(28),
+            Some([3, 7, 11, 15, 19, 23, 27])
+        );
+        assert_eq!(
+            gauge_divider_positions::<WEEKLY_GAUGE_DAYS>(23),
+            Some([2, 6, 9, 12, 15, 19, 22])
+        );
+
+        for width in 7..=80 {
+            let positions =
+                gauge_divider_positions::<WEEKLY_GAUGE_DAYS>(width).expect("visible gauge");
+            let mut segment_widths = [0_u16; WEEKLY_GAUGE_DAYS];
+            let mut start = 0_u16;
+            for (index, end) in positions.into_iter().enumerate() {
+                segment_widths[index] = end.saturating_add(1).saturating_sub(start);
+                start = end.saturating_add(1);
+            }
+            assert_eq!(positions[WEEKLY_GAUGE_DAYS - 1], width - 1);
+            assert_eq!(segment_widths, {
+                let mut reversed = segment_widths;
+                reversed.reverse();
+                reversed
+            });
+            let shortest = segment_widths.iter().copied().min().expect("segment");
+            let longest = segment_widths.iter().copied().max().expect("segment");
+            assert!(longest - shortest <= 1);
+        }
+    }
+
+    #[test]
+    fn weekly_gauge_uses_reverse_video_for_filled_day_dividers() {
+        let area = Rect::new(0, 0, 28, 1);
+        let mut buffer = Buffer::empty(area);
+        render_segmented_usage_gauge::<WEEKLY_GAUGE_DAYS>(
+            &mut buffer,
+            area,
+            Some(21.4),
+            WeeklyPaceBand::Orange,
+        );
+
+        assert_eq!(buffer[(0, 0)].symbol(), LIMIT_GAUGE_FILL);
+        assert_eq!(buffer[(0, 0)].style().fg, Some(WEEKLY_PACE_ORANGE_BG));
+        assert_eq!(buffer[(3, 0)].symbol(), LIMIT_GAUGE_DIVIDER);
+        assert!(buffer[(3, 0)]
+            .style()
+            .add_modifier
+            .contains(Modifier::REVERSED));
+        assert_eq!(buffer[(4, 0)].symbol(), LIMIT_GAUGE_FILL);
+        assert_eq!(buffer[(6, 0)].symbol(), " ");
+        assert_eq!(buffer[(7, 0)].symbol(), LIMIT_GAUGE_DIVIDER);
+        assert_eq!(buffer[(7, 0)].style().fg, Some(Color::DarkGray));
+        assert!(!buffer[(7, 0)]
+            .style()
+            .add_modifier
+            .contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn weekly_gauge_clamps_usage_and_handles_missing_values() {
+        assert_eq!(gauge_filled_width(None, 28), 0);
+        assert_eq!(gauge_filled_width(Some(f64::NAN), 28), 0);
+        assert_eq!(gauge_filled_width(Some(-1.0), 28), 0);
+        assert_eq!(gauge_filled_width(Some(50.0), 28), 14);
+        assert_eq!(gauge_filled_width(Some(101.0), 28), 28);
+    }
+
+    #[test]
+    fn monthly_only_limit_selects_a_single_segment_gauge() {
+        let limits = crate::codex_rpc::AccountRateLimits {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            individual_limit: Some(crate::codex_rpc::SpendControlLimitSnapshot {
+                limit: Some("60000".to_string()),
+                remaining_percent: Some(75.0),
+                resets_at: None,
+                used: Some("15000".to_string()),
+            }),
+            primary: None,
+            secondary: None,
+            credits: None,
+            buckets: Vec::new(),
+            reset_credits_available: None,
+            reset_credits: None,
+        };
+
+        assert_eq!(
+            limit_usage_gauge(Some(&limits), 0),
+            LimitUsageGauge::Monthly {
+                used_percent: Some(25.0)
+            }
+        );
+    }
+
+    #[test]
+    fn empty_rolling_window_objects_do_not_override_monthly_gauge() {
+        let limits = crate::codex_rpc::AccountRateLimits {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            individual_limit: Some(crate::codex_rpc::SpendControlLimitSnapshot {
+                limit: None,
+                remaining_percent: Some(40.0),
+                resets_at: Some(1_788_192_000),
+                used: None,
+            }),
+            primary: Some(crate::codex_rpc::RateLimitWindow {
+                used_percent: None,
+                window_duration_mins: Some(300.0),
+                resets_at: None,
+            }),
+            secondary: Some(crate::codex_rpc::RateLimitWindow {
+                used_percent: None,
+                window_duration_mins: Some(10_080.0),
+                resets_at: None,
+            }),
+            credits: None,
+            buckets: Vec::new(),
+            reset_credits_available: None,
+            reset_credits: None,
+        };
+
+        assert_eq!(
+            limit_usage_gauge(Some(&limits), 0),
+            LimitUsageGauge::Monthly {
+                used_percent: Some(60.0)
+            }
+        );
+    }
+
+    #[test]
+    fn top_level_monthly_limit_ignores_auxiliary_rolling_bucket() {
+        let limits = crate::codex_rpc::AccountRateLimits {
+            limit_id: Some("active-monthly".to_string()),
+            limit_name: None,
+            individual_limit: Some(crate::codex_rpc::SpendControlLimitSnapshot {
+                limit: None,
+                remaining_percent: Some(40.0),
+                resets_at: Some(1_788_192_000),
+                used: None,
+            }),
+            primary: None,
+            secondary: None,
+            credits: None,
+            buckets: vec![crate::codex_rpc::RateLimitSnapshot {
+                limit_id: Some("auxiliary-rolling".to_string()),
+                limit_name: None,
+                individual_limit: None,
+                primary: Some(crate::codex_rpc::RateLimitWindow {
+                    used_percent: Some(10.0),
+                    window_duration_mins: Some(300.0),
+                    resets_at: None,
+                }),
+                secondary: Some(crate::codex_rpc::RateLimitWindow {
+                    used_percent: Some(20.0),
+                    window_duration_mins: Some(10_080.0),
+                    resets_at: None,
+                }),
+                credits: None,
+            }],
+            reset_credits_available: None,
+            reset_credits: None,
+        };
+
+        assert_eq!(
+            limit_usage_gauge(Some(&limits), 0),
+            LimitUsageGauge::Monthly {
+                used_percent: Some(60.0)
+            }
+        );
+    }
+
+    #[test]
+    fn monthly_gauge_has_only_the_right_edge_divider() {
+        let area = Rect::new(0, 0, 12, 1);
+        let mut buffer = Buffer::empty(area);
+        render_limit_usage_gauge(
+            &mut buffer,
+            area,
+            LimitUsageGauge::Monthly {
+                used_percent: Some(50.0),
+            },
+        );
+
+        for x in 0..6 {
+            assert_eq!(buffer[(x, 0)].symbol(), LIMIT_GAUGE_FILL);
+        }
+        for x in 6..11 {
+            assert_eq!(buffer[(x, 0)].symbol(), " ");
+        }
+        assert_eq!(buffer[(11, 0)].symbol(), LIMIT_GAUGE_DIVIDER);
+        assert_eq!(buffer[(11, 0)].style().fg, Some(Color::DarkGray));
     }
 
     #[test]

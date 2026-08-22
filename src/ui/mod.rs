@@ -1,6 +1,6 @@
 use crate::app::{
     AccentTheme, ActiveScreen, ApiStatGraph, ApiStatGrouping, AppState, BarFillMode,
-    ChartOrientation, UiClickAction, UiHitTarget,
+    ChartOrientation, LimitResetButtonState, UiClickAction, UiHitTarget,
 };
 use crate::locale::{DisplayFormatter, DisplayStyle};
 use crate::usage::{
@@ -246,6 +246,8 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
 
     if state.history_catalog_scan_prompt {
         render_history_catalog_scan_confirmation(frame, area, state);
+    } else if state.limit_reset_confirm_open {
+        render_limit_reset_confirmation(frame, area, state);
     } else if state.quit_confirm_open {
         render_quit_confirmation(frame, area, state);
     } else if state.quit_preference_prompt.is_some() {
@@ -1975,7 +1977,8 @@ fn footer_error(state: &AppState) -> String {
         ActiveScreen::Usage => state
             .usage_error
             .as_deref()
-            .or(state.limits_error.as_deref()),
+            .or(state.limits_error.as_deref())
+            .or(state.limit_reset_error.as_deref()),
         ActiveScreen::Activity => state.usage_error.as_deref(),
         ActiveScreen::ApiStat => state.account_usage_error.as_deref(),
         ActiveScreen::LimitResets => state.limits_error.as_deref(),
@@ -2028,7 +2031,10 @@ fn render_usage(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     let chunks = usage_layout(area, controls_height, cards_height);
 
     render_usage_controls(frame, chunks[0], state, reset_summary.as_deref());
-    let weekly_hover = render_usage_cards(frame, chunks[1], state);
+    let (weekly_hover, limit_reset_target) = render_usage_cards(frame, chunks[1], state);
+    if let Some(target) = limit_reset_target {
+        state.ui_hit_targets.push(target);
+    }
     render_usage_chart(frame, chunks[2], state);
     render_top_models(frame, chunks[3], state);
     if let Some(hover) = weekly_hover {
@@ -2067,7 +2073,7 @@ fn render_activity(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
         .split(area);
 
     render_activity_controls(frame, chunks[0], state, reset_summary.as_deref());
-    let weekly_hover = render_usage_cards(frame, chunks[1], state);
+    let (weekly_hover, _) = render_usage_cards(frame, chunks[1], state);
     render_activity_heatmaps(frame, chunks[2], state);
     if let Some(hover) = weekly_hover {
         render_weekly_pace_tooltip(frame, area, hover.mouse, &hover.text);
@@ -3279,8 +3285,9 @@ fn render_usage_cards(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &AppState,
-) -> Option<WeeklyPaceHover> {
+) -> (Option<WeeklyPaceHover>, Option<UiHitTarget>) {
     let mut weekly_hover: Option<WeeklyPaceHover> = None;
+    let mut limit_reset_target: Option<UiHitTarget> = None;
     let formatter = state.formatter();
     let today_now = match state.usage_zone {
         UsageZone::Local => Local::now().naive_local(),
@@ -3342,11 +3349,12 @@ fn render_usage_cards(
                         Constraint::Percentage(16),
                     ])
                     .split(row1);
-                if let Some(hover) = render_limits_card(
+                if let Some(hover) = render_usage_limits_card(
                     frame,
                     cards[0],
                     state,
                     uses_compact_limit_lines(card_layout.min_card_width),
+                    &mut limit_reset_target,
                 ) {
                     weekly_hover = Some(hover);
                 };
@@ -3376,11 +3384,12 @@ fn render_usage_cards(
                         Constraint::Percentage(33),
                     ])
                     .split(row1);
-                if let Some(hover) = render_limits_card(
+                if let Some(hover) = render_usage_limits_card(
                     frame,
                     top[0],
                     state,
                     uses_compact_limit_lines(card_layout.min_card_width),
+                    &mut limit_reset_target,
                 ) {
                     weekly_hover = Some(hover);
                 };
@@ -3409,7 +3418,7 @@ fn render_usage_cards(
             render_pending(frame, aux_title, bottom[1]);
             render_pending(frame, "PEAK_DAY", bottom[2]);
         }
-        return weekly_hover;
+        return (weekly_hover, limit_reset_target);
     }
 
     // TODAY card always shows Tokens / Runs / Time.
@@ -3499,11 +3508,12 @@ fn render_usage_cards(
                             Constraint::Percentage(16),
                         ])
                         .split(row1);
-                    if let Some(hover) = render_limits_card(
+                    if let Some(hover) = render_usage_limits_card(
                         frame,
                         cards[0],
                         state,
                         uses_compact_limit_lines(card_layout.min_card_width),
+                        &mut limit_reset_target,
                     ) {
                         weekly_hover = Some(hover);
                     };
@@ -3550,11 +3560,12 @@ fn render_usage_cards(
                             Constraint::Percentage(33),
                         ])
                         .split(row1);
-                    if let Some(hover) = render_limits_card(
+                    if let Some(hover) = render_usage_limits_card(
                         frame,
                         top[0],
                         state,
                         uses_compact_limit_lines(card_layout.min_card_width),
+                        &mut limit_reset_target,
                     ) {
                         weekly_hover = Some(hover);
                     };
@@ -3649,11 +3660,12 @@ fn render_usage_cards(
                             Constraint::Percentage(16),
                         ])
                         .split(row1);
-                    if let Some(hover) = render_limits_card(
+                    if let Some(hover) = render_usage_limits_card(
                         frame,
                         cards[0],
                         state,
                         uses_compact_limit_lines(card_layout.min_card_width),
+                        &mut limit_reset_target,
                     ) {
                         weekly_hover = Some(hover);
                     };
@@ -3697,11 +3709,12 @@ fn render_usage_cards(
                             Constraint::Percentage(33),
                         ])
                         .split(row1);
-                    if let Some(hover) = render_limits_card(
+                    if let Some(hover) = render_usage_limits_card(
                         frame,
                         top[0],
                         state,
                         uses_compact_limit_lines(card_layout.min_card_width),
+                        &mut limit_reset_target,
                     ) {
                         weekly_hover = Some(hover);
                     };
@@ -3834,11 +3847,12 @@ fn render_usage_cards(
                             Constraint::Percentage(16),
                         ])
                         .split(row1);
-                    if let Some(hover) = render_limits_card(
+                    if let Some(hover) = render_usage_limits_card(
                         frame,
                         cards[0],
                         state,
                         uses_compact_limit_lines(card_layout.min_card_width),
+                        &mut limit_reset_target,
                     ) {
                         weekly_hover = Some(hover);
                     };
@@ -3880,11 +3894,12 @@ fn render_usage_cards(
                             Constraint::Percentage(33),
                         ])
                         .split(row1);
-                    if let Some(hover) = render_limits_card(
+                    if let Some(hover) = render_usage_limits_card(
                         frame,
                         top[0],
                         state,
                         uses_compact_limit_lines(card_layout.min_card_width),
+                        &mut limit_reset_target,
                     ) {
                         weekly_hover = Some(hover);
                     };
@@ -3931,7 +3946,7 @@ fn render_usage_cards(
             }
         }
     }
-    weekly_hover
+    (weekly_hover, limit_reset_target)
 }
 
 fn aggregate_usage_days(days: &[UsageDay], grouping: ChartRange) -> Vec<UsageDay> {
@@ -5259,6 +5274,73 @@ fn render_history_catalog_scan_confirmation(
             pill("YES", false),
             Span::raw("   "),
             pill("NO", true),
+        ]))
+        .alignment(Alignment::Center),
+        buttons_area,
+    );
+}
+
+fn render_limit_reset_confirmation(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
+    state.ui_hit_targets.clear();
+
+    let popup = centered_rect(area.width.min(58), area.height.min(11), area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .title(Span::styled(
+                " Use reset credit ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        popup,
+    );
+
+    let message_area = Rect::new(
+        popup.x.saturating_add(2),
+        popup.y.saturating_add(2),
+        popup.width.saturating_sub(4),
+        popup.height.saturating_sub(5),
+    );
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            Line::from("Consume one reset credit and reset exhausted limits?"),
+            Line::from(""),
+            Line::from(Span::styled(
+                "The RESET button will be locked for one hour.",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(Span::styled(
+                "Y confirms; N/Esc cancels.",
+                Style::default().fg(Color::Gray),
+            )),
+        ]))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true }),
+        message_area,
+    );
+
+    let buttons_area = Rect::new(
+        popup.x.saturating_add(1),
+        popup.y.saturating_add(popup.height.saturating_sub(2)),
+        popup.width.saturating_sub(2),
+        1,
+    );
+    let segments = [
+        (" YES ", Some(UiClickAction::ConfirmLimitReset)),
+        ("   ", None),
+        (" NO ", Some(UiClickAction::CancelLimitReset)),
+    ];
+    state
+        .ui_hit_targets
+        .extend(centered_targets(buttons_area, &segments));
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            pill("YES", state.limit_reset_confirm_yes_selected),
+            Span::raw("   "),
+            pill("NO", !state.limit_reset_confirm_yes_selected),
         ]))
         .alignment(Alignment::Center),
         buttons_area,
@@ -6609,6 +6691,94 @@ fn render_limits_card(
         return None;
     }
     Some(WeeklyPaceHover { mouse, text })
+}
+
+fn render_usage_limits_card(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &AppState,
+    compact: bool,
+    reset_target: &mut Option<UiHitTarget>,
+) -> Option<WeeklyPaceHover> {
+    let weekly_hover = render_limits_card(frame, area, state, compact);
+    if state.active_screen != ActiveScreen::Usage {
+        return weekly_hover;
+    }
+
+    let button_state = state.limit_reset_button_state();
+    let (label, style, tooltip, clickable) = match button_state {
+        LimitResetButtonState::Enabled => (
+            " RESET ".to_string(),
+            Style::default()
+                .fg(Color::Black)
+                .bg(state.accent_text_color())
+                .add_modifier(Modifier::BOLD),
+            "Use one reset credit for exhausted limit windows.".to_string(),
+            true,
+        ),
+        LimitResetButtonState::Disabled => (
+            " RESET ".to_string(),
+            Style::default().fg(Color::DarkGray),
+            state.limit_reset_disabled_reason().to_string(),
+            false,
+        ),
+        LimitResetButtonState::Cooldown(remaining_secs) => {
+            let minutes = remaining_secs.div_ceil(60);
+            let time = if minutes >= 60 {
+                "1h".to_string()
+            } else {
+                format!("{minutes}m")
+            };
+            (
+                format!(" RESET {time} "),
+                Style::default().fg(Color::Gray),
+                format!("Reset cooldown active for about {time}."),
+                false,
+            )
+        }
+        LimitResetButtonState::InFlight => (
+            " RESET... ".to_string(),
+            Style::default()
+                .fg(state.accent_text_color())
+                .add_modifier(Modifier::BOLD),
+            "Reset request is in progress.".to_string(),
+            false,
+        ),
+    };
+    let width = u16::try_from(UnicodeWidthStr::width(label.as_str())).unwrap_or(u16::MAX);
+    if width == 0 || area.width < width.saturating_add(12) || area.height == 0 {
+        return weekly_hover;
+    }
+    let button_area = Rect::new(
+        area.x
+            .saturating_add(area.width.saturating_sub(width).saturating_sub(1)),
+        area.y,
+        width,
+        1,
+    );
+    frame.render_widget(Paragraph::new(Span::styled(label, style)), button_area);
+    if clickable {
+        *reset_target = Some(UiHitTarget {
+            area: button_area,
+            action: UiClickAction::PromptLimitReset,
+        });
+    }
+
+    if state
+        .mouse_position
+        .is_some_and(|mouse| rect_contains(button_area, mouse))
+    {
+        return state.mouse_position.map(|mouse| WeeklyPaceHover {
+            mouse,
+            text: state
+                .limit_reset_error
+                .as_deref()
+                .or(state.limit_reset_notice.as_deref())
+                .unwrap_or(&tooltip)
+                .to_string(),
+        });
+    }
+    weekly_hover
 }
 
 fn individual_limit_for_limits(

@@ -78,6 +78,14 @@ pub struct AccountRateLimits {
     pub reset_credits: Option<Vec<RateLimitResetCredit>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetCreditOutcome {
+    Reset,
+    NothingToReset,
+    NoCredit,
+    AlreadyRedeemed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountUsageSummary {
     pub lifetime_tokens: Option<u64>,
@@ -391,6 +399,25 @@ impl CodexRpc {
         parse_account_usage_result(&result)
     }
 
+    pub async fn consume_account_rate_limit_reset_credit(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<ResetCreditOutcome> {
+        let value = self
+            .send_request(
+                "account/rateLimitResetCredit/consume",
+                json!({ "idempotencyKey": idempotency_key }),
+            )
+            .await?;
+
+        if let Some(err) = value.get("error") {
+            return Err(anyhow!("account/rateLimitResetCredit/consume error: {err}"));
+        }
+
+        let result = value.get("result").cloned().unwrap_or(Value::Null);
+        parse_reset_credit_outcome(&result)
+    }
+
     pub async fn recv_notification(&self) -> Option<Value> {
         self.notifications.lock().await.recv().await
     }
@@ -403,6 +430,17 @@ impl CodexRpc {
 
 pub fn is_account_rate_limits_updated_notification(value: &Value) -> bool {
     value.get("method").and_then(|v| v.as_str()) == Some("account/rateLimits/updated")
+}
+
+fn parse_reset_credit_outcome(result: &Value) -> Result<ResetCreditOutcome> {
+    match result.get("outcome").and_then(Value::as_str) {
+        Some("reset") => Ok(ResetCreditOutcome::Reset),
+        Some("nothingToReset") => Ok(ResetCreditOutcome::NothingToReset),
+        Some("noCredit") => Ok(ResetCreditOutcome::NoCredit),
+        Some("alreadyRedeemed") => Ok(ResetCreditOutcome::AlreadyRedeemed),
+        Some(other) => Err(anyhow!("unknown reset-credit outcome: {other}")),
+        None => Err(anyhow!("reset-credit outcome missing")),
+    }
 }
 
 fn non_empty_string(value: String) -> Option<String> {
@@ -982,6 +1020,27 @@ mod tests {
             limits.buckets[1].limit_name.as_deref(),
             Some("GPT-5.3-Codex-Spark")
         );
+    }
+
+    #[test]
+    fn parses_all_reset_credit_outcomes() {
+        for (raw, expected) in [
+            ("reset", ResetCreditOutcome::Reset),
+            ("nothingToReset", ResetCreditOutcome::NothingToReset),
+            ("noCredit", ResetCreditOutcome::NoCredit),
+            ("alreadyRedeemed", ResetCreditOutcome::AlreadyRedeemed),
+        ] {
+            assert_eq!(
+                parse_reset_credit_outcome(&json!({ "outcome": raw })).expect("outcome"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_or_missing_reset_credit_outcome() {
+        assert!(parse_reset_credit_outcome(&json!({ "outcome": "futureValue" })).is_err());
+        assert!(parse_reset_credit_outcome(&json!({})).is_err());
     }
 
     #[test]

@@ -6711,7 +6711,7 @@ fn render_usage_limits_card(
             " RESET ".to_string(),
             Style::default()
                 .fg(Color::Black)
-                .bg(state.accent_text_color())
+                .bg(Color::White)
                 .add_modifier(Modifier::BOLD),
             "Use one reset credit for exhausted limit windows.".to_string(),
             true,
@@ -6751,11 +6751,12 @@ fn render_usage_limits_card(
     }
     let button_area = Rect::new(
         area.x
-            .saturating_add(area.width.saturating_sub(width).saturating_sub(1)),
-        area.y,
+            .saturating_add(area.width.saturating_sub(width).saturating_sub(2)),
+        area.y.saturating_add(area.height / 2),
         width,
         1,
     );
+    frame.render_widget(Clear, button_area);
     frame.render_widget(Paragraph::new(Span::styled(label, style)), button_area);
     if clickable {
         *reset_target = Some(UiHitTarget {
@@ -6770,12 +6771,15 @@ fn render_usage_limits_card(
     {
         return state.mouse_position.map(|mouse| WeeklyPaceHover {
             mouse,
-            text: state
-                .limit_reset_error
-                .as_deref()
-                .or(state.limit_reset_notice.as_deref())
-                .unwrap_or(&tooltip)
-                .to_string(),
+            text: match button_state {
+                LimitResetButtonState::Cooldown(_) | LimitResetButtonState::InFlight => state
+                    .limit_reset_error
+                    .as_deref()
+                    .or(state.limit_reset_notice.as_deref())
+                    .unwrap_or(&tooltip)
+                    .to_string(),
+                LimitResetButtonState::Enabled | LimitResetButtonState::Disabled => tooltip,
+            },
         });
     }
     weekly_hover

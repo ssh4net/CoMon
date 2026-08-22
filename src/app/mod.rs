@@ -1,4 +1,4 @@
-use crate::codex_rpc::{AccountRateLimits, AccountUsage, CodexRpc};
+use crate::codex_rpc::{AccountRateLimits, AccountUsage, CodexRpc, ResetCreditOutcome};
 use crate::locale::{DisplayFormatter, DisplayStyle, SystemLocale};
 use crate::read;
 use crate::usage::{ChartRange, LocalUsageSnapshot, UsageMetric, UsageZone};
@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Stdout;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 
@@ -204,6 +205,7 @@ enum UsageCommand {
 enum AppEvent {
     UsageUpdated(Result<LocalUsageSnapshot>),
     LimitsUpdated(Result<AccountRateLimits>),
+    LimitResetConsumed(Result<ResetCreditOutcome>),
     AccountUsageUpdated(Result<AccountUsage>),
     AccountApiUnavailable {
         message: String,
@@ -257,6 +259,9 @@ pub(crate) enum UiClickAction {
     SetActivityScrollOffset(usize),
     DecreaseProjects,
     IncreaseProjects,
+    PromptLimitReset,
+    ConfirmLimitReset,
+    CancelLimitReset,
     PromptQuit,
     CancelQuit,
     ConfirmQuit,
@@ -396,6 +401,12 @@ pub(crate) struct AppState {
     pub(crate) limits_error: Option<String>,
     pub(crate) limits_notice: Option<String>,
     pub(crate) limits_enabled: bool,
+    pub(crate) limit_reset_confirm_open: bool,
+    pub(crate) limit_reset_confirm_yes_selected: bool,
+    pub(crate) limit_reset_in_flight: bool,
+    pub(crate) limit_reset_cooldown_until: Option<i64>,
+    pub(crate) limit_reset_notice: Option<String>,
+    pub(crate) limit_reset_error: Option<String>,
 
     pub(crate) account_usage: Option<AccountUsage>,
     pub(crate) account_usage_updated_at: Option<Instant>,
@@ -405,18 +416,30 @@ pub(crate) struct AppState {
     pub(crate) read_browser: crate::read::tui::BrowserState,
 }
 
-const STATE_STORE_SCHEMA_VERSION: u32 = 3;
+const STATE_STORE_SCHEMA_VERSION: u32 = 4;
 const STATE_STORE_FILE_NAME: &str = "state.json";
 const STATE_SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
 const IDLE_UI_TICK: Duration = Duration::from_secs(1);
+const LIMIT_RESET_COOLDOWN_SECS: i64 = 60 * 60;
+const LIMIT_EXHAUSTED_EPSILON: f64 = 0.01;
+static LIMIT_RESET_ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 pub(crate) const DEFAULT_ACTIVITY_PROJECT_LIMIT: usize = 5;
 pub(crate) const MIN_ACTIVITY_PROJECT_LIMIT: usize = 1;
 pub(crate) const MAX_ACTIVITY_PROJECT_LIMIT: usize = 50;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum LimitsWake {
     Poll,
+    ConsumeReset(String),
     Stop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LimitResetButtonState {
+    Enabled,
+    Disabled,
+    Cooldown(u64),
+    InFlight,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -435,6 +458,7 @@ struct PersistedUiState {
     accent_theme: AccentTheme,
     bar_fill_mode: BarFillMode,
     skip_quit_confirmation: bool,
+    limit_reset_cooldown_until: Option<i64>,
     history_project_view_mode: crate::read::catalog::ProjectViewMode,
     history_deep_depth: u8,
     history_selected_projects: BTreeSet<String>,
@@ -459,6 +483,7 @@ impl PersistedUiState {
             accent_theme: AccentTheme::default(),
             bar_fill_mode: BarFillMode::default(),
             skip_quit_confirmation: false,
+            limit_reset_cooldown_until: None,
             history_project_view_mode: crate::read::catalog::ProjectViewMode::Strict,
             history_deep_depth: crate::read::catalog::DEFAULT_DEEP_DEPTH,
             history_selected_projects: BTreeSet::new(),
@@ -483,6 +508,9 @@ impl PersistedUiState {
             accent_theme: state.accent_theme,
             bar_fill_mode: state.bar_fill_mode,
             skip_quit_confirmation: state.skip_quit_confirmation,
+            limit_reset_cooldown_until: state
+                .limit_reset_cooldown_until
+                .filter(|until| *until > unix_time_seconds()),
             history_project_view_mode: state.read_browser.project_mode(),
             history_deep_depth: state.read_browser.deep_depth(),
             history_selected_projects: state.read_browser.selected_projects().clone(),
@@ -529,6 +557,7 @@ struct StoredGlobalState {
     bar_fill_mode: Option<String>,
     #[serde(default)]
     skip_quit_confirmation: bool,
+    limit_reset_cooldown_until: Option<i64>,
     last_workspace_path: Option<String>,
     history_project_view_mode: Option<String>,
     history_deep_depth: Option<u8>,
@@ -562,6 +591,7 @@ async fn run_inner(
     let (evt_tx, mut evt_rx) = mpsc::channel::<AppEvent>(64);
     let (usage_refresh_tx, usage_refresh_rx) = mpsc::channel::<()>(1);
     let (limits_refresh_tx, limits_refresh_rx) = mpsc::channel::<()>(1);
+    let (limit_reset_tx, limit_reset_rx) = mpsc::channel::<String>(4);
     let (catalog_refresh_tx, catalog_refresh_rx) = mpsc::channel::<()>(1);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let restored_ui_state = load_persisted_ui_state_with_history_depth(
@@ -808,6 +838,7 @@ async fn run_inner(
         let cwd = config.cwd.clone();
         let refresh = Duration::from_secs(config.refresh_limits_secs);
         let mut limits_refresh_rx = limits_refresh_rx;
+        let mut limit_reset_rx = limit_reset_rx;
         let mut shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             if live_limits_mode == LiveLimitsMode::Off {
@@ -879,6 +910,12 @@ async fn run_inner(
                             LimitsWake::Poll
                         }
                     }
+                    recv = limit_reset_rx.recv() => {
+                        match recv {
+                            Some(idempotency_key) => LimitsWake::ConsumeReset(idempotency_key),
+                            None => LimitsWake::Stop,
+                        }
+                    }
                     notification = rpc.recv_notification() => {
                         match notification {
                             Some(value)
@@ -891,9 +928,25 @@ async fn run_inner(
                         }
                     }
                 };
-                if wake == LimitsWake::Stop {
-                    rpc.kill().await;
-                    break;
+                match wake {
+                    LimitsWake::Stop => {
+                        rpc.kill().await;
+                        break;
+                    }
+                    LimitsWake::ConsumeReset(idempotency_key) => {
+                        let result = rpc
+                            .consume_account_rate_limit_reset_credit(&idempotency_key)
+                            .await;
+                        if evt_tx
+                            .send(AppEvent::LimitResetConsumed(result))
+                            .await
+                            .is_err()
+                        {
+                            rpc.kill().await;
+                            break;
+                        }
+                    }
+                    LimitsWake::Poll => {}
                 }
                 let res = rpc.read_account_rate_limits().await;
                 if evt_tx.send(AppEvent::LimitsUpdated(res)).await.is_err() {
@@ -998,6 +1051,14 @@ async fn run_inner(
         limits_error: None,
         limits_notice: None,
         limits_enabled: true,
+        limit_reset_confirm_open: false,
+        limit_reset_confirm_yes_selected: false,
+        limit_reset_in_flight: false,
+        limit_reset_cooldown_until: restored_ui_state
+            .limit_reset_cooldown_until
+            .filter(|until| *until > unix_time_seconds()),
+        limit_reset_notice: None,
+        limit_reset_error: None,
         account_usage: None,
         account_usage_updated_at: None,
         account_usage_error: None,
@@ -1024,7 +1085,9 @@ async fn run_inner(
                         input,
                         &usage_refresh_tx,
                         &limits_refresh_tx,
+                        &limit_reset_tx,
                         &catalog_refresh_tx,
+                        &config.comon_home,
                     )? {
                         InputOutcome::Continue(should_redraw) => {
                             dirty |= should_redraw;
@@ -1117,12 +1180,109 @@ fn clear_scan_cache_files(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn new_limit_reset_idempotency_key() -> String {
+    let sequence = LIMIT_RESET_ATTEMPT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("comon-{}-{nanos}-{sequence}", std::process::id())
+}
+
+fn begin_limit_reset(
+    state: &mut AppState,
+    limit_reset_tx: &mpsc::Sender<String>,
+    comon_home: &Path,
+) -> Result<bool> {
+    if state.limit_reset_button_state() != LimitResetButtonState::Enabled {
+        state.limit_reset_confirm_open = false;
+        state.limit_reset_confirm_yes_selected = false;
+        return Ok(true);
+    }
+
+    state.limit_reset_confirm_open = false;
+    state.limit_reset_confirm_yes_selected = false;
+    state.limit_reset_in_flight = true;
+    state.limit_reset_cooldown_until =
+        Some(unix_time_seconds().saturating_add(LIMIT_RESET_COOLDOWN_SECS));
+    state.limit_reset_notice = Some("Reset request queued; waiting for Codex.".to_string());
+    state.limit_reset_error = None;
+
+    // Persist the safety lock before the irreversible request. If persistence fails, do not
+    // consume a credit: an immediate restart could otherwise permit an accidental retry.
+    if let Err(error) =
+        save_persisted_ui_state(comon_home, &PersistedUiState::from_app_state(state))
+    {
+        state.limit_reset_in_flight = false;
+        state.limit_reset_cooldown_until = None;
+        state.limit_reset_notice = None;
+        state.limit_reset_error = Some(format!("Unable to save reset cooldown: {error}"));
+        return Ok(true);
+    }
+
+    let idempotency_key = new_limit_reset_idempotency_key();
+    if let Err(error) = limit_reset_tx.try_send(idempotency_key) {
+        state.limit_reset_in_flight = false;
+        state.limit_reset_cooldown_until = None;
+        state.limit_reset_notice = None;
+        state.limit_reset_error = Some(format!("Unable to queue reset request: {error}"));
+        let _ = save_persisted_ui_state(comon_home, &PersistedUiState::from_app_state(state));
+    }
+    Ok(true)
+}
+
+fn handle_limit_reset_confirmation_input(
+    state: &mut AppState,
+    event: Event,
+    limit_reset_tx: &mpsc::Sender<String>,
+    comon_home: &Path,
+) -> Result<InputOutcome> {
+    let finish = |state: &mut AppState, confirmed: bool| -> Result<InputOutcome> {
+        if confirmed {
+            begin_limit_reset(state, limit_reset_tx, comon_home)?;
+        } else {
+            state.limit_reset_confirm_open = false;
+            state.limit_reset_confirm_yes_selected = false;
+        }
+        Ok(InputOutcome::Continue(true))
+    };
+
+    match event {
+        Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+            match ui_click_action_at(&state.ui_hit_targets, mouse.column, mouse.row) {
+                Some(UiClickAction::ConfirmLimitReset) => finish(state, true),
+                Some(UiClickAction::CancelLimitReset) => finish(state, false),
+                _ => Ok(InputOutcome::Continue(false)),
+            }
+        }
+        Event::Key(key) if key.kind == KeyEventKind::Press => match (key.code, key.modifiers) {
+            (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => finish(state, true),
+            (KeyCode::Enter, _) => finish(state, state.limit_reset_confirm_yes_selected),
+            (KeyCode::Left, _) | (KeyCode::Right, _) | (KeyCode::Tab, _) => {
+                state.limit_reset_confirm_yes_selected = !state.limit_reset_confirm_yes_selected;
+                Ok(InputOutcome::Continue(true))
+            }
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => Ok(InputOutcome::Quit),
+            (KeyCode::Esc, _)
+            | (KeyCode::Char('n'), _)
+            | (KeyCode::Char('N'), _)
+            | (KeyCode::Char('q'), _)
+            | (KeyCode::Char('Q'), _) => finish(state, false),
+            _ => Ok(InputOutcome::Continue(false)),
+        },
+        Event::Resize(_, _) => Ok(InputOutcome::Continue(true)),
+        _ => Ok(InputOutcome::Continue(false)),
+    }
+}
+
 fn handle_input_event(
     state: &mut AppState,
     event: Event,
     usage_refresh_tx: &mpsc::Sender<()>,
     limits_refresh_tx: &mpsc::Sender<()>,
+    limit_reset_tx: &mpsc::Sender<String>,
     catalog_refresh_tx: &mpsc::Sender<()>,
+    comon_home: &Path,
 ) -> Result<InputOutcome> {
     if state.history_catalog_scan_prompt {
         return match event {
@@ -1170,6 +1330,10 @@ fn handle_input_event(
             Event::Resize(_, _) => Ok(InputOutcome::Continue(true)),
             _ => Ok(InputOutcome::Continue(false)),
         };
+    }
+
+    if state.limit_reset_confirm_open {
+        return handle_limit_reset_confirmation_input(state, event, limit_reset_tx, comon_home);
     }
 
     if let Some(desired_skip_confirmation) = state.quit_preference_prompt {
@@ -1618,6 +1782,15 @@ fn apply_ui_click_action(state: &mut AppState, action: UiClickAction) -> bool {
             state.activity_project_limit = next;
             changed
         }
+        UiClickAction::PromptLimitReset => {
+            if state.limit_reset_button_state() != LimitResetButtonState::Enabled {
+                return false;
+            }
+            state.limit_reset_confirm_open = true;
+            state.limit_reset_confirm_yes_selected = false;
+            true
+        }
+        UiClickAction::ConfirmLimitReset | UiClickAction::CancelLimitReset => false,
         UiClickAction::PromptQuit => {
             state.quit_confirm_open = true;
             state.quit_confirm_yes_selected = false;
@@ -2096,6 +2269,42 @@ fn handle_app_event(state: &mut AppState, evt: AppEvent) -> bool {
             }
             true
         }
+        AppEvent::LimitResetConsumed(res) => {
+            state.limit_reset_in_flight = false;
+            match res {
+                Ok(ResetCreditOutcome::Reset) => {
+                    state.limit_reset_notice =
+                        Some("Limit reset accepted; refreshing server statistics.".to_string());
+                    state.limit_reset_error = None;
+                }
+                Ok(ResetCreditOutcome::AlreadyRedeemed) => {
+                    state.limit_reset_notice = Some(
+                        "This reset attempt was already redeemed; refreshing server statistics."
+                            .to_string(),
+                    );
+                    state.limit_reset_error = None;
+                }
+                Ok(ResetCreditOutcome::NothingToReset) => {
+                    state.limit_reset_cooldown_until = None;
+                    state.limit_reset_notice =
+                        Some("Codex reports that no limit is eligible for reset.".to_string());
+                    state.limit_reset_error = None;
+                }
+                Ok(ResetCreditOutcome::NoCredit) => {
+                    state.limit_reset_cooldown_until = None;
+                    state.limit_reset_notice =
+                        Some("No reset credit is currently available.".to_string());
+                    state.limit_reset_error = None;
+                }
+                Err(error) => {
+                    // Keep the cooldown after an ambiguous transport/server failure: the backend
+                    // may have consumed the credit even when the response did not arrive.
+                    state.limit_reset_notice = None;
+                    state.limit_reset_error = Some(format!("Limit reset failed: {error}"));
+                }
+            }
+            true
+        }
         AppEvent::AccountUsageUpdated(res) => {
             match res {
                 Ok(usage) => {
@@ -2217,6 +2426,10 @@ fn load_persisted_ui_state_with_history_depth(
         }
     }
     state.skip_quit_confirmation = store.global.skip_quit_confirmation;
+    state.limit_reset_cooldown_until = store
+        .global
+        .limit_reset_cooldown_until
+        .filter(|until| *until > unix_time_seconds());
     if let Some(mode_text) = store.global.history_project_view_mode.as_deref() {
         if let Some(mode) = crate::read::catalog::ProjectViewMode::from_store(mode_text) {
             state.history_project_view_mode = mode;
@@ -2280,6 +2493,9 @@ fn save_persisted_ui_state(comon_home: &Path, state: &PersistedUiState) -> Resul
     store.global.accent_theme = Some(state.accent_theme.store_value().to_string());
     store.global.bar_fill_mode = Some(state.bar_fill_mode.store_value().to_string());
     store.global.skip_quit_confirmation = state.skip_quit_confirmation;
+    store.global.limit_reset_cooldown_until = state
+        .limit_reset_cooldown_until
+        .filter(|until| *until > now);
     store.global.history_project_view_mode =
         Some(state.history_project_view_mode.store_value().to_string());
     store.global.history_deep_depth = Some(
@@ -2475,12 +2691,80 @@ impl AppState {
         let updated_at = self.account_usage_updated_at?;
         Some(crate::ui::format_updated_label(updated_at))
     }
+
+    pub(crate) fn limit_reset_button_state(&self) -> LimitResetButtonState {
+        if self.limit_reset_in_flight {
+            return LimitResetButtonState::InFlight;
+        }
+        let now = unix_time_seconds();
+        if let Some(remaining) = self
+            .limit_reset_cooldown_until
+            .and_then(|until| until.checked_sub(now))
+            .filter(|remaining| *remaining > 0)
+        {
+            return LimitResetButtonState::Cooldown(remaining as u64);
+        }
+        if self.limits_enabled && self.limits.as_ref().is_some_and(limit_reset_is_available) {
+            LimitResetButtonState::Enabled
+        } else {
+            LimitResetButtonState::Disabled
+        }
+    }
+
+    pub(crate) fn limit_reset_disabled_reason(&self) -> &'static str {
+        if !self.limits_enabled || self.limits.is_none() {
+            "Limits are unavailable."
+        } else if self
+            .limits
+            .as_ref()
+            .and_then(|limits| limits.reset_credits_available)
+            .unwrap_or(0)
+            <= 0
+        {
+            "No reset credits are available."
+        } else {
+            "Reset becomes available when a limit reaches 0% remaining."
+        }
+    }
+}
+
+fn limit_reset_is_available(limits: &AccountRateLimits) -> bool {
+    limits.reset_credits_available.unwrap_or(0) > 0 && account_has_exhausted_limit(limits)
+}
+
+fn account_has_exhausted_limit(limits: &AccountRateLimits) -> bool {
+    snapshot_has_exhausted_limit(
+        limits.primary.as_ref(),
+        limits.secondary.as_ref(),
+        limits.individual_limit.as_ref(),
+    ) || limits.buckets.iter().any(|bucket| {
+        snapshot_has_exhausted_limit(
+            bucket.primary.as_ref(),
+            bucket.secondary.as_ref(),
+            bucket.individual_limit.as_ref(),
+        )
+    })
+}
+
+fn snapshot_has_exhausted_limit(
+    primary: Option<&crate::codex_rpc::RateLimitWindow>,
+    secondary: Option<&crate::codex_rpc::RateLimitWindow>,
+    individual: Option<&crate::codex_rpc::SpendControlLimitSnapshot>,
+) -> bool {
+    [primary, secondary].into_iter().flatten().any(|window| {
+        window
+            .used_percent
+            .is_some_and(|used| used.is_finite() && used >= 100.0 - LIMIT_EXHAUSTED_EPSILON)
+    }) || individual.is_some_and(|limit| {
+        limit
+            .remaining_percent
+            .is_some_and(|remaining| remaining.is_finite() && remaining <= LIMIT_EXHAUSTED_EPSILON)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -2607,6 +2891,56 @@ mod tests {
         assert!(!should_continue_scan_catch_up(0, 10, 1_000, Some((9, 900))));
     }
 
+    fn reset_test_limits(used_percent: Option<f64>, available: i64) -> AccountRateLimits {
+        AccountRateLimits {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            individual_limit: None,
+            primary: Some(crate::codex_rpc::RateLimitWindow {
+                used_percent,
+                window_duration_mins: Some(300.0),
+                resets_at: None,
+            }),
+            secondary: None,
+            credits: None,
+            buckets: Vec::new(),
+            reset_credits_available: Some(available),
+            reset_credits: None,
+        }
+    }
+
+    #[test]
+    fn reset_requires_both_a_credit_and_an_exhausted_limit() {
+        assert!(limit_reset_is_available(&reset_test_limits(
+            Some(99.999),
+            1
+        )));
+        assert!(!limit_reset_is_available(&reset_test_limits(Some(99.0), 1)));
+        assert!(!limit_reset_is_available(&reset_test_limits(
+            Some(100.0),
+            0
+        )));
+    }
+
+    #[test]
+    fn reset_detects_an_exhausted_individual_limit_in_a_bucket() {
+        let mut limits = reset_test_limits(Some(20.0), 1);
+        limits.buckets.push(crate::codex_rpc::RateLimitSnapshot {
+            limit_id: Some("monthly".to_string()),
+            limit_name: None,
+            individual_limit: Some(crate::codex_rpc::SpendControlLimitSnapshot {
+                limit: None,
+                remaining_percent: Some(0.0),
+                resets_at: None,
+                used: None,
+            }),
+            primary: None,
+            secondary: None,
+            credits: None,
+        });
+        assert!(limit_reset_is_available(&limits));
+    }
+
     fn make_temp_dir(prefix: &str) -> PathBuf {
         let unique = format!(
             "{}-{}-{}",
@@ -2716,6 +3050,20 @@ mod tests {
         let loaded = load_persisted_ui_state(&comon_home, None).expect("load persisted ui state");
         assert_eq!(loaded.accent_theme, AccentTheme::Magenta);
         assert_eq!(loaded.bar_fill_mode, BarFillMode::DualColorBackground);
+
+        let _ = std::fs::remove_dir_all(comon_home);
+    }
+
+    #[test]
+    fn active_reset_cooldown_round_trips_through_state_store() {
+        let comon_home = make_temp_dir("limit-reset-cooldown");
+        let mut state = PersistedUiState::default_for_workspace(None);
+        let cooldown_until = unix_time_seconds().saturating_add(3_600);
+        state.limit_reset_cooldown_until = Some(cooldown_until);
+
+        save_persisted_ui_state(&comon_home, &state).expect("save persisted ui state");
+        let loaded = load_persisted_ui_state(&comon_home, None).expect("load persisted ui state");
+        assert_eq!(loaded.limit_reset_cooldown_until, Some(cooldown_until));
 
         let _ = std::fs::remove_dir_all(comon_home);
     }

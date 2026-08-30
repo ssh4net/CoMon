@@ -505,7 +505,7 @@ fn render_api_stats(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
 }
 
 fn api_stat_controls_height(summary: Option<&str>, width: u16) -> u16 {
-    1_u16.saturating_add(reset_summary_height(summary, width))
+    1_u16.saturating_add(reset_summary_height(summary, width, None))
 }
 
 fn render_api_stat_controls(
@@ -514,7 +514,7 @@ fn render_api_stat_controls(
     state: &mut AppState,
     reset_summary: Option<&str>,
 ) {
-    let reset_height = reset_summary_height(reset_summary, area.width);
+    let reset_height = reset_summary_height(reset_summary, area.width, None);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(reset_height)])
@@ -613,7 +613,7 @@ fn render_api_stat_controls(
     );
 
     if let Some(text) = reset_summary {
-        render_reset_summary(frame, chunks[1], text, state.accent_text_color());
+        let _ = render_reset_summary(frame, chunks[1], text, state.accent_text_color(), None);
     }
 }
 
@@ -2027,17 +2027,27 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 fn render_usage(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     let cards_height = usage_cards_height(state, area.width);
     let reset_summary = reset_summary_text(state);
-    let controls_height = usage_controls_height(reset_summary.as_deref(), area.width);
+    let reset_button = reset_summary
+        .as_ref()
+        .map(|_| limit_reset_button_view(state));
+    let controls_height = usage_controls_height(
+        reset_summary.as_deref(),
+        area.width,
+        reset_button.as_ref().map(LimitResetButtonView::width),
+    );
     let chunks = usage_layout(area, controls_height, cards_height);
 
-    render_usage_controls(frame, chunks[0], state, reset_summary.as_deref());
-    let (weekly_hover, limit_reset_target) = render_usage_cards(frame, chunks[1], state);
-    if let Some(target) = limit_reset_target {
-        state.ui_hit_targets.push(target);
-    }
+    let reset_hover = render_usage_controls(
+        frame,
+        chunks[0],
+        state,
+        reset_summary.as_deref(),
+        reset_button.as_ref(),
+    );
+    let weekly_hover = render_usage_cards(frame, chunks[1], state);
     render_usage_chart(frame, chunks[2], state);
     render_top_models(frame, chunks[3], state);
-    if let Some(hover) = weekly_hover {
+    if let Some(hover) = reset_hover.or(weekly_hover) {
         render_weekly_pace_tooltip(frame, area, hover.mouse, &hover.text);
     }
 }
@@ -2073,7 +2083,7 @@ fn render_activity(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
         .split(area);
 
     render_activity_controls(frame, chunks[0], state, reset_summary.as_deref());
-    let (weekly_hover, _) = render_usage_cards(frame, chunks[1], state);
+    let weekly_hover = render_usage_cards(frame, chunks[1], state);
     render_activity_heatmaps(frame, chunks[2], state);
     if let Some(hover) = weekly_hover {
         render_weekly_pace_tooltip(frame, area, hover.mouse, &hover.text);
@@ -2086,7 +2096,7 @@ fn render_activity_controls(
     state: &mut AppState,
     reset_summary: Option<&str>,
 ) {
-    let reset_height = reset_summary_height(reset_summary, area.width);
+    let reset_height = reset_summary_height(reset_summary, area.width, None);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(reset_height)])
@@ -2113,7 +2123,7 @@ fn render_activity_controls(
     );
 
     if let Some(text) = reset_summary {
-        render_reset_summary(frame, chunks[1], text, state.accent_text_color());
+        let _ = render_reset_summary(frame, chunks[1], text, state.accent_text_color(), None);
     }
 }
 
@@ -2663,8 +2673,13 @@ fn render_usage_controls(
     area: Rect,
     state: &mut AppState,
     reset_summary: Option<&str>,
-) {
-    let reset_height = reset_summary_height(reset_summary, area.width);
+    reset_button: Option<&LimitResetButtonView>,
+) -> Option<WeeklyPaceHover> {
+    let reset_height = reset_summary_height(
+        reset_summary,
+        area.width,
+        reset_button.map(LimitResetButtonView::width),
+    );
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(reset_height)])
@@ -2712,9 +2727,28 @@ fn render_usage_controls(
         ],
     );
 
-    if let Some(text) = reset_summary {
-        render_reset_summary(frame, chunks[1], text, state.accent_text_color());
+    let button_area = reset_summary.and_then(|text| {
+        render_reset_summary(
+            frame,
+            chunks[1],
+            text,
+            state.accent_text_color(),
+            reset_button,
+        )
+    });
+    let button = reset_button?;
+    let button_area = button_area?;
+    if button.clickable {
+        state.ui_hit_targets.push(UiHitTarget {
+            area: button_area,
+            action: UiClickAction::PromptLimitReset,
+        });
     }
+    let mouse = state.mouse_position?;
+    rect_contains(button_area, mouse).then(|| WeeklyPaceHover {
+        mouse,
+        text: button.tooltip.clone(),
+    })
 }
 
 fn render_workspace_label(frame: &mut Frame<'_>, area: Rect, workspace_label: &str) {
@@ -3285,9 +3319,8 @@ fn render_usage_cards(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &AppState,
-) -> (Option<WeeklyPaceHover>, Option<UiHitTarget>) {
+) -> Option<WeeklyPaceHover> {
     let mut weekly_hover: Option<WeeklyPaceHover> = None;
-    let mut limit_reset_target: Option<UiHitTarget> = None;
     let formatter = state.formatter();
     let today_now = match state.usage_zone {
         UsageZone::Local => Local::now().naive_local(),
@@ -3349,12 +3382,11 @@ fn render_usage_cards(
                         Constraint::Percentage(16),
                     ])
                     .split(row1);
-                if let Some(hover) = render_usage_limits_card(
+                if let Some(hover) = render_limits_card(
                     frame,
                     cards[0],
                     state,
                     uses_compact_limit_lines(card_layout.min_card_width),
-                    &mut limit_reset_target,
                 ) {
                     weekly_hover = Some(hover);
                 };
@@ -3384,12 +3416,11 @@ fn render_usage_cards(
                         Constraint::Percentage(33),
                     ])
                     .split(row1);
-                if let Some(hover) = render_usage_limits_card(
+                if let Some(hover) = render_limits_card(
                     frame,
                     top[0],
                     state,
                     uses_compact_limit_lines(card_layout.min_card_width),
-                    &mut limit_reset_target,
                 ) {
                     weekly_hover = Some(hover);
                 };
@@ -3418,7 +3449,7 @@ fn render_usage_cards(
             render_pending(frame, aux_title, bottom[1]);
             render_pending(frame, "PEAK_DAY", bottom[2]);
         }
-        return (weekly_hover, limit_reset_target);
+        return weekly_hover;
     }
 
     // TODAY card always shows Tokens / Runs / Time.
@@ -3508,12 +3539,11 @@ fn render_usage_cards(
                             Constraint::Percentage(16),
                         ])
                         .split(row1);
-                    if let Some(hover) = render_usage_limits_card(
+                    if let Some(hover) = render_limits_card(
                         frame,
                         cards[0],
                         state,
                         uses_compact_limit_lines(card_layout.min_card_width),
-                        &mut limit_reset_target,
                     ) {
                         weekly_hover = Some(hover);
                     };
@@ -3560,12 +3590,11 @@ fn render_usage_cards(
                             Constraint::Percentage(33),
                         ])
                         .split(row1);
-                    if let Some(hover) = render_usage_limits_card(
+                    if let Some(hover) = render_limits_card(
                         frame,
                         top[0],
                         state,
                         uses_compact_limit_lines(card_layout.min_card_width),
-                        &mut limit_reset_target,
                     ) {
                         weekly_hover = Some(hover);
                     };
@@ -3660,12 +3689,11 @@ fn render_usage_cards(
                             Constraint::Percentage(16),
                         ])
                         .split(row1);
-                    if let Some(hover) = render_usage_limits_card(
+                    if let Some(hover) = render_limits_card(
                         frame,
                         cards[0],
                         state,
                         uses_compact_limit_lines(card_layout.min_card_width),
-                        &mut limit_reset_target,
                     ) {
                         weekly_hover = Some(hover);
                     };
@@ -3709,12 +3737,11 @@ fn render_usage_cards(
                             Constraint::Percentage(33),
                         ])
                         .split(row1);
-                    if let Some(hover) = render_usage_limits_card(
+                    if let Some(hover) = render_limits_card(
                         frame,
                         top[0],
                         state,
                         uses_compact_limit_lines(card_layout.min_card_width),
-                        &mut limit_reset_target,
                     ) {
                         weekly_hover = Some(hover);
                     };
@@ -3847,12 +3874,11 @@ fn render_usage_cards(
                             Constraint::Percentage(16),
                         ])
                         .split(row1);
-                    if let Some(hover) = render_usage_limits_card(
+                    if let Some(hover) = render_limits_card(
                         frame,
                         cards[0],
                         state,
                         uses_compact_limit_lines(card_layout.min_card_width),
-                        &mut limit_reset_target,
                     ) {
                         weekly_hover = Some(hover);
                     };
@@ -3894,12 +3920,11 @@ fn render_usage_cards(
                             Constraint::Percentage(33),
                         ])
                         .split(row1);
-                    if let Some(hover) = render_usage_limits_card(
+                    if let Some(hover) = render_limits_card(
                         frame,
                         top[0],
                         state,
                         uses_compact_limit_lines(card_layout.min_card_width),
-                        &mut limit_reset_target,
                     ) {
                         weekly_hover = Some(hover);
                     };
@@ -3946,7 +3971,7 @@ fn render_usage_cards(
             }
         }
     }
-    (weekly_hover, limit_reset_target)
+    weekly_hover
 }
 
 fn aggregate_usage_days(days: &[UsageDay], grouping: ChartRange) -> Vec<UsageDay> {
@@ -5771,42 +5796,185 @@ fn reset_summary_display_text(text: &str) -> String {
     format!("LIMIT RESETS  {text}")
 }
 
-fn reset_summary_height(summary: Option<&str>, width: u16) -> u16 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResetSummaryLayout {
+    summary_area: Rect,
+    button_area: Option<Rect>,
+    height: u16,
+}
+
+fn reset_summary_layout(area: Rect, text: &str, button_width: Option<u16>) -> ResetSummaryLayout {
+    if area.width == 0 || area.height == 0 {
+        return ResetSummaryLayout {
+            summary_area: Rect::new(area.x, area.y, 0, 0),
+            button_area: None,
+            height: 0,
+        };
+    }
+
+    let display_text = reset_summary_display_text(text);
+    let display_width =
+        u16::try_from(UnicodeWidthStr::width(display_text.as_str())).unwrap_or(u16::MAX);
+    let wrapped_height = wrapped_line_count(&display_text, area.width);
+    let button_width = button_width.filter(|width| *width > 0);
+    let button_fits_same_line = button_width.is_some_and(|width| {
+        wrapped_height == 1 && display_width.saturating_add(width) <= area.width
+    });
+
+    if button_fits_same_line {
+        let width = button_width.unwrap_or_default();
+        return ResetSummaryLayout {
+            summary_area: Rect::new(area.x, area.y, display_width, 1),
+            button_area: Some(Rect::new(
+                area.x.saturating_add(display_width),
+                area.y,
+                width,
+                1,
+            )),
+            height: 2,
+        };
+    }
+
+    let button_area = button_width
+        .filter(|_| wrapped_height < area.height)
+        .map(|width| {
+            Rect::new(
+                area.x,
+                area.y.saturating_add(wrapped_height),
+                width.min(area.width),
+                1,
+            )
+        });
+    ResetSummaryLayout {
+        summary_area: Rect::new(area.x, area.y, area.width, wrapped_height.min(area.height)),
+        button_area,
+        height: wrapped_height
+            .saturating_add(u16::from(button_area.is_some()))
+            .saturating_add(1),
+    }
+}
+
+fn reset_summary_height(summary: Option<&str>, width: u16, button_width: Option<u16>) -> u16 {
     summary
-        .map(reset_summary_display_text)
-        .map(|text| wrapped_line_count(&text, width).saturating_add(1))
+        .map(|text| {
+            reset_summary_layout(Rect::new(0, 0, width, u16::MAX), text, button_width).height
+        })
         .unwrap_or(0)
 }
 
-fn usage_controls_height(summary: Option<&str>, width: u16) -> u16 {
-    1_u16.saturating_add(reset_summary_height(summary, width))
+fn usage_controls_height(summary: Option<&str>, width: u16, button_width: Option<u16>) -> u16 {
+    1_u16.saturating_add(reset_summary_height(summary, width, button_width))
 }
 
 fn activity_controls_height(summary: Option<&str>, width: u16) -> u16 {
-    1_u16.saturating_add(reset_summary_height(summary, width))
+    1_u16.saturating_add(reset_summary_height(summary, width, None))
 }
 
-fn render_reset_summary(frame: &mut Frame<'_>, area: Rect, text: &str, accent_color: Color) {
-    let line = Line::from(vec![
-        Span::styled(" LIMIT RESETS ", Style::default().fg(Color::Gray)),
+#[derive(Debug, Clone)]
+struct LimitResetButtonView {
+    label: String,
+    style: Style,
+    tooltip: String,
+    clickable: bool,
+}
+
+impl LimitResetButtonView {
+    fn width(&self) -> u16 {
+        u16::try_from(UnicodeWidthStr::width(self.label.as_str())).unwrap_or(u16::MAX)
+    }
+}
+
+fn limit_reset_button_view(state: &AppState) -> LimitResetButtonView {
+    match state.limit_reset_button_state() {
+        LimitResetButtonState::Enabled => LimitResetButtonView {
+            label: " RESET ".to_string(),
+            style: Style::default()
+                .fg(Color::Black)
+                .bg(Color::White)
+                .add_modifier(Modifier::BOLD),
+            tooltip: "Use one reset credit for exhausted limit windows.".to_string(),
+            clickable: true,
+        },
+        LimitResetButtonState::Disabled => LimitResetButtonView {
+            label: " RESET ".to_string(),
+            style: Style::default().fg(Color::DarkGray),
+            tooltip: state.limit_reset_disabled_reason().to_string(),
+            clickable: false,
+        },
+        LimitResetButtonState::Cooldown(remaining_secs) => {
+            let minutes = remaining_secs.div_ceil(60);
+            let time = if minutes >= 60 {
+                "1h".to_string()
+            } else {
+                format!("{minutes}m")
+            };
+            LimitResetButtonView {
+                label: format!(" RESET {time} "),
+                style: Style::default().fg(Color::Gray),
+                tooltip: state
+                    .limit_reset_error
+                    .as_deref()
+                    .or(state.limit_reset_notice.as_deref())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("Reset cooldown active for about {time}.")),
+                clickable: false,
+            }
+        }
+        LimitResetButtonState::InFlight => LimitResetButtonView {
+            label: " RESET... ".to_string(),
+            style: Style::default()
+                .fg(state.accent_text_color())
+                .add_modifier(Modifier::BOLD),
+            tooltip: state
+                .limit_reset_error
+                .as_deref()
+                .or(state.limit_reset_notice.as_deref())
+                .unwrap_or("Reset request is in progress.")
+                .to_string(),
+            clickable: false,
+        },
+    }
+}
+
+fn reset_summary_line(text: &str, accent_color: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(" LIMIT RESETS ", Style::default().fg(Color::White)),
         Span::styled(text.to_string(), Style::default().fg(accent_color)),
-    ]);
+    ])
+}
+
+fn render_reset_summary(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    text: &str,
+    accent_color: Color,
+    button: Option<&LimitResetButtonView>,
+) -> Option<Rect> {
+    let layout = reset_summary_layout(area, text, button.map(LimitResetButtonView::width));
     frame.render_widget(
-        Paragraph::new(Text::from(vec![line, Line::from("")])).wrap(Wrap { trim: true }),
-        area,
+        Paragraph::new(reset_summary_line(text, accent_color)).wrap(Wrap { trim: true }),
+        layout.summary_area,
     );
+    if let (Some(button), Some(button_area)) = (button, layout.button_area) {
+        frame.render_widget(Clear, button_area);
+        frame.render_widget(
+            Paragraph::new(Span::styled(button.label.clone(), button.style)),
+            button_area,
+        );
+    }
+    layout.button_area
 }
 
 fn render_limit_resets(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let summary = reset_summary_text(state);
-    let summary_height = reset_summary_height(summary.as_deref(), area.width);
+    let summary_height = reset_summary_height(summary.as_deref(), area.width, None);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(summary_height), Constraint::Min(0)])
         .split(area);
 
     if let Some(text) = summary.as_deref() {
-        render_reset_summary(frame, chunks[0], text, state.accent_text_color());
+        let _ = render_reset_summary(frame, chunks[0], text, state.accent_text_color(), None);
     }
     render_limit_reset_details(frame, chunks[1], state);
 }
@@ -6240,91 +6408,20 @@ fn weekly_pace_band(
     }
 }
 
-/// Split `Weekly:   89% (resets...)` / `7d: 89% | ...` into label word, mid, percent, suffix.
-fn split_weekly_limit_line_parts(plain: &str) -> (String, String, String, String) {
-    let Some(percent_end) = plain.find('%').map(|index| index + 1) else {
-        return (
-            plain.to_string(),
-            String::new(),
-            String::new(),
-            String::new(),
-        );
-    };
-    let bytes = plain.as_bytes();
-    let mut percent_start = percent_end.saturating_sub(1);
-    while percent_start > 0 && bytes[percent_start - 1].is_ascii_digit() {
-        percent_start -= 1;
-    }
-    let prefix = &plain[..percent_start];
-    let percent = &plain[percent_start..percent_end];
-    let suffix = &plain[percent_end..];
-
-    let (label, mid) = if let Some(rest) = prefix.strip_prefix("Weekly") {
-        ("Weekly", rest)
-    } else if let Some(rest) = prefix.strip_prefix("7d") {
-        ("7d", rest)
-    } else {
-        return (
-            prefix.to_string(),
-            String::new(),
-            percent.to_string(),
-            suffix.to_string(),
-        );
-    };
-    (
-        label.to_string(),
-        mid.to_string(),
-        percent.to_string(),
-        suffix.to_string(),
-    )
-}
-
 fn style_weekly_limit_line(plain: &str, band: WeeklyPaceBand, emphasize: bool) -> Line<'static> {
-    let (label, mid, percent, suffix) = split_weekly_limit_line_parts(plain);
-    let gray = Style::default().fg(Color::Gray);
-    let mut spans = Vec::with_capacity(4);
-
-    match band {
+    let style = match band {
         WeeklyPaceBand::Normal => {
-            let mut body = Style::default().fg(Color::White);
+            let mut style = Style::default().fg(Color::White);
             if emphasize {
-                body = body.add_modifier(Modifier::BOLD);
+                style = style.add_modifier(Modifier::BOLD);
             }
-            let head = format!("{label}{mid}{percent}");
-            spans.push(Span::styled(head, body));
-            if !suffix.is_empty() {
-                spans.push(Span::styled(suffix, gray));
-            }
+            style
         }
-        WeeklyPaceBand::Yellow => {
-            let body = Style::default().fg(Color::Yellow);
-            spans.push(Span::styled(format!("{label}{mid}{percent}"), body));
-            if !suffix.is_empty() {
-                spans.push(Span::styled(suffix, gray));
-            }
-        }
-        WeeklyPaceBand::Orange => {
-            spans.push(Span::styled(
-                format!("{label}{mid}{percent}"),
-                Style::default().fg(Color::White).bg(WEEKLY_PACE_ORANGE_BG),
-            ));
-            if !suffix.is_empty() {
-                spans.push(Span::styled(suffix, gray));
-            }
-        }
-        WeeklyPaceBand::Red => {
-            // Red background covers label + percent only (`Weekly: ##%` / `7d: ##%`).
-            spans.push(Span::styled(
-                format!("{label}{mid}{percent}"),
-                Style::default().fg(Color::White).bg(Color::Red),
-            ));
-            if !suffix.is_empty() {
-                spans.push(Span::styled(suffix, gray));
-            }
-        }
-    }
-
-    Line::from(spans)
+        WeeklyPaceBand::Yellow => Style::default().fg(Color::Yellow),
+        WeeklyPaceBand::Orange => Style::default().fg(Color::White).bg(WEEKLY_PACE_ORANGE_BG),
+        WeeklyPaceBand::Red => Style::default().fg(Color::White).bg(Color::Red),
+    };
+    Line::from(Span::styled(plain.to_string(), style))
 }
 
 fn limits_line_for_slot(
@@ -6409,20 +6506,11 @@ fn gauge_filled_width(used_percent: Option<f64>, width: u16) -> u16 {
     ((used_percent.clamp(0.0, 100.0) * f64::from(width)) / 100.0).round() as u16
 }
 
-fn gauge_fill_color(band: WeeklyPaceBand) -> Color {
-    match band {
-        WeeklyPaceBand::Normal => Color::White,
-        WeeklyPaceBand::Yellow => Color::Yellow,
-        WeeklyPaceBand::Orange => WEEKLY_PACE_ORANGE_BG,
-        WeeklyPaceBand::Red => Color::Red,
-    }
-}
-
 fn render_segmented_usage_gauge<const SEGMENTS: usize>(
     buffer: &mut Buffer,
     area: Rect,
     used_percent: Option<f64>,
-    band: WeeklyPaceBand,
+    fair_percent: Option<f64>,
 ) {
     if area.height == 0 {
         return;
@@ -6432,9 +6520,11 @@ fn render_segmented_usage_gauge<const SEGMENTS: usize>(
     };
 
     let filled_width = gauge_filled_width(used_percent, area.width);
-    let fill_color = gauge_fill_color(band);
-    let fill_style = Style::default().fg(fill_color);
-    let filled_divider_style = fill_style.add_modifier(Modifier::REVERSED);
+    let fair_width = fair_percent
+        .filter(|value| value.is_finite())
+        .map(|value| gauge_filled_width(Some(value), area.width));
+    let fair_marker =
+        fair_width.map(|width| width.saturating_sub(1).min(area.width.saturating_sub(1)));
     let empty_divider_style = Style::default().fg(Color::DarkGray);
     let mut next_divider = 0_usize;
 
@@ -6443,19 +6533,30 @@ fn render_segmented_usage_gauge<const SEGMENTS: usize>(
         if is_divider {
             next_divider += 1;
         }
+        let fill_color = if let Some(fair) = fair_width {
+            if offset < fair {
+                Color::Yellow
+            } else {
+                Color::Red
+            }
+        } else {
+            Color::White
+        };
 
         let cell = &mut buffer[(area.x.saturating_add(offset), area.y)];
         cell.reset();
-        if is_divider {
+        if is_divider || fair_marker == Some(offset) {
             cell.set_symbol(LIMIT_GAUGE_DIVIDER);
             if offset < filled_width {
-                // Reverse-video makes the right-edge divider a cutout in the filled bar.
-                cell.set_style(filled_divider_style);
+                cell.set_style(Style::default().fg(Color::Black).bg(fill_color));
+            } else if fair_marker == Some(offset) {
+                cell.set_style(Style::default().fg(Color::Yellow));
             } else {
                 cell.set_style(empty_divider_style);
             }
         } else if offset < filled_width {
-            cell.set_symbol(LIMIT_GAUGE_FILL).set_style(fill_style);
+            cell.set_symbol(LIMIT_GAUGE_FILL)
+                .set_style(Style::default().fg(fill_color));
         }
     }
 }
@@ -6464,7 +6565,7 @@ fn render_segmented_usage_gauge<const SEGMENTS: usize>(
 enum LimitUsageGauge {
     Weekly {
         used_percent: Option<f64>,
-        band: WeeklyPaceBand,
+        fair_percent: Option<f64>,
     },
     Monthly {
         used_percent: Option<f64>,
@@ -6478,7 +6579,7 @@ fn limit_usage_gauge(
     let Some(limits) = limits else {
         return LimitUsageGauge::Weekly {
             used_percent: None,
-            band: WeeklyPaceBand::Normal,
+            fair_percent: None,
         };
     };
     let (_, top_level_weekly_window) =
@@ -6488,7 +6589,7 @@ fn limit_usage_gauge(
     {
         return LimitUsageGauge::Weekly {
             used_percent: window.used_percent,
-            band: weekly_pace_band(window, now_unix_secs),
+            fair_percent: weekly_unlocked_allowed_percent(window, now_unix_secs),
         };
     }
     if let Some(monthly) = limits.individual_limit.as_ref() {
@@ -6505,7 +6606,7 @@ fn limit_usage_gauge(
     if let Some(window) = usable_weekly_window {
         return LimitUsageGauge::Weekly {
             used_percent: window.used_percent,
-            band: weekly_pace_band(window, now_unix_secs),
+            fair_percent: weekly_unlocked_allowed_percent(window, now_unix_secs),
         };
     }
     let has_usable_short_window = short_window
@@ -6521,17 +6622,25 @@ fn limit_usage_gauge(
     }
     LimitUsageGauge::Weekly {
         used_percent: None,
-        band: WeeklyPaceBand::Normal,
+        fair_percent: None,
     }
 }
 
 fn render_limit_usage_gauge(buffer: &mut Buffer, area: Rect, gauge: LimitUsageGauge) {
     match gauge {
-        LimitUsageGauge::Weekly { used_percent, band } => {
-            render_segmented_usage_gauge::<WEEKLY_GAUGE_DAYS>(buffer, area, used_percent, band);
+        LimitUsageGauge::Weekly {
+            used_percent,
+            fair_percent,
+        } => {
+            render_segmented_usage_gauge::<WEEKLY_GAUGE_DAYS>(
+                buffer,
+                area,
+                used_percent,
+                fair_percent,
+            );
         }
         LimitUsageGauge::Monthly { used_percent } => {
-            render_segmented_usage_gauge::<1>(buffer, area, used_percent, WeeklyPaceBand::Normal);
+            render_segmented_usage_gauge::<1>(buffer, area, used_percent, None);
         }
     }
 }
@@ -6691,98 +6800,6 @@ fn render_limits_card(
         return None;
     }
     Some(WeeklyPaceHover { mouse, text })
-}
-
-fn render_usage_limits_card(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    state: &AppState,
-    compact: bool,
-    reset_target: &mut Option<UiHitTarget>,
-) -> Option<WeeklyPaceHover> {
-    let weekly_hover = render_limits_card(frame, area, state, compact);
-    if state.active_screen != ActiveScreen::Usage {
-        return weekly_hover;
-    }
-
-    let button_state = state.limit_reset_button_state();
-    let (label, style, tooltip, clickable) = match button_state {
-        LimitResetButtonState::Enabled => (
-            " RESET ".to_string(),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::White)
-                .add_modifier(Modifier::BOLD),
-            "Use one reset credit for exhausted limit windows.".to_string(),
-            true,
-        ),
-        LimitResetButtonState::Disabled => (
-            " RESET ".to_string(),
-            Style::default().fg(Color::DarkGray),
-            state.limit_reset_disabled_reason().to_string(),
-            false,
-        ),
-        LimitResetButtonState::Cooldown(remaining_secs) => {
-            let minutes = remaining_secs.div_ceil(60);
-            let time = if minutes >= 60 {
-                "1h".to_string()
-            } else {
-                format!("{minutes}m")
-            };
-            (
-                format!(" RESET {time} "),
-                Style::default().fg(Color::Gray),
-                format!("Reset cooldown active for about {time}."),
-                false,
-            )
-        }
-        LimitResetButtonState::InFlight => (
-            " RESET... ".to_string(),
-            Style::default()
-                .fg(state.accent_text_color())
-                .add_modifier(Modifier::BOLD),
-            "Reset request is in progress.".to_string(),
-            false,
-        ),
-    };
-    let width = u16::try_from(UnicodeWidthStr::width(label.as_str())).unwrap_or(u16::MAX);
-    if width == 0 || area.width < width.saturating_add(12) || area.height == 0 {
-        return weekly_hover;
-    }
-    let button_area = Rect::new(
-        area.x
-            .saturating_add(area.width.saturating_sub(width).saturating_sub(2)),
-        area.y.saturating_add(area.height / 2),
-        width,
-        1,
-    );
-    frame.render_widget(Clear, button_area);
-    frame.render_widget(Paragraph::new(Span::styled(label, style)), button_area);
-    if clickable {
-        *reset_target = Some(UiHitTarget {
-            area: button_area,
-            action: UiClickAction::PromptLimitReset,
-        });
-    }
-
-    if state
-        .mouse_position
-        .is_some_and(|mouse| rect_contains(button_area, mouse))
-    {
-        return state.mouse_position.map(|mouse| WeeklyPaceHover {
-            mouse,
-            text: match button_state {
-                LimitResetButtonState::Cooldown(_) | LimitResetButtonState::InFlight => state
-                    .limit_reset_error
-                    .as_deref()
-                    .or(state.limit_reset_notice.as_deref())
-                    .unwrap_or(&tooltip)
-                    .to_string(),
-                LimitResetButtonState::Enabled | LimitResetButtonState::Disabled => tooltip,
-            },
-        });
-    }
-    weekly_hover
 }
 
 fn individual_limit_for_limits(
@@ -7117,7 +7134,7 @@ mod tests {
 
         assert_eq!(
             api_stat_controls_height(Some(summary), 100),
-            usage_controls_height(Some(summary), 100)
+            usage_controls_height(Some(summary), 100, Some(7))
         );
     }
 
@@ -7529,9 +7546,52 @@ mod tests {
     #[test]
     fn reset_summary_height_accounts_for_its_label() {
         let summary = "Resets: 3 available | earliest expires 18 Jul";
-        assert!(reset_summary_height(Some(summary), 24) > wrapped_line_count(summary, 24));
-        assert_eq!(usage_controls_height(None, 80), 1);
+        assert!(reset_summary_height(Some(summary), 24, None) > wrapped_line_count(summary, 24));
+        assert_eq!(usage_controls_height(None, 80, Some(7)), 1);
         assert_eq!(activity_controls_height(None, 80), 1);
+    }
+
+    #[test]
+    fn reset_summary_uses_white_label_and_bright_accent_value() {
+        let line = reset_summary_line("Resets: 1 available", Color::LightCyan);
+
+        assert_eq!(line.spans.len(), 2);
+        assert_eq!(line.spans[0].style.fg, Some(Color::White));
+        assert_eq!(line.spans[1].style.fg, Some(Color::LightCyan));
+    }
+
+    #[test]
+    fn reset_button_is_immediately_after_the_summary_when_it_fits() {
+        let area = Rect::new(4, 6, 100, 4);
+        let summary = "Resets: 1 available | earliest expires 21 Sep, 09:04";
+        let display_width = u16::try_from(UnicodeWidthStr::width(
+            reset_summary_display_text(summary).as_str(),
+        ))
+        .expect("summary width");
+
+        let layout = reset_summary_layout(area, summary, Some(7));
+
+        assert_eq!(layout.summary_area, Rect::new(4, 6, display_width, 1));
+        assert_eq!(
+            layout.button_area,
+            Some(Rect::new(4 + display_width, 6, 7, 1))
+        );
+        assert_eq!(layout.height, 2);
+    }
+
+    #[test]
+    fn reset_button_wraps_below_a_narrow_summary() {
+        let area = Rect::new(4, 6, 24, 8);
+        let summary = "Resets: 1 available | earliest expires 21 Sep, 09:04";
+
+        let layout = reset_summary_layout(area, summary, Some(7));
+
+        assert!(layout.summary_area.height > 1);
+        assert_eq!(
+            layout.button_area,
+            Some(Rect::new(4, 6 + layout.summary_area.height, 7, 1))
+        );
+        assert_eq!(layout.height, layout.summary_area.height + 2);
     }
 
     #[test]
@@ -7787,31 +7847,51 @@ mod tests {
     }
 
     #[test]
-    fn weekly_gauge_uses_reverse_video_for_filled_day_dividers() {
+    fn weekly_gauge_colors_fair_progress_yellow_and_overage_red() {
         let area = Rect::new(0, 0, 28, 1);
         let mut buffer = Buffer::empty(area);
         render_segmented_usage_gauge::<WEEKLY_GAUGE_DAYS>(
             &mut buffer,
             area,
-            Some(21.4),
-            WeeklyPaceBand::Orange,
+            Some(35.7),
+            Some(14.3),
         );
 
         assert_eq!(buffer[(0, 0)].symbol(), LIMIT_GAUGE_FILL);
-        assert_eq!(buffer[(0, 0)].style().fg, Some(WEEKLY_PACE_ORANGE_BG));
+        assert_eq!(buffer[(0, 0)].style().fg, Some(Color::Yellow));
         assert_eq!(buffer[(3, 0)].symbol(), LIMIT_GAUGE_DIVIDER);
-        assert!(buffer[(3, 0)]
+        assert_eq!(buffer[(3, 0)].style().fg, Some(Color::Black));
+        assert_eq!(buffer[(3, 0)].style().bg, Some(Color::Yellow));
+        assert!(!buffer[(3, 0)]
             .style()
             .add_modifier
             .contains(Modifier::REVERSED));
         assert_eq!(buffer[(4, 0)].symbol(), LIMIT_GAUGE_FILL);
-        assert_eq!(buffer[(6, 0)].symbol(), " ");
+        assert_eq!(buffer[(4, 0)].style().fg, Some(Color::Red));
         assert_eq!(buffer[(7, 0)].symbol(), LIMIT_GAUGE_DIVIDER);
-        assert_eq!(buffer[(7, 0)].style().fg, Some(Color::DarkGray));
+        assert_eq!(buffer[(7, 0)].style().fg, Some(Color::Black));
+        assert_eq!(buffer[(7, 0)].style().bg, Some(Color::Red));
         assert!(!buffer[(7, 0)]
             .style()
             .add_modifier
             .contains(Modifier::REVERSED));
+        assert_eq!(buffer[(10, 0)].symbol(), " ");
+        assert_eq!(buffer[(11, 0)].symbol(), LIMIT_GAUGE_DIVIDER);
+        assert_eq!(buffer[(11, 0)].style().fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn weekly_gauge_shows_the_fair_limit_before_usage_reaches_it() {
+        let area = Rect::new(0, 0, 28, 1);
+        let mut buffer = Buffer::empty(area);
+
+        render_segmented_usage_gauge::<WEEKLY_GAUGE_DAYS>(&mut buffer, area, Some(7.0), Some(14.3));
+
+        assert_eq!(buffer[(0, 0)].style().fg, Some(Color::Yellow));
+        assert_eq!(buffer[(2, 0)].symbol(), " ");
+        assert_eq!(buffer[(3, 0)].symbol(), LIMIT_GAUGE_DIVIDER);
+        assert_eq!(buffer[(3, 0)].style().fg, Some(Color::Yellow));
+        assert_eq!(buffer[(3, 0)].style().bg, Some(Color::Reset));
     }
 
     #[test]
@@ -7821,6 +7901,33 @@ mod tests {
         assert_eq!(gauge_filled_width(Some(-1.0), 28), 0);
         assert_eq!(gauge_filled_width(Some(50.0), 28), 14);
         assert_eq!(gauge_filled_width(Some(101.0), 28), 28);
+    }
+
+    #[test]
+    fn weekly_limit_gauge_uses_the_current_fair_share() {
+        let start = NaiveDate::from_ymd_opt(2026, 7, 20).expect("date");
+        let (weekly, now) = weekly_window_local_days(20.0, start, start, 15, 0);
+        let limits = crate::codex_rpc::AccountRateLimits {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            individual_limit: None,
+            primary: None,
+            secondary: Some(weekly),
+            credits: None,
+            buckets: Vec::new(),
+            reset_credits_available: None,
+            reset_credits: None,
+        };
+
+        let LimitUsageGauge::Weekly {
+            used_percent,
+            fair_percent,
+        } = limit_usage_gauge(Some(&limits), now)
+        else {
+            panic!("weekly gauge");
+        };
+        assert_eq!(used_percent, Some(20.0));
+        assert!((fair_percent.expect("fair share") - 100.0 / 7.0).abs() < 0.01);
     }
 
     #[test]
@@ -7952,27 +8059,33 @@ mod tests {
     #[test]
     fn style_weekly_limit_line_matches_band_colors() {
         let plain = "Weekly:   83% (resets 12:14, 4 Aug)";
+        let normal = style_weekly_limit_line(plain, WeeklyPaceBand::Normal, true);
+        assert_eq!(normal.spans.len(), 1);
+        assert_eq!(normal.spans[0].content.as_ref(), plain);
+        assert_eq!(normal.spans[0].style.fg, Some(Color::White));
+        assert!(normal.spans[0].style.add_modifier.contains(Modifier::BOLD));
+
         let yellow = style_weekly_limit_line(plain, WeeklyPaceBand::Yellow, false);
-        assert_eq!(yellow.spans.len(), 2);
+        assert_eq!(yellow.spans.len(), 1);
+        assert_eq!(yellow.spans[0].content.as_ref(), plain);
         assert_eq!(yellow.spans[0].style.fg, Some(Color::Yellow));
-        assert_eq!(yellow.spans[1].style.fg, Some(Color::Gray));
 
         let orange = style_weekly_limit_line(plain, WeeklyPaceBand::Orange, false);
-        assert_eq!(orange.spans.len(), 2);
-        assert_eq!(orange.spans[0].content.as_ref(), "Weekly:   83%");
+        assert_eq!(orange.spans.len(), 1);
+        assert_eq!(orange.spans[0].content.as_ref(), plain);
         assert_eq!(orange.spans[0].style.bg, Some(WEEKLY_PACE_ORANGE_BG));
         assert_eq!(orange.spans[0].style.fg, Some(Color::White));
-        assert_eq!(orange.spans[1].style.fg, Some(Color::Gray));
 
         let red = style_weekly_limit_line(plain, WeeklyPaceBand::Red, false);
-        assert_eq!(red.spans.len(), 2);
+        assert_eq!(red.spans.len(), 1);
+        assert_eq!(red.spans[0].content.as_ref(), plain);
         assert_eq!(red.spans[0].style.bg, Some(Color::Red));
         assert_eq!(red.spans[0].style.fg, Some(Color::White));
-        assert!(red.spans[0].content.as_ref().contains("83%"));
-        assert_eq!(red.spans[1].style.fg, Some(Color::Gray));
 
-        let compact = style_weekly_limit_line("7d: 50% | 12:14", WeeklyPaceBand::Orange, false);
-        assert_eq!(compact.spans[0].content.as_ref(), "7d: 50%");
+        let compact_plain = "7d: 50% | 12:14";
+        let compact = style_weekly_limit_line(compact_plain, WeeklyPaceBand::Orange, false);
+        assert_eq!(compact.spans.len(), 1);
+        assert_eq!(compact.spans[0].content.as_ref(), compact_plain);
         assert_eq!(compact.spans[0].style.bg, Some(WEEKLY_PACE_ORANGE_BG));
         assert_eq!(compact.spans[0].style.fg, Some(Color::White));
     }

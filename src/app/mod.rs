@@ -78,24 +78,36 @@ pub(crate) enum ApiStatGraph {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum AccentTheme {
+    Red,
+    Orange,
+    Yellow,
+    Chartreuse,
+    Green,
+    SpringGreen,
     #[default]
     Cyan,
-    Red,
-    Green,
-    Yellow,
+    Azure,
     Blue,
+    Violet,
     Magenta,
+    Rose,
     Gray,
 }
 
 impl AccentTheme {
-    pub(crate) const ALL: [Self; 7] = [
-        Self::Cyan,
+    pub(crate) const ALL: [Self; 13] = [
         Self::Red,
-        Self::Green,
+        Self::Orange,
         Self::Yellow,
+        Self::Chartreuse,
+        Self::Green,
+        Self::SpringGreen,
+        Self::Cyan,
+        Self::Azure,
         Self::Blue,
+        Self::Violet,
         Self::Magenta,
+        Self::Rose,
         Self::Gray,
     ];
 
@@ -103,10 +115,16 @@ impl AccentTheme {
         match self {
             Self::Cyan => (Color::Cyan, Color::LightCyan),
             Self::Red => (Color::Red, Color::LightRed),
+            Self::Orange => (Color::Rgb(128, 64, 0), Color::Rgb(255, 128, 0)),
+            Self::Chartreuse => (Color::Rgb(64, 128, 0), Color::Rgb(128, 255, 0)),
             Self::Green => (Color::Green, Color::LightGreen),
+            Self::SpringGreen => (Color::Rgb(0, 128, 64), Color::Rgb(0, 255, 128)),
             Self::Yellow => (Color::Yellow, Color::LightYellow),
+            Self::Azure => (Color::Rgb(0, 64, 128), Color::Rgb(0, 128, 255)),
             Self::Blue => (Color::Blue, Color::LightBlue),
+            Self::Violet => (Color::Rgb(64, 0, 128), Color::Rgb(128, 0, 255)),
             Self::Magenta => (Color::Magenta, Color::LightMagenta),
+            Self::Rose => (Color::Rgb(128, 0, 64), Color::Rgb(255, 0, 128)),
             Self::Gray => (Color::Gray, Color::White),
         }
     }
@@ -119,10 +137,16 @@ impl AccentTheme {
         match self {
             Self::Cyan => "cyan",
             Self::Red => "red",
+            Self::Orange => "orange",
+            Self::Chartreuse => "chartreuse",
             Self::Green => "green",
+            Self::SpringGreen => "spring-green",
             Self::Yellow => "yellow",
+            Self::Azure => "azure",
             Self::Blue => "blue",
+            Self::Violet => "violet",
             Self::Magenta => "magenta",
+            Self::Rose => "rose",
             Self::Gray => "gray",
         }
     }
@@ -131,10 +155,16 @@ impl AccentTheme {
         match value {
             "cyan" => Some(Self::Cyan),
             "red" => Some(Self::Red),
+            "orange" => Some(Self::Orange),
+            "chartreuse" => Some(Self::Chartreuse),
             "green" => Some(Self::Green),
+            "spring-green" => Some(Self::SpringGreen),
             "yellow" => Some(Self::Yellow),
+            "azure" => Some(Self::Azure),
             "blue" => Some(Self::Blue),
+            "violet" => Some(Self::Violet),
             "magenta" => Some(Self::Magenta),
+            "rose" => Some(Self::Rose),
             "gray" => Some(Self::Gray),
             _ => None,
         }
@@ -142,13 +172,19 @@ impl AccentTheme {
 
     pub(crate) fn cycled(self) -> Self {
         match self {
-            Self::Cyan => Self::Red,
-            Self::Red => Self::Green,
-            Self::Green => Self::Yellow,
-            Self::Yellow => Self::Blue,
-            Self::Blue => Self::Magenta,
-            Self::Magenta => Self::Gray,
-            Self::Gray => Self::Cyan,
+            Self::Red => Self::Orange,
+            Self::Orange => Self::Yellow,
+            Self::Yellow => Self::Chartreuse,
+            Self::Chartreuse => Self::Green,
+            Self::Green => Self::SpringGreen,
+            Self::SpringGreen => Self::Cyan,
+            Self::Cyan => Self::Azure,
+            Self::Azure => Self::Blue,
+            Self::Blue => Self::Violet,
+            Self::Violet => Self::Magenta,
+            Self::Magenta => Self::Rose,
+            Self::Rose => Self::Gray,
+            Self::Gray => Self::Red,
         }
     }
 }
@@ -2771,12 +2807,42 @@ mod tests {
     #[test]
     fn accent_theme_exposes_requested_normal_and_bright_pairs() {
         let expected = [
-            (AccentTheme::Cyan, Color::Cyan, Color::LightCyan),
             (AccentTheme::Red, Color::Red, Color::LightRed),
-            (AccentTheme::Green, Color::Green, Color::LightGreen),
+            (
+                AccentTheme::Orange,
+                Color::Rgb(128, 64, 0),
+                Color::Rgb(255, 128, 0),
+            ),
             (AccentTheme::Yellow, Color::Yellow, Color::LightYellow),
+            (
+                AccentTheme::Chartreuse,
+                Color::Rgb(64, 128, 0),
+                Color::Rgb(128, 255, 0),
+            ),
+            (AccentTheme::Green, Color::Green, Color::LightGreen),
+            (
+                AccentTheme::SpringGreen,
+                Color::Rgb(0, 128, 64),
+                Color::Rgb(0, 255, 128),
+            ),
+            (AccentTheme::Cyan, Color::Cyan, Color::LightCyan),
+            (
+                AccentTheme::Azure,
+                Color::Rgb(0, 64, 128),
+                Color::Rgb(0, 128, 255),
+            ),
             (AccentTheme::Blue, Color::Blue, Color::LightBlue),
+            (
+                AccentTheme::Violet,
+                Color::Rgb(64, 0, 128),
+                Color::Rgb(128, 0, 255),
+            ),
             (AccentTheme::Magenta, Color::Magenta, Color::LightMagenta),
+            (
+                AccentTheme::Rose,
+                Color::Rgb(128, 0, 64),
+                Color::Rgb(255, 0, 128),
+            ),
             (AccentTheme::Gray, Color::Gray, Color::White),
         ];
 
@@ -2791,12 +2857,12 @@ mod tests {
 
     #[test]
     fn accent_theme_cycles_through_every_available_theme() {
-        let mut theme = AccentTheme::Cyan;
+        let mut theme = AccentTheme::ALL[0];
         for expected in AccentTheme::ALL.iter().copied().skip(1) {
             theme = theme.cycled();
             assert_eq!(theme, expected);
         }
-        assert_eq!(theme.cycled(), AccentTheme::Cyan);
+        assert_eq!(theme.cycled(), AccentTheme::ALL[0]);
     }
 
     #[test]

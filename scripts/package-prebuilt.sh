@@ -143,7 +143,8 @@ if [ "${SKIP_BUILD}" -eq 0 ]; then
     cargo build "${BUILD_ARGS[@]}"
   ); then
     if [[ "${TARGET}" == *-musl ]]; then
-      echo "musl build failed. Install musl toolchain and retry (Debian/Ubuntu: sudo apt install musl-tools)." >&2
+      echo "musl build failed; see the compiler or linker error above." >&2
+      echo "If the musl compiler/linker is missing, install it and retry (Debian/Ubuntu: sudo apt install musl-tools)." >&2
     fi
     exit 1
   fi

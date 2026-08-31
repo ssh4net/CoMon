@@ -438,13 +438,20 @@ mod platform {
     use super::*;
     use std::ffi::{CStr, CString};
 
+    const PROFILE_LOCALE_MASK: libc::c_int = libc::LC_NUMERIC_MASK | libc::LC_TIME_MASK;
+
     pub(super) fn detect() -> Option<SystemLocale> {
         let requested = CString::new("").ok()?;
-        let locale =
-            unsafe { libc::newlocale(libc::LC_ALL_MASK, requested.as_ptr(), std::ptr::null_mut()) };
+        let locale = unsafe {
+            libc::newlocale(
+                PROFILE_LOCALE_MASK,
+                requested.as_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
         let locale = if locale.is_null() {
             let fallback = CString::new("C").ok()?;
-            unsafe { libc::newlocale(libc::LC_ALL_MASK, fallback.as_ptr(), std::ptr::null_mut()) }
+            unsafe { libc::newlocale(PROFILE_LOCALE_MASK, fallback.as_ptr(), std::ptr::null_mut()) }
         } else {
             locale
         };

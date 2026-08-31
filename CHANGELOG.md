@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+- Fixed musl builds by requesting only the numeric and time locale categories
+  used by CoMon instead of the unavailable musl `libc::LC_ALL_MASK` binding.
 - Deep/Full History repository discovery is now opt-in: startup uses only the
   cached catalog, new configurations have no discovery roots, and `r`/`F5`
   presents the exact roots and limits for confirmation before a filesystem scan.

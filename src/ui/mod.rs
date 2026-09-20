@@ -44,6 +44,7 @@ const SOLID_BAR_GLYPH: char = '\u{2588}';
 const WEEKLY_GAUGE_DAYS: usize = 7;
 const LIMIT_GAUGE_FILL: &str = "\u{2588}";
 const LIMIT_GAUGE_DIVIDER: &str = "\u{2595}";
+const LIMIT_GAUGE_FILLED_DIVIDER: &str = "\u{2589}";
 const USAGE_HEADER_HEIGHT: u16 = 3;
 
 #[derive(Clone)]
@@ -128,6 +129,19 @@ pub fn format_updated_label(updated_at: Instant) -> String {
             format!("Updated {hours}h ago")
         }
     }
+}
+
+fn cache_hit_rate_label(
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    formatter: DisplayFormatter<'_>,
+) -> String {
+    let rate = if input_tokens > 0 {
+        ((cached_input_tokens as f64) / (input_tokens as f64) * 1000.0).round() / 10.0
+    } else {
+        0.0
+    };
+    format!("Hit Rate {}%", formatter.format_one_decimal(rate))
 }
 
 pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
@@ -653,7 +667,7 @@ fn api_stat_card_specs(
     let summary = &usage.summary;
 
     vec![
-        ("LIMITS", CardSpec::new(limits_value, limits_captions)),
+        ("LIMITS", CardSpec::limits(limits_value, limits_captions)),
         (
             "LIFETIME",
             CardSpec::new(
@@ -2971,10 +2985,22 @@ fn render_history_style_controls(frame: &mut Frame<'_>, area: Rect, state: &mut 
 #[derive(Debug)]
 struct CardSpec {
     lines: Vec<String>,
+    reserved_rows: u16,
 }
+
+// The LIMITS card paints its gauge after the text, then keeps the normal bottom spacer.
+const LIMITS_CARD_RESERVED_ROWS: u16 = 1;
 
 impl CardSpec {
     fn new(value: String, captions: Vec<String>) -> Self {
+        Self::new_with_reserved_rows(value, captions, 0)
+    }
+
+    fn limits(value: String, captions: Vec<String>) -> Self {
+        Self::new_with_reserved_rows(value, captions, LIMITS_CARD_RESERVED_ROWS)
+    }
+
+    fn new_with_reserved_rows(value: String, captions: Vec<String>, reserved_rows: u16) -> Self {
         let mut lines = Vec::with_capacity(1 + captions.len());
         lines.push(value);
         for caption in captions {
@@ -2982,7 +3008,10 @@ impl CardSpec {
                 lines.push(caption);
             }
         }
-        Self { lines }
+        Self {
+            lines,
+            reserved_rows,
+        }
     }
 
     fn required_height(&self, card_width: u16) -> u16 {
@@ -2997,6 +3026,7 @@ impl CardSpec {
         CARD_VERTICAL_CHROME
             .saturating_add(CARD_BOTTOM_SPACER)
             .saturating_add(lines)
+            .saturating_add(self.reserved_rows)
             .max(CARD_MIN_HEIGHT)
     }
 }
@@ -3066,7 +3096,7 @@ fn usage_card_specs(state: &AppState, card_width: u16) -> Vec<CardSpec> {
             formatter.format_usize(pending.scan_total_files)
         );
         let mut cards = Vec::with_capacity(6);
-        cards.push(CardSpec::new(limits_value, limits_captions));
+        cards.push(CardSpec::limits(limits_value, limits_captions));
         for _ in 0..5 {
             cards.push(CardSpec::new(
                 "INDEXING".to_string(),
@@ -3085,6 +3115,9 @@ fn usage_card_specs(state: &AppState, card_width: u16) -> Vec<CardSpec> {
         })
         .unwrap_or_else(|| "--".to_string());
     let today_captions = vec![
+        today
+            .map(|day| cache_hit_rate_label(day.input_tokens, day.cached_input_tokens, formatter))
+            .unwrap_or_default(),
         today
             .map(|day| format!("Runs {}", format_count(day.agent_runs, formatter)))
             .unwrap_or_default(),
@@ -3113,7 +3146,7 @@ fn usage_card_specs(state: &AppState, card_width: u16) -> Vec<CardSpec> {
         .map(|runs| format!("Runs {}", format_count(runs, formatter)));
 
     let mut cards = Vec::with_capacity(6);
-    cards.push(CardSpec::new(limits_value, limits_captions));
+    cards.push(CardSpec::limits(limits_value, limits_captions));
     cards.push(CardSpec::new(today_value, today_captions));
 
     match state.metric {
@@ -3390,14 +3423,14 @@ fn render_usage_cards(
                 ) {
                     weekly_hover = Some(hover);
                 };
-                render_today_card(
-                    frame,
+                frame.render_widget(
+                    card(
+                        &today_title,
+                        "INDEXING",
+                        Some(&progress),
+                        Some("Please wait"),
+                    ),
                     cards[1],
-                    state,
-                    &today_title,
-                    "INDEXING",
-                    Some(&progress),
-                    Some("Please wait"),
                 );
                 for (title, target) in [
                     ("LAST_7_DAYS", cards[2]),
@@ -3424,14 +3457,14 @@ fn render_usage_cards(
                 ) {
                     weekly_hover = Some(hover);
                 };
-                render_today_card(
-                    frame,
+                frame.render_widget(
+                    card(
+                        &today_title,
+                        "INDEXING",
+                        Some(&progress),
+                        Some("Please wait"),
+                    ),
                     top[1],
-                    state,
-                    &today_title,
-                    "INDEXING",
-                    Some(&progress),
-                    Some("Please wait"),
                 );
                 render_pending(frame, "LAST_7_DAYS", top[2]);
             }
@@ -3452,7 +3485,7 @@ fn render_usage_cards(
         return weekly_hover;
     }
 
-    // TODAY card always shows Tokens / Runs / Time.
+    // TODAY card always shows Tokens / Hit Rate / Runs / Time.
     let today_value = today
         .map(|d| {
             format!(
@@ -5651,30 +5684,21 @@ fn render_today_card(
     caption1: Option<&str>,
     caption2: Option<&str>,
 ) {
-    frame.render_widget(card(title, value, caption1, caption2), area);
-
-    let Some(first_content_line) = card_content_line_rect(area, 0) else {
-        return;
-    };
-    let mut gauge_line_index = usize::from(wrapped_line_count(value, first_content_line.width));
-    for caption in [caption1, caption2].into_iter().flatten() {
-        if !caption.trim().is_empty() {
-            gauge_line_index = gauge_line_index.saturating_add(usize::from(wrapped_line_count(
-                caption,
-                first_content_line.width,
-            )));
-        }
-    }
-    let Some(gauge_area) = card_content_line_rect(area, gauge_line_index) else {
-        return;
-    };
-
-    let limits = state
-        .limits_enabled
-        .then_some(state.limits.as_ref())
-        .flatten();
-    let gauge = limit_usage_gauge(limits, now_unix_secs());
-    render_limit_usage_gauge(frame.buffer_mut(), gauge_area, gauge);
+    let today_hit_rate = state
+        .usage
+        .as_ref()
+        .and_then(|snapshot| snapshot.days_for_zone(state.usage_zone).last())
+        .map(|day| {
+            cache_hit_rate_label(day.input_tokens, day.cached_input_tokens, state.formatter())
+        });
+    frame.render_widget(
+        card_with_captions(
+            title,
+            value,
+            &[today_hit_rate.as_deref(), caption1, caption2],
+        ),
+        area,
+    );
 }
 
 fn today_card_title(formatter: DisplayFormatter<'_>, now: NaiveDateTime) -> String {
@@ -6481,6 +6505,14 @@ fn card_content_line_rect(card_area: Rect, line_index: usize) -> Option<Rect> {
     Some(Rect::new(x, y, width, 1))
 }
 
+const LIMIT_GAUGE_TRAILING_PAD: u16 = 1;
+
+fn limit_gauge_line_rect(card_area: Rect, line_index: usize) -> Option<Rect> {
+    let content = card_content_line_rect(card_area, line_index)?;
+    let width = content.width.saturating_sub(LIMIT_GAUGE_TRAILING_PAD);
+    (width > 0).then(|| Rect::new(content.x, content.y, width, content.height))
+}
+
 fn weekly_line_hit_rect(card_area: Rect, line_index: usize) -> Option<Rect> {
     card_content_line_rect(card_area, line_index)
 }
@@ -6546,12 +6578,17 @@ fn render_segmented_usage_gauge<const SEGMENTS: usize>(
         let cell = &mut buffer[(area.x.saturating_add(offset), area.y)];
         cell.reset();
         if is_divider || fair_marker == Some(offset) {
-            cell.set_symbol(LIMIT_GAUGE_DIVIDER);
             if offset < filled_width {
-                cell.set_style(Style::default().fg(Color::Black).bg(fill_color));
+                // Use a left-seven-eighths block for filled boundaries. It renders as
+                // the colored portion with a narrow dark edge more consistently in
+                // macOS Terminal than an inverted right-one-eighth block.
+                cell.set_symbol(LIMIT_GAUGE_FILLED_DIVIDER)
+                    .set_style(Style::default().fg(fill_color).bg(Color::Black));
             } else if fair_marker == Some(offset) {
+                cell.set_symbol(LIMIT_GAUGE_DIVIDER);
                 cell.set_style(Style::default().fg(Color::Yellow));
             } else {
+                cell.set_symbol(LIMIT_GAUGE_DIVIDER);
                 cell.set_style(empty_divider_style);
             }
         } else if offset < filled_width {
@@ -6699,7 +6736,8 @@ fn format_weekly_pace_tooltip(
 fn limits_card_paragraph(
     state: &AppState,
     compact: bool,
-) -> (Paragraph<'static>, Option<usize>, Option<String>) {
+    content_width: u16,
+) -> (Paragraph<'static>, Option<usize>, usize, Option<String>) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
@@ -6716,6 +6754,7 @@ fn limits_card_paragraph(
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut weekly_line_index: Option<usize> = None;
+    let mut content_line_index = 0_usize;
     let mut tooltip: Option<String> = None;
 
     if !state.limits_enabled {
@@ -6751,7 +6790,7 @@ fn limits_card_paragraph(
 
         let mut push_line = |text: &str, is_value: bool| {
             if weekly_plain.as_deref() == Some(text) {
-                weekly_line_index = Some(lines.len());
+                weekly_line_index = Some(content_line_index);
             }
             lines.push(limits_line_for_slot(
                 text,
@@ -6759,6 +6798,8 @@ fn limits_card_paragraph(
                 band,
                 is_value,
             ));
+            content_line_index = content_line_index
+                .saturating_add(usize::from(wrapped_line_count(text, content_width)));
         };
 
         push_line(&value, true);
@@ -6774,13 +6815,14 @@ fn limits_card_paragraph(
             Style::default().add_modifier(Modifier::BOLD),
         )));
     }
+    let gauge_line_index = content_line_index;
     lines.push(Line::from(""));
 
     let paragraph = Paragraph::new(Text::from(lines))
         .block(block)
         .alignment(Alignment::Left)
         .wrap(Wrap { trim: true });
-    (paragraph, weekly_line_index, tooltip)
+    (paragraph, weekly_line_index, gauge_line_index, tooltip)
 }
 
 fn render_limits_card(
@@ -6789,8 +6831,19 @@ fn render_limits_card(
     state: &AppState,
     compact: bool,
 ) -> Option<WeeklyPaceHover> {
-    let (paragraph, weekly_line_index, tooltip) = limits_card_paragraph(state, compact);
+    let content_width = area.width.saturating_sub(5).max(1);
+    let (paragraph, weekly_line_index, gauge_line_index, tooltip) =
+        limits_card_paragraph(state, compact, content_width);
     frame.render_widget(paragraph, area);
+
+    let limits = state
+        .limits_enabled
+        .then_some(state.limits.as_ref())
+        .flatten();
+    let gauge = limit_usage_gauge(limits, now_unix_secs());
+    if let Some(gauge_area) = limit_gauge_line_rect(area, gauge_line_index) {
+        render_limit_usage_gauge(frame.buffer_mut(), gauge_area, gauge);
+    }
 
     let mouse = state.mouse_position?;
     let line_index = weekly_line_index?;
@@ -7473,6 +7526,23 @@ mod tests {
     }
 
     #[test]
+    fn limits_card_height_reserves_the_gauge_row() {
+        let regular = CardSpec::new("value".to_string(), vec!["caption".to_string()]);
+        let limits = CardSpec::limits("value".to_string(), vec!["caption".to_string()]);
+        let regular_height = regular.required_height(40);
+        let limits_height = limits.required_height(40);
+
+        assert_eq!(
+            limits_height,
+            regular_height.saturating_add(LIMITS_CARD_RESERVED_ROWS)
+        );
+        assert_eq!(
+            api_stat_card_row_height(&[("LIMITS", limits), ("LIFETIME", regular)], 40),
+            limits_height
+        );
+    }
+
+    #[test]
     fn short_usage_layout_preserves_measured_card_height() {
         let area = Rect::new(0, 0, 140, 18);
         let chunks = usage_layout(area, 2, 12);
@@ -7815,6 +7885,28 @@ mod tests {
     }
 
     #[test]
+    fn limit_gauge_reserves_two_cells_before_card_edge() {
+        let card = Rect::new(10, 20, 40, 10);
+        let gauge = limit_gauge_line_rect(card, 0).expect("gauge");
+        assert_eq!(gauge.x, 13);
+        assert_eq!(gauge.y, 22);
+        assert_eq!(gauge.width, 34);
+        let right_border_x = card.x + card.width - 1;
+        assert_eq!(right_border_x - (gauge.x + gauge.width), 2);
+    }
+
+    #[test]
+    fn today_cache_hit_rate_label_uses_daily_input_and_cached_tokens() {
+        let locale = crate::locale::SystemLocale::default();
+        let formatter = DisplayFormatter::new(DisplayStyle::Classic, &locale);
+        assert_eq!(
+            cache_hit_rate_label(1_000, 375, formatter),
+            "Hit Rate 37.5%"
+        );
+        assert_eq!(cache_hit_rate_label(0, 0, formatter), "Hit Rate 0.0%");
+    }
+
+    #[test]
     fn weekly_gauge_dividers_evenly_fill_the_content_width() {
         assert_eq!(
             gauge_divider_positions::<WEEKLY_GAUGE_DAYS>(28),
@@ -7859,18 +7951,18 @@ mod tests {
 
         assert_eq!(buffer[(0, 0)].symbol(), LIMIT_GAUGE_FILL);
         assert_eq!(buffer[(0, 0)].style().fg, Some(Color::Yellow));
-        assert_eq!(buffer[(3, 0)].symbol(), LIMIT_GAUGE_DIVIDER);
-        assert_eq!(buffer[(3, 0)].style().fg, Some(Color::Black));
-        assert_eq!(buffer[(3, 0)].style().bg, Some(Color::Yellow));
+        assert_eq!(buffer[(3, 0)].symbol(), LIMIT_GAUGE_FILLED_DIVIDER);
+        assert_eq!(buffer[(3, 0)].style().fg, Some(Color::Yellow));
+        assert_eq!(buffer[(3, 0)].style().bg, Some(Color::Black));
         assert!(!buffer[(3, 0)]
             .style()
             .add_modifier
             .contains(Modifier::REVERSED));
         assert_eq!(buffer[(4, 0)].symbol(), LIMIT_GAUGE_FILL);
         assert_eq!(buffer[(4, 0)].style().fg, Some(Color::Red));
-        assert_eq!(buffer[(7, 0)].symbol(), LIMIT_GAUGE_DIVIDER);
-        assert_eq!(buffer[(7, 0)].style().fg, Some(Color::Black));
-        assert_eq!(buffer[(7, 0)].style().bg, Some(Color::Red));
+        assert_eq!(buffer[(7, 0)].symbol(), LIMIT_GAUGE_FILLED_DIVIDER);
+        assert_eq!(buffer[(7, 0)].style().fg, Some(Color::Red));
+        assert_eq!(buffer[(7, 0)].style().bg, Some(Color::Black));
         assert!(!buffer[(7, 0)]
             .style()
             .add_modifier

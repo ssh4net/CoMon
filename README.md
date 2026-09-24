@@ -9,6 +9,11 @@ Single-binary, cross-platform TUI for:
 
 See `CHANGELOG.md` for release history.
 
+The horizontal Usage token chart shows three columns: **INPUT / NON-CACHED / OUTPUT**.
+Input includes cached input; non-cached is input minus cached input; output is
+generated tokens. Bar lengths and summary-card totals use input plus output.
+See the [synthetic-data preview](docs/screenshots/usage-token-columns.png).
+
 <img width="1298" height="1050" alt="WindowsTerminal_HTSsSPVKmE" src="https://github.com/user-attachments/assets/96719893-3cfc-4d3d-8d44-06721df8e14c" />
 <img width="1298" height="1050" alt="WindowsTerminal_qoqii76JKv" src="https://github.com/user-attachments/assets/15828746-2591-4871-a84c-f1d70e83ac5a" />
 <img width="1298" height="1050" alt="WindowsTerminal_qoqii76JKv" src="https://github.com/user-attachments/assets/748b0ba4-4c1a-4383-8f02-cb1abddacebb" />

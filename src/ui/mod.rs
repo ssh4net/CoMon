@@ -389,11 +389,19 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 }
 
 fn header_line_area(area: Rect) -> Rect {
-    Rect {
+    inset_header_area(Rect {
         x: area.x,
         y: area.y.saturating_add(area.height.min(2).saturating_sub(1)),
         width: area.width,
         height: area.height.min(1),
+    })
+}
+
+fn inset_header_area(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(u16::from(area.width > 0)),
+        width: area.width.saturating_sub(2),
+        ..area
     }
 }
 
@@ -519,7 +527,7 @@ fn render_api_stats(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
 }
 
 fn api_stat_controls_height(summary: Option<&str>, width: u16) -> u16 {
-    1_u16.saturating_add(reset_summary_height(summary, width, None))
+    1_u16.saturating_add(reset_summary_height(summary, width.saturating_sub(2), None))
 }
 
 fn render_api_stat_controls(
@@ -528,7 +536,7 @@ fn render_api_stat_controls(
     state: &mut AppState,
     reset_summary: Option<&str>,
 ) {
-    let reset_height = reset_summary_height(reset_summary, area.width, None);
+    let reset_height = reset_summary_height(reset_summary, area.width.saturating_sub(2), None);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(reset_height)])
@@ -620,14 +628,21 @@ fn render_api_stat_controls(
     spans.push(control_group_label("STYLE", accent_color));
     spans.extend([classic, system_compact, system_full]);
 
-    register_right_aligned_targets(state, chunks[0], &segments);
+    let header_row = inset_header_area(chunks[0]);
+    register_right_aligned_targets(state, header_row, &segments);
     frame.render_widget(
         Paragraph::new(Line::from(spans)).alignment(Alignment::Right),
-        chunks[0],
+        header_row,
     );
 
     if let Some(text) = reset_summary {
-        let _ = render_reset_summary(frame, chunks[1], text, state.accent_text_color(), None);
+        let _ = render_reset_summary(
+            frame,
+            inset_header_area(chunks[1]),
+            text,
+            state.accent_text_color(),
+            None,
+        );
     }
 }
 
@@ -2110,7 +2125,7 @@ fn render_activity_controls(
     state: &mut AppState,
     reset_summary: Option<&str>,
 ) {
-    let reset_height = reset_summary_height(reset_summary, area.width, None);
+    let reset_height = reset_summary_height(reset_summary, area.width.saturating_sub(2), None);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(reset_height)])
@@ -2137,7 +2152,13 @@ fn render_activity_controls(
     );
 
     if let Some(text) = reset_summary {
-        let _ = render_reset_summary(frame, chunks[1], text, state.accent_text_color(), None);
+        let _ = render_reset_summary(
+            frame,
+            inset_header_area(chunks[1]),
+            text,
+            state.accent_text_color(),
+            None,
+        );
     }
 }
 
@@ -2149,6 +2170,7 @@ fn render_flat_activity_controls(
     metric_pills: Vec<Span<'static>>,
     project_count: String,
 ) {
+    let area = inset_header_area(area);
     let row = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(20), Constraint::Min(0)])
@@ -2691,7 +2713,7 @@ fn render_usage_controls(
 ) -> Option<WeeklyPaceHover> {
     let reset_height = reset_summary_height(
         reset_summary,
-        area.width,
+        area.width.saturating_sub(2),
         reset_button.map(LimitResetButtonView::width),
     );
     let chunks = Layout::default()
@@ -2744,7 +2766,7 @@ fn render_usage_controls(
     let button_area = reset_summary.and_then(|text| {
         render_reset_summary(
             frame,
-            chunks[1],
+            inset_header_area(chunks[1]),
             text,
             state.accent_text_color(),
             reset_button,
@@ -2784,6 +2806,7 @@ fn render_flat_usage_controls(
     workspace_label: &str,
     pills: Vec<Span<'static>>,
 ) {
+    let area = inset_header_area(area);
     let row = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(20), Constraint::Length(116)])
@@ -5972,11 +5995,15 @@ fn reset_summary_height(summary: Option<&str>, width: u16, button_width: Option<
 }
 
 fn usage_controls_height(summary: Option<&str>, width: u16, button_width: Option<u16>) -> u16 {
-    1_u16.saturating_add(reset_summary_height(summary, width, button_width))
+    1_u16.saturating_add(reset_summary_height(
+        summary,
+        width.saturating_sub(2),
+        button_width,
+    ))
 }
 
 fn activity_controls_height(summary: Option<&str>, width: u16) -> u16 {
-    1_u16.saturating_add(reset_summary_height(summary, width, None))
+    1_u16.saturating_add(reset_summary_height(summary, width.saturating_sub(2), None))
 }
 
 #[derive(Debug, Clone)]
@@ -6076,14 +6103,21 @@ fn render_reset_summary(
 
 fn render_limit_resets(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let summary = reset_summary_text(state);
-    let summary_height = reset_summary_height(summary.as_deref(), area.width, None);
+    let summary_height =
+        reset_summary_height(summary.as_deref(), area.width.saturating_sub(2), None);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(summary_height), Constraint::Min(0)])
         .split(area);
 
     if let Some(text) = summary.as_deref() {
-        let _ = render_reset_summary(frame, chunks[0], text, state.accent_text_color(), None);
+        let _ = render_reset_summary(
+            frame,
+            inset_header_area(chunks[0]),
+            text,
+            state.accent_text_color(),
+            None,
+        );
     }
     render_limit_reset_details(frame, chunks[1], state);
 }
@@ -6408,11 +6442,7 @@ fn rolling_windows_for_limits(
         .unwrap_or((None, None))
 }
 
-/// How full the elapsed-time share of the weekly window is.
-///
-/// Pace uses API `used_percent` (not the displayed percent-left). A seven-day
-/// window unlocks exactly 1/7 of its limit for every 24 hours elapsed from the
-/// reset boundary, rather than jumping at local midnight.
+/// Status for the current reset-anchored daily allowance within a weekly window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WeeklyPaceBand {
     /// fill < 50% of today's daily allowance
@@ -6458,22 +6488,6 @@ fn weekly_window_bounds_secs(
     };
     let start_secs = reset_secs.saturating_sub(window_secs);
     Some((start_secs, reset_secs, window_mins))
-}
-
-/// Elapsed fair-share percent of the weekly window at `now_unix_secs`.
-/// Returns `None` when the window cannot be placed on a timeline.
-fn weekly_elapsed_allowed_percent(
-    window: &crate::codex_rpc::RateLimitWindow,
-    now_unix_secs: i64,
-) -> Option<f64> {
-    let (start_secs, reset_secs, _) = weekly_window_bounds_secs(window)?;
-    let window_secs = reset_secs.saturating_sub(start_secs);
-    if window_secs <= 0 {
-        return None;
-    }
-    let now_clamped = now_unix_secs.clamp(start_secs, reset_secs);
-    let elapsed_secs = now_clamped.saturating_sub(start_secs);
-    Some((elapsed_secs as f64 / window_secs as f64 * 100.0).clamp(0.0, 100.0))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6528,9 +6542,12 @@ fn weekly_pace_band(
     window: &crate::codex_rpc::RateLimitWindow,
     now_unix_secs: i64,
 ) -> WeeklyPaceBand {
-    let Some(pace) = weekly_daily_pace(window, now_unix_secs) else {
-        return WeeklyPaceBand::Normal;
-    };
+    weekly_daily_pace(window, now_unix_secs)
+        .map(weekly_daily_pace_band)
+        .unwrap_or(WeeklyPaceBand::Normal)
+}
+
+fn weekly_daily_pace_band(pace: WeeklyDailyPace) -> WeeklyPaceBand {
     let daily_used_percent = (100.0 - pace.safe_today_percent).clamp(0.0, 100.0);
     let fill = daily_used_percent + PACE_THRESHOLD_EPSILON;
     if fill >= 90.0 {
@@ -6542,6 +6559,24 @@ fn weekly_pace_band(
     } else {
         WeeklyPaceBand::Normal
     }
+}
+
+fn weekly_daily_cap_percent(pace: WeeklyDailyPace) -> f64 {
+    (pace.day_index as f64 * pace.daily_limit_percent).clamp(0.0, 100.0)
+}
+
+fn weekly_gauge_pacing(
+    window: &crate::codex_rpc::RateLimitWindow,
+    now_unix_secs: i64,
+) -> (Option<WeeklyPaceBand>, Option<f64>) {
+    weekly_daily_pace(window, now_unix_secs)
+        .map(|pace| {
+            (
+                Some(weekly_daily_pace_band(pace)),
+                Some(weekly_daily_cap_percent(pace)),
+            )
+        })
+        .unwrap_or((None, None))
 }
 
 fn style_weekly_limit_line(plain: &str, band: WeeklyPaceBand, emphasize: bool) -> Line<'static> {
@@ -6558,6 +6593,15 @@ fn style_weekly_limit_line(plain: &str, band: WeeklyPaceBand, emphasize: bool) -
         WeeklyPaceBand::Red => Style::default().fg(Color::White).bg(Color::Red),
     };
     Line::from(Span::styled(plain.to_string(), style))
+}
+
+fn weekly_pace_gauge_color(band: WeeklyPaceBand) -> Color {
+    match band {
+        WeeklyPaceBand::Normal => Color::White,
+        WeeklyPaceBand::Yellow => Color::Yellow,
+        WeeklyPaceBand::Orange => WEEKLY_PACE_ORANGE_BG,
+        WeeklyPaceBand::Red => Color::Red,
+    }
 }
 
 fn limits_line_for_slot(
@@ -6654,7 +6698,8 @@ fn render_segmented_usage_gauge<const SEGMENTS: usize>(
     buffer: &mut Buffer,
     area: Rect,
     used_percent: Option<f64>,
-    fair_percent: Option<f64>,
+    status_band: Option<WeeklyPaceBand>,
+    marker_percent: Option<f64>,
 ) {
     if area.height == 0 {
         return;
@@ -6664,11 +6709,14 @@ fn render_segmented_usage_gauge<const SEGMENTS: usize>(
     };
 
     let filled_width = gauge_filled_width(used_percent, area.width);
-    let fair_width = fair_percent
+    let marker_width = marker_percent
         .filter(|value| value.is_finite())
         .map(|value| gauge_filled_width(Some(value), area.width));
-    let fair_marker =
-        fair_width.map(|width| width.saturating_sub(1).min(area.width.saturating_sub(1)));
+    let marker =
+        marker_width.map(|width| width.saturating_sub(1).min(area.width.saturating_sub(1)));
+    let fill_color = status_band
+        .map(weekly_pace_gauge_color)
+        .unwrap_or(Color::White);
     let empty_divider_style = Style::default().fg(Color::DarkGray);
     let mut next_divider = 0_usize;
 
@@ -6677,28 +6725,18 @@ fn render_segmented_usage_gauge<const SEGMENTS: usize>(
         if is_divider {
             next_divider += 1;
         }
-        let fill_color = if let Some(fair) = fair_width {
-            if offset < fair {
-                Color::Yellow
-            } else {
-                Color::Red
-            }
-        } else {
-            Color::White
-        };
-
         let cell = &mut buffer[(area.x.saturating_add(offset), area.y)];
         cell.reset();
-        if is_divider || fair_marker == Some(offset) {
+        if is_divider || marker == Some(offset) {
             if offset < filled_width {
                 // Use a left-seven-eighths block for filled boundaries. It renders as
                 // the colored portion with a narrow dark edge more consistently in
                 // macOS Terminal than an inverted right-one-eighth block.
                 cell.set_symbol(LIMIT_GAUGE_FILLED_DIVIDER)
                     .set_style(Style::default().fg(fill_color).bg(Color::Black));
-            } else if fair_marker == Some(offset) {
+            } else if marker == Some(offset) {
                 cell.set_symbol(LIMIT_GAUGE_DIVIDER);
-                cell.set_style(Style::default().fg(Color::Yellow));
+                cell.set_style(Style::default().fg(fill_color));
             } else {
                 cell.set_symbol(LIMIT_GAUGE_DIVIDER);
                 cell.set_style(empty_divider_style);
@@ -6714,7 +6752,8 @@ fn render_segmented_usage_gauge<const SEGMENTS: usize>(
 enum LimitUsageGauge {
     Weekly {
         used_percent: Option<f64>,
-        fair_percent: Option<f64>,
+        status_band: Option<WeeklyPaceBand>,
+        marker_percent: Option<f64>,
     },
     Monthly {
         used_percent: Option<f64>,
@@ -6728,7 +6767,8 @@ fn limit_usage_gauge(
     let Some(limits) = limits else {
         return LimitUsageGauge::Weekly {
             used_percent: None,
-            fair_percent: None,
+            status_band: None,
+            marker_percent: None,
         };
     };
     let (_, top_level_weekly_window) =
@@ -6736,9 +6776,11 @@ fn limit_usage_gauge(
     if let Some(window) = top_level_weekly_window
         .filter(|window| window.used_percent.is_some_and(|value| value.is_finite()))
     {
+        let (status_band, marker_percent) = weekly_gauge_pacing(window, now_unix_secs);
         return LimitUsageGauge::Weekly {
             used_percent: window.used_percent,
-            fair_percent: weekly_elapsed_allowed_percent(window, now_unix_secs),
+            status_band,
+            marker_percent,
         };
     }
     if let Some(monthly) = limits.individual_limit.as_ref() {
@@ -6753,9 +6795,11 @@ fn limit_usage_gauge(
     let usable_weekly_window =
         weekly_window.filter(|window| window.used_percent.is_some_and(|value| value.is_finite()));
     if let Some(window) = usable_weekly_window {
+        let (status_band, marker_percent) = weekly_gauge_pacing(window, now_unix_secs);
         return LimitUsageGauge::Weekly {
             used_percent: window.used_percent,
-            fair_percent: weekly_elapsed_allowed_percent(window, now_unix_secs),
+            status_band,
+            marker_percent,
         };
     }
     let has_usable_short_window = short_window
@@ -6771,7 +6815,8 @@ fn limit_usage_gauge(
     }
     LimitUsageGauge::Weekly {
         used_percent: None,
-        fair_percent: None,
+        status_band: None,
+        marker_percent: None,
     }
 }
 
@@ -6779,17 +6824,19 @@ fn render_limit_usage_gauge(buffer: &mut Buffer, area: Rect, gauge: LimitUsageGa
     match gauge {
         LimitUsageGauge::Weekly {
             used_percent,
-            fair_percent,
+            status_band,
+            marker_percent,
         } => {
             render_segmented_usage_gauge::<WEEKLY_GAUGE_DAYS>(
                 buffer,
                 area,
                 used_percent,
-                fair_percent,
+                status_band,
+                marker_percent,
             );
         }
         LimitUsageGauge::Monthly { used_percent } => {
-            render_segmented_usage_gauge::<1>(buffer, area, used_percent, None);
+            render_segmented_usage_gauge::<1>(buffer, area, used_percent, None, None);
         }
     }
 }
@@ -6803,7 +6850,7 @@ fn rect_contains(area: Rect, point: (u16, u16)) -> bool {
 
 /// Human-friendly hover text for weekly pace, available for every pace band.
 ///
-/// Uses API `used_percent` and elapsed fair share; not the displayed percent-left.
+/// Uses API `used_percent` with reset-anchored daily allowance and carryover.
 fn format_weekly_pace_tooltip(
     window: &crate::codex_rpc::RateLimitWindow,
     band: WeeklyPaceBand,
@@ -7244,6 +7291,29 @@ mod tests {
     }
 
     #[test]
+    fn inset_header_control_row_moves_content_and_targets_together() {
+        let row = inset_header_area(Rect::new(10, 3, 30, 1));
+        assert_eq!(row, Rect::new(11, 3, 28, 1));
+        let targets = right_aligned_targets(
+            row,
+            &[
+                (
+                    " TOKENS ",
+                    Some(UiClickAction::SetMetric(UsageMetric::Tokens)),
+                ),
+                (" TIME ", Some(UiClickAction::SetMetric(UsageMetric::Time))),
+            ],
+        );
+        assert_eq!(targets[0].area, Rect::new(25, 3, 8, 1));
+        assert_eq!(targets[1].area, Rect::new(33, 3, 6, 1));
+        for width in 0..=2 {
+            let area = inset_header_area(Rect::new(10, 3, width, 1));
+            assert_eq!(area.x, 10 + u16::from(width > 0));
+            assert_eq!(area.width, 0);
+        }
+    }
+
+    #[test]
     fn right_aligned_control_targets_are_disabled_when_clipped() {
         let targets = right_aligned_targets(
             Rect::new(0, 0, 4, 1),
@@ -7530,7 +7600,7 @@ mod tests {
         let header_line = header_line_area(chunks[0]);
 
         assert_eq!(chunks[0], Rect::new(2, 1, 100, 3));
-        assert_eq!(header_line, Rect::new(2, 2, 100, 1));
+        assert_eq!(header_line, Rect::new(3, 2, 98, 1));
         assert_eq!(header_line.y + header_line.height + 1, chunks[1].y);
     }
 
@@ -7730,6 +7800,18 @@ mod tests {
         assert!(reset_summary_height(Some(summary), 24, None) > wrapped_line_count(summary, 24));
         assert_eq!(usage_controls_height(None, 80, Some(7)), 1);
         assert_eq!(activity_controls_height(None, 80), 1);
+        assert_eq!(
+            usage_controls_height(Some(summary), 24, Some(7)),
+            1 + reset_summary_height(Some(summary), 22, Some(7))
+        );
+        assert_eq!(
+            activity_controls_height(Some(summary), 24),
+            1 + reset_summary_height(Some(summary), 22, None)
+        );
+        assert_eq!(
+            api_stat_controls_height(Some(summary), 24),
+            1 + reset_summary_height(Some(summary), 22, None)
+        );
     }
 
     #[test]
@@ -7743,7 +7825,7 @@ mod tests {
 
     #[test]
     fn reset_button_is_immediately_after_the_summary_when_it_fits() {
-        let area = Rect::new(4, 6, 100, 4);
+        let area = inset_header_area(Rect::new(4, 6, 100, 4));
         let summary = "Resets: 1 available | earliest expires 21 Sep, 09:04";
         let display_width = u16::try_from(UnicodeWidthStr::width(
             reset_summary_display_text(summary).as_str(),
@@ -7752,25 +7834,27 @@ mod tests {
 
         let layout = reset_summary_layout(area, summary, Some(7));
 
-        assert_eq!(layout.summary_area, Rect::new(4, 6, display_width, 1));
+        assert_eq!(area, Rect::new(5, 6, 98, 4));
+        assert_eq!(layout.summary_area, Rect::new(5, 6, display_width, 1));
         assert_eq!(
             layout.button_area,
-            Some(Rect::new(4 + display_width, 6, 7, 1))
+            Some(Rect::new(5 + display_width, 6, 7, 1))
         );
         assert_eq!(layout.height, 2);
     }
 
     #[test]
     fn reset_button_wraps_below_a_narrow_summary() {
-        let area = Rect::new(4, 6, 24, 8);
+        let area = inset_header_area(Rect::new(4, 6, 24, 8));
         let summary = "Resets: 1 available | earliest expires 21 Sep, 09:04";
 
         let layout = reset_summary_layout(area, summary, Some(7));
 
+        assert_eq!(area, Rect::new(5, 6, 22, 8));
         assert!(layout.summary_area.height > 1);
         assert_eq!(
             layout.button_area,
-            Some(Rect::new(4, 6 + layout.summary_area.height, 7, 1))
+            Some(Rect::new(5, 6 + layout.summary_area.height, 7, 1))
         );
         assert_eq!(layout.height, layout.summary_area.height + 2);
     }
@@ -7914,21 +7998,50 @@ mod tests {
     }
 
     #[test]
-    fn weekly_pace_band_thresholds_use_elapsed_share() {
-        // During the first day, the daily budget is 100/7 ~ 14.286%.
-        // used 6 -> 42% of today's budget -> Normal
-        // used 8 -> 56% -> Yellow
-        // used 10 -> 70% -> Orange
-        // used 13 -> 91% -> Red
-        let start = NaiveDate::from_ymd_opt(2026, 7, 20).expect("date");
-        let (w6, now) = weekly_window(6.0, start, start, 1, 0);
-        assert_eq!(weekly_pace_band(&w6, now), WeeklyPaceBand::Normal);
-        let (w8, now) = weekly_window(8.0, start, start, 1, 0);
-        assert_eq!(weekly_pace_band(&w8, now), WeeklyPaceBand::Yellow);
-        let (w10, now) = weekly_window(10.0, start, start, 1, 0);
-        assert_eq!(weekly_pace_band(&w10, now), WeeklyPaceBand::Orange);
-        let (w13, now) = weekly_window(13.0, start, start, 1, 0);
-        assert_eq!(weekly_pace_band(&w13, now), WeeklyPaceBand::Red);
+    fn weekly_pace_thresholds_match_daily_band_and_gauge_status() {
+        const START_SECS: i64 = 1_800_000_000;
+        const WINDOW_SECS: i64 = 7 * 24 * 60 * 60;
+        let daily_budget = 100.0 / 7.0;
+        for (share, expected) in [
+            (49.99, WeeklyPaceBand::Normal),
+            (50.0, WeeklyPaceBand::Yellow),
+            (69.99, WeeklyPaceBand::Yellow),
+            (70.0, WeeklyPaceBand::Orange),
+            (89.99, WeeklyPaceBand::Orange),
+            (90.0, WeeklyPaceBand::Red),
+        ] {
+            let window = crate::codex_rpc::RateLimitWindow {
+                used_percent: Some(daily_budget * share / 100.0),
+                window_duration_mins: Some(7.0 * 24.0 * 60.0),
+                resets_at: Some((START_SECS + WINDOW_SECS) * 1000),
+            };
+            let band = weekly_pace_band(&window, START_SECS);
+            assert_eq!(band, expected, "daily share {share}%");
+            let gauge = limit_usage_gauge(Some(&limits_with_weekly(window)), START_SECS);
+            assert!(matches!(
+                gauge,
+                LimitUsageGauge::Weekly {
+                    status_band: Some(gauge_band),
+                    ..
+                } if gauge_band == band
+            ));
+        }
+    }
+
+    fn limits_with_weekly(
+        weekly: crate::codex_rpc::RateLimitWindow,
+    ) -> crate::codex_rpc::AccountRateLimits {
+        crate::codex_rpc::AccountRateLimits {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            individual_limit: None,
+            primary: None,
+            secondary: Some(weekly),
+            credits: None,
+            buckets: Vec::new(),
+            reset_credits_available: None,
+            reset_credits: None,
+        }
     }
 
     #[test]
@@ -7962,10 +8075,14 @@ mod tests {
         // A local midnight does not start a new daily allowance when reset was 19:54.
         let (w, now) = weekly_window_from_start(used, start, 19, 54, day2, 0, 23);
         assert_eq!(weekly_pace_band(&w, now), WeeklyPaceBand::Yellow);
+        let before_midnight_cap = weekly_gauge_pacing(&w, now).1.expect("daily cap");
+        assert!((before_midnight_cap - 100.0 / 7.0).abs() < 0.01);
 
         // The allowance changes only after the reset-anchored 24 hours complete.
         let (w, now) = weekly_window_from_start(used, start, 19, 54, day2, 19, 54);
         assert_eq!(weekly_pace_band(&w, now), WeeklyPaceBand::Normal);
+        let after_boundary_cap = weekly_gauge_pacing(&w, now).1.expect("daily cap");
+        assert!((after_boundary_cap - 200.0 / 7.0).abs() < 0.01);
     }
 
     #[test]
@@ -7982,8 +8099,6 @@ mod tests {
         let daily = weekly_daily_pace(&window, now).expect("daily pace");
         assert_eq!(daily.day_index, 5);
         assert!((daily.safe_today_percent - 38.0).abs() < 0.1);
-        let fair = weekly_elapsed_allowed_percent(&window, now).expect("fair share");
-        assert!((fair - 59.9).abs() < 0.1);
     }
 
     #[test]
@@ -8110,51 +8225,147 @@ mod tests {
     }
 
     #[test]
-    fn weekly_gauge_colors_fair_progress_yellow_and_overage_red() {
+    fn weekly_gauge_uses_one_status_color_for_every_filled_cell() {
         let area = Rect::new(0, 0, 28, 1);
-        let mut buffer = Buffer::empty(area);
-        render_segmented_usage_gauge::<WEEKLY_GAUGE_DAYS>(
-            &mut buffer,
-            area,
-            Some(35.7),
-            Some(14.3),
-        );
-
-        assert_eq!(buffer[(0, 0)].symbol(), LIMIT_GAUGE_FILL);
-        assert_eq!(buffer[(0, 0)].style().fg, Some(Color::Yellow));
-        assert_eq!(buffer[(3, 0)].symbol(), LIMIT_GAUGE_FILLED_DIVIDER);
-        assert_eq!(buffer[(3, 0)].style().fg, Some(Color::Yellow));
-        assert_eq!(buffer[(3, 0)].style().bg, Some(Color::Black));
-        assert!(!buffer[(3, 0)]
-            .style()
-            .add_modifier
-            .contains(Modifier::REVERSED));
-        assert_eq!(buffer[(4, 0)].symbol(), LIMIT_GAUGE_FILL);
-        assert_eq!(buffer[(4, 0)].style().fg, Some(Color::Red));
-        assert_eq!(buffer[(7, 0)].symbol(), LIMIT_GAUGE_FILLED_DIVIDER);
-        assert_eq!(buffer[(7, 0)].style().fg, Some(Color::Red));
-        assert_eq!(buffer[(7, 0)].style().bg, Some(Color::Black));
-        assert!(!buffer[(7, 0)]
-            .style()
-            .add_modifier
-            .contains(Modifier::REVERSED));
-        assert_eq!(buffer[(10, 0)].symbol(), " ");
-        assert_eq!(buffer[(11, 0)].symbol(), LIMIT_GAUGE_DIVIDER);
-        assert_eq!(buffer[(11, 0)].style().fg, Some(Color::DarkGray));
+        let marker_percent = 3.0 / 7.0 * 100.0;
+        for band in [
+            WeeklyPaceBand::Normal,
+            WeeklyPaceBand::Yellow,
+            WeeklyPaceBand::Orange,
+            WeeklyPaceBand::Red,
+        ] {
+            let mut buffer = Buffer::empty(area);
+            render_segmented_usage_gauge::<WEEKLY_GAUGE_DAYS>(
+                &mut buffer,
+                area,
+                Some(80.0),
+                Some(band),
+                Some(marker_percent),
+            );
+            let expected_color = weekly_pace_gauge_color(band);
+            for x in 0..gauge_filled_width(Some(80.0), area.width) {
+                let cell = &buffer[(x, 0)];
+                assert!(
+                    cell.symbol() == LIMIT_GAUGE_FILL
+                        || cell.symbol() == LIMIT_GAUGE_FILLED_DIVIDER
+                );
+                assert_eq!(cell.style().fg, Some(expected_color));
+                if cell.symbol() == LIMIT_GAUGE_FILLED_DIVIDER {
+                    assert_eq!(cell.style().bg, Some(Color::Black));
+                    assert!(!cell.style().add_modifier.contains(Modifier::REVERSED));
+                }
+            }
+            assert_eq!(buffer[(23, 0)].symbol(), LIMIT_GAUGE_DIVIDER);
+            assert_eq!(buffer[(23, 0)].style().fg, Some(Color::DarkGray));
+            assert_eq!(buffer[(27, 0)].symbol(), LIMIT_GAUGE_DIVIDER);
+            assert_eq!(buffer[(27, 0)].style().fg, Some(Color::DarkGray));
+        }
     }
 
     #[test]
-    fn weekly_gauge_shows_the_fair_limit_before_usage_reaches_it() {
+    fn weekly_gauge_marks_cumulative_daily_cap_before_usage_reaches_it() {
         let area = Rect::new(0, 0, 28, 1);
         let mut buffer = Buffer::empty(area);
 
-        render_segmented_usage_gauge::<WEEKLY_GAUGE_DAYS>(&mut buffer, area, Some(7.0), Some(14.3));
+        render_segmented_usage_gauge::<WEEKLY_GAUGE_DAYS>(
+            &mut buffer,
+            area,
+            Some(7.0),
+            Some(WeeklyPaceBand::Yellow),
+            Some(100.0 / 7.0),
+        );
 
         assert_eq!(buffer[(0, 0)].style().fg, Some(Color::Yellow));
         assert_eq!(buffer[(2, 0)].symbol(), " ");
         assert_eq!(buffer[(3, 0)].symbol(), LIMIT_GAUGE_DIVIDER);
         assert_eq!(buffer[(3, 0)].style().fg, Some(Color::Yellow));
         assert_eq!(buffer[(3, 0)].style().bg, Some(Color::Reset));
+    }
+
+    #[test]
+    fn weekly_gauge_marker_tracks_day_one_and_day_three_caps() {
+        let start_secs = 1_800_000_000;
+        let reset_secs = start_secs + 7 * 24 * 60 * 60;
+        let daily_budget = 100.0 / 7.0;
+        for (day_offset, day_index) in [(0, 1), (2, 3)] {
+            let window = crate::codex_rpc::RateLimitWindow {
+                used_percent: Some(daily_budget * (day_index - 1) as f64),
+                window_duration_mins: Some(10_080.0),
+                resets_at: Some(reset_secs * 1000),
+            };
+            let now = start_secs + day_offset * 24 * 60 * 60;
+            let pace = weekly_daily_pace(&window, now).expect("valid pace");
+            assert_eq!(pace.day_index, day_index);
+            let (band, marker) = weekly_gauge_pacing(&window, now);
+            assert_eq!(band, Some(WeeklyPaceBand::Normal));
+            assert!((marker.expect("daily cap") - day_index as f64 / 7.0 * 100.0).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn weekly_gauge_marker_changes_at_fixed_reset_boundary() {
+        let start_secs = 1_800_000_000;
+        let reset_secs = start_secs + 7 * 24 * 60 * 60;
+        let window = crate::codex_rpc::RateLimitWindow {
+            used_percent: Some(8.0),
+            window_duration_mins: Some(10_080.0),
+            resets_at: Some(reset_secs * 1000),
+        };
+        let before_boundary = start_secs + 24 * 60 * 60 - 1;
+        let at_boundary = start_secs + 24 * 60 * 60;
+        let before = weekly_daily_pace(&window, before_boundary).expect("day one");
+        let after = weekly_daily_pace(&window, at_boundary).expect("day two");
+        assert_eq!(before.day_index, 1);
+        assert_eq!(after.day_index, 2);
+        assert!((weekly_daily_cap_percent(before) - 100.0 / 7.0).abs() < 0.01);
+        assert!((weekly_daily_cap_percent(after) - 200.0 / 7.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn weekly_gauge_marker_moves_when_reset_hour_moves_from_1954_to_midnight() {
+        const MIDNIGHT_START_SECS: i64 = 1_800_057_600;
+        assert_eq!(MIDNIGHT_START_SECS.rem_euclid(24 * 60 * 60), 0);
+        let now = MIDNIGHT_START_SECS + 24 * 60 * 60 + 23 * 60;
+        let window_for_start = |start_secs| crate::codex_rpc::RateLimitWindow {
+            used_percent: Some(8.0),
+            window_duration_mins: Some(10_080.0),
+            resets_at: Some((start_secs + 7 * 24 * 60 * 60) * 1000),
+        };
+        let midnight_reset = window_for_start(MIDNIGHT_START_SECS);
+        let evening_reset = window_for_start(MIDNIGHT_START_SECS + 19 * 60 * 60 + 54 * 60);
+
+        let midnight_pace = weekly_daily_pace(&midnight_reset, now).expect("midnight reset pace");
+        let evening_pace = weekly_daily_pace(&evening_reset, now).expect("evening reset pace");
+        assert_eq!(midnight_pace.day_index, 2);
+        assert_eq!(evening_pace.day_index, 1);
+        assert!((weekly_daily_cap_percent(midnight_pace) - 200.0 / 7.0).abs() < 0.01);
+        assert!((weekly_daily_cap_percent(evening_pace) - 100.0 / 7.0).abs() < 0.01);
+        assert_eq!(
+            weekly_pace_band(&midnight_reset, now),
+            WeeklyPaceBand::Normal
+        );
+        assert_eq!(
+            weekly_pace_band(&evening_reset, now),
+            WeeklyPaceBand::Yellow
+        );
+    }
+
+    #[test]
+    fn weekly_gauge_handles_widths_below_one_segment() {
+        for width in 0..WEEKLY_GAUGE_DAYS as u16 {
+            let area = Rect::new(4, 2, width, 1);
+            let mut buffer = Buffer::empty(area);
+            render_segmented_usage_gauge::<WEEKLY_GAUGE_DAYS>(
+                &mut buffer,
+                area,
+                Some(50.0),
+                Some(WeeklyPaceBand::Orange),
+                Some(100.0 / 7.0),
+            );
+            for x in area.x..area.x.saturating_add(area.width) {
+                assert_eq!(buffer[(x, area.y)].symbol(), " ");
+            }
+        }
     }
 
     #[test]
@@ -8167,31 +8378,105 @@ mod tests {
     }
 
     #[test]
-    fn weekly_limit_gauge_uses_the_current_fair_share() {
-        let start = NaiveDate::from_ymd_opt(2026, 7, 20).expect("date");
-        let next_day = NaiveDate::from_ymd_opt(2026, 7, 21).expect("date");
-        let (weekly, now) = weekly_window(20.0, start, next_day, 0, 0);
-        let limits = crate::codex_rpc::AccountRateLimits {
-            limit_id: Some("codex".to_string()),
-            limit_name: None,
-            individual_limit: None,
-            primary: None,
-            secondary: Some(weekly),
-            credits: None,
-            buckets: Vec::new(),
-            reset_credits_available: None,
-            reset_credits: None,
+    fn weekly_limit_gauge_uses_status_band_and_daily_cap_marker() {
+        let start_secs = 1_800_000_000;
+        let reset_secs = start_secs + 7 * 24 * 60 * 60;
+        let now = start_secs + 24 * 60 * 60;
+        let weekly = crate::codex_rpc::RateLimitWindow {
+            used_percent: Some(20.0),
+            window_duration_mins: Some(10_080.0),
+            resets_at: Some(reset_secs * 1000),
         };
-
+        let limits = limits_with_weekly(weekly.clone());
         let LimitUsageGauge::Weekly {
             used_percent,
-            fair_percent,
+            status_band,
+            marker_percent,
         } = limit_usage_gauge(Some(&limits), now)
         else {
             panic!("weekly gauge");
         };
         assert_eq!(used_percent, Some(20.0));
-        assert!((fair_percent.expect("fair share") - 100.0 / 7.0).abs() < 0.01);
+        assert_eq!(status_band, Some(WeeklyPaceBand::Normal));
+        assert_eq!(status_band, Some(weekly_pace_band(&weekly, now)));
+        assert!((marker_percent.expect("daily cap") - 200.0 / 7.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn weekly_gauge_keeps_missing_or_invalid_pacing_data_white_without_marker() {
+        let mut missing_used = crate::codex_rpc::RateLimitWindow {
+            used_percent: None,
+            window_duration_mins: Some(10_080.0),
+            resets_at: Some(1_800_000_000 * 1000 + 7 * 24 * 60 * 60 * 1000),
+        };
+        let no_usage = limit_usage_gauge(
+            Some(&limits_with_weekly(missing_used.clone())),
+            1_800_000_000,
+        );
+        assert_eq!(
+            no_usage,
+            LimitUsageGauge::Weekly {
+                used_percent: None,
+                status_band: None,
+                marker_percent: None,
+            }
+        );
+
+        let zero_usage_window = crate::codex_rpc::RateLimitWindow {
+            used_percent: Some(0.0),
+            window_duration_mins: Some(10_080.0),
+            resets_at: Some(1_800_000_000 * 1000 + 7 * 24 * 60 * 60 * 1000),
+        };
+        assert!(matches!(
+            limit_usage_gauge(Some(&limits_with_weekly(zero_usage_window)), 1_800_000_000),
+            LimitUsageGauge::Weekly {
+                used_percent: Some(0.0),
+                status_band: Some(WeeklyPaceBand::Normal),
+                marker_percent: Some(_),
+            }
+        ));
+
+        missing_used.used_percent = Some(25.0);
+        missing_used.resets_at = None;
+        let bad_timing = limit_usage_gauge(Some(&limits_with_weekly(missing_used)), 1_800_000_000);
+        assert_eq!(
+            bad_timing,
+            LimitUsageGauge::Weekly {
+                used_percent: Some(25.0),
+                status_band: None,
+                marker_percent: None,
+            }
+        );
+
+        let bad_usage = crate::codex_rpc::RateLimitWindow {
+            used_percent: Some(f64::NAN),
+            window_duration_mins: Some(10_080.0),
+            resets_at: Some(1_800_000_000 * 1000 + 7 * 24 * 60 * 60 * 1000),
+        };
+        let bad_usage = limit_usage_gauge(Some(&limits_with_weekly(bad_usage)), 1_800_000_000);
+        assert_eq!(
+            bad_usage,
+            LimitUsageGauge::Weekly {
+                used_percent: None,
+                status_band: None,
+                marker_percent: None,
+            }
+        );
+
+        let area = Rect::new(0, 0, 28, 1);
+        for gauge in [no_usage, bad_usage] {
+            let mut empty_buffer = Buffer::empty(area);
+            render_limit_usage_gauge(&mut empty_buffer, area, gauge);
+            assert_eq!(empty_buffer[(0, 0)].symbol(), " ");
+            assert_eq!(empty_buffer[(3, 0)].symbol(), LIMIT_GAUGE_DIVIDER);
+            assert_eq!(empty_buffer[(3, 0)].style().fg, Some(Color::DarkGray));
+        }
+        let mut buffer = Buffer::empty(area);
+        render_limit_usage_gauge(&mut buffer, area, bad_timing);
+        assert_eq!(buffer[(0, 0)].symbol(), LIMIT_GAUGE_FILL);
+        assert_eq!(buffer[(0, 0)].style().fg, Some(Color::White));
+        assert_eq!(buffer[(3, 0)].symbol(), LIMIT_GAUGE_FILLED_DIVIDER);
+        assert_eq!(buffer[(3, 0)].style().fg, Some(Color::White));
     }
 
     #[test]
@@ -8312,6 +8597,7 @@ mod tests {
 
         for x in 0..6 {
             assert_eq!(buffer[(x, 0)].symbol(), LIMIT_GAUGE_FILL);
+            assert_eq!(buffer[(x, 0)].style().fg, Some(Color::White));
         }
         for x in 6..11 {
             assert_eq!(buffer[(x, 0)].symbol(), " ");

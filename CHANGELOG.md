@@ -11,14 +11,26 @@ All notable changes to this project are documented in this file.
   presents the exact roots and limits for confirmation before a filesystem scan.
 - Applied each Weekly pace warning style to the full limit line. Normal and
   Yellow use text colors; Orange and Red use white text on warning backgrounds.
-- Updated the Today limit gauge to color fair-share progress yellow and consumed
-  usage beyond that boundary red, including matching filled-divider backgrounds.
+- Aligned the Limits gauge with reset-anchored daily allowance warnings and
+  retained matching filled-divider colors.
 - Moved the reset action from the Limits card to the reset-credit summary, with
   a wrapped narrow-layout position, white label, bright accent value, and the
   same click and hover behavior.
 - Added six persisted half-channel RGB accent themes and ordered all color
   swatches through a red-to-green-to-blue-to-red rainbow.
 - Fixed project attribution to use recorded session context only: sandbox permissions, tool working directories, and referenced command paths cannot create project memberships or relink Session history. The v12 cache migration rebuilds derived usage from raw session logs.
+
+## 0.5.7 - 2026-09-24
+
+- The weekly Limits gauge now matches the daily-allowance warning status:
+  white, yellow, orange, or red, including unused allowance carried forward.
+- Moved its marker to today's cumulative allowance instead of continuous
+  elapsed-week pacing. Monthly gauges remain neutral white.
+
+## 0.5.6 - 2026-09-24
+
+- Added one cell of padding to both sides of the top information and control
+  rows on every screen, including matching button hit areas and summary wrapping.
 
 ## 0.5.5 - 2026-09-24
 

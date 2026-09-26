@@ -894,9 +894,9 @@ fn render_header(
 
 fn header_line_area(area: Rect) -> Rect {
     Rect {
-        x: area.x,
+        x: area.x.saturating_add(u16::from(area.width > 0)),
         y: area.y.saturating_add(area.height.min(2).saturating_sub(1)),
-        width: area.width,
+        width: area.width.saturating_sub(2),
         height: area.height.min(1),
     }
 }
@@ -1651,19 +1651,25 @@ mod tests {
     fn header_line_has_one_blank_row_above_and_below() {
         assert_eq!(
             header_line_area(Rect::new(2, 1, 100, 3)),
-            Rect::new(2, 2, 100, 1)
+            Rect::new(3, 2, 98, 1)
         );
+        for width in 0..=2 {
+            assert_eq!(
+                header_line_area(Rect::new(2, 1, width, 3)),
+                Rect::new(2 + u16::from(width > 0), 2, 0, 1)
+            );
+        }
     }
 
     #[test]
     fn history_style_controls_use_right_side_of_header_line() {
         assert_eq!(
             history_style_controls_area(Rect::new(2, 1, 100, 3)),
-            Rect::new(34, 2, 68, 1)
+            Rect::new(33, 2, 68, 1)
         );
         assert_eq!(
             history_depth_controls_area(Rect::new(2, 1, 100, 3)),
-            Rect::new(52, 3, 16, 1)
+            Rect::new(51, 3, 16, 1)
         );
         assert_eq!(
             history_style_controls_area(Rect::new(2, 1, 20, 3)),

@@ -636,13 +636,7 @@ fn render_api_stat_controls(
     );
 
     if let Some(text) = reset_summary {
-        let _ = render_reset_summary(
-            frame,
-            inset_header_area(chunks[1]),
-            text,
-            state.accent_text_color(),
-            None,
-        );
+        let _ = render_reset_summary(frame, inset_header_area(chunks[1]), text, None);
     }
 }
 
@@ -2152,13 +2146,7 @@ fn render_activity_controls(
     );
 
     if let Some(text) = reset_summary {
-        let _ = render_reset_summary(
-            frame,
-            inset_header_area(chunks[1]),
-            text,
-            state.accent_text_color(),
-            None,
-        );
+        let _ = render_reset_summary(frame, inset_header_area(chunks[1]), text, None);
     }
 }
 
@@ -2764,13 +2752,7 @@ fn render_usage_controls(
     );
 
     let button_area = reset_summary.and_then(|text| {
-        render_reset_summary(
-            frame,
-            inset_header_area(chunks[1]),
-            text,
-            state.accent_text_color(),
-            reset_button,
-        )
+        render_reset_summary(frame, inset_header_area(chunks[1]), text, reset_button)
     });
     let button = reset_button?;
     let button_area = button_area?;
@@ -5910,7 +5892,7 @@ fn reset_summary_for_limits(
     formatter: DisplayFormatter<'_>,
 ) -> Option<String> {
     let available = limits.reset_credits_available?;
-    let mut text = format!("Resets: {} available", formatter.format_count(available));
+    let mut text = format!("{} available", formatter.format_count(available));
     let earliest_expiry = limits
         .reset_credits
         .as_deref()
@@ -5925,7 +5907,7 @@ fn reset_summary_for_limits(
 }
 
 fn reset_summary_display_text(text: &str) -> String {
-    format!("LIMIT RESETS  {text}")
+    format!("LIMIT RESETS: {text}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6072,23 +6054,22 @@ fn limit_reset_button_view(state: &AppState) -> LimitResetButtonView {
     }
 }
 
-fn reset_summary_line(text: &str, accent_color: Color) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(" LIMIT RESETS ", Style::default().fg(Color::White)),
-        Span::styled(text.to_string(), Style::default().fg(accent_color)),
-    ])
+fn reset_summary_line(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        reset_summary_display_text(text),
+        Style::default().fg(Color::White),
+    ))
 }
 
 fn render_reset_summary(
     frame: &mut Frame<'_>,
     area: Rect,
     text: &str,
-    accent_color: Color,
     button: Option<&LimitResetButtonView>,
 ) -> Option<Rect> {
     let layout = reset_summary_layout(area, text, button.map(LimitResetButtonView::width));
     frame.render_widget(
-        Paragraph::new(reset_summary_line(text, accent_color)).wrap(Wrap { trim: true }),
+        Paragraph::new(reset_summary_line(text)).wrap(Wrap { trim: true }),
         layout.summary_area,
     );
     if let (Some(button), Some(button_area)) = (button, layout.button_area) {
@@ -6111,13 +6092,7 @@ fn render_limit_resets(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         .split(area);
 
     if let Some(text) = summary.as_deref() {
-        let _ = render_reset_summary(
-            frame,
-            inset_header_area(chunks[0]),
-            text,
-            state.accent_text_color(),
-            None,
-        );
+        let _ = render_reset_summary(frame, inset_header_area(chunks[0]), text, None);
     }
     render_limit_reset_details(frame, chunks[1], state);
 }
@@ -6311,16 +6286,27 @@ fn format_limit_compact_line(
     window: Option<&crate::codex_rpc::RateLimitWindow>,
     compact: bool,
     formatter: DisplayFormatter<'_>,
+    weekly: bool,
 ) -> String {
     // Match requested alignment:
     // 5h limit: 100% (resets 20:43)
-    // Weekly:   99% (resets 09:47, 10 Feb)
+    // Weekly:   1% / 99% (resets 09:47, 10 Feb)
     const LABEL_W: usize = 10;
     let label = format!("{label_with_colon:<LABEL_W$}");
     let Some(w) = window else {
         return format!("{label}--");
     };
-    let pct = percent_left_value(w.used_percent);
+    let pct = if weekly {
+        match w.used_percent.filter(|value| value.is_finite()) {
+            Some(value) => {
+                let used = value.clamp(0.0, 100.0).round();
+                format!("{used:.0}% / {:.0}%", 100.0 - used)
+            }
+            None => "--% / --%".to_string(),
+        }
+    } else {
+        percent_left_value(w.used_percent)
+    };
     if compact {
         let label = label_with_colon
             .trim_end_matches(':')
@@ -6353,13 +6339,15 @@ fn format_rolling_limit_lines(
     // The newer response can expose the seven-day window as `primary` with no
     // short window. Keep the populated weekly limit in the card's value slot.
     if short_window.is_none() && weekly_window.is_some() {
-        let weekly = format_limit_compact_line(weekly_label, weekly_window, compact, formatter);
-        let short = format_limit_compact_line(&short_label, short_window, compact, formatter);
+        let weekly =
+            format_limit_compact_line(weekly_label, weekly_window, compact, formatter, true);
+        let short =
+            format_limit_compact_line(&short_label, short_window, compact, formatter, false);
         return (weekly, short);
     }
 
-    let short = format_limit_compact_line(&short_label, short_window, compact, formatter);
-    let weekly = format_limit_compact_line(weekly_label, weekly_window, compact, formatter);
+    let short = format_limit_compact_line(&short_label, short_window, compact, formatter, false);
+    let weekly = format_limit_compact_line(weekly_label, weekly_window, compact, formatter, true);
     (short, weekly)
 }
 
@@ -6492,7 +6480,6 @@ fn weekly_window_bounds_secs(
 
 #[derive(Debug, Clone, Copy)]
 struct WeeklyDailyPace {
-    used_percent: f64,
     day_index: u64,
     total_days: u64,
     daily_limit_percent: f64,
@@ -6526,7 +6513,6 @@ fn weekly_daily_pace(
         ((daily_limit_percent - used_today_percent) / daily_limit_percent) * 100.0;
 
     Some(WeeklyDailyPace {
-        used_percent,
         day_index,
         total_days,
         daily_limit_percent,
@@ -6850,7 +6836,7 @@ fn rect_contains(area: Rect, point: (u16, u16)) -> bool {
 
 /// Human-friendly hover text for weekly pace, available for every pace band.
 ///
-/// Uses API `used_percent` with reset-anchored daily allowance and carryover.
+/// Uses the reset-anchored daily allowance and carryover calculation.
 fn format_weekly_pace_tooltip(
     window: &crate::codex_rpc::RateLimitWindow,
     band: WeeklyPaceBand,
@@ -6860,28 +6846,14 @@ fn format_weekly_pace_tooltip(
     let (start_secs, reset_secs, _) = weekly_window_bounds_secs(window)?;
     let now_clamped = now_unix_secs.clamp(start_secs, reset_secs);
     let daily_used_percent = (pace.used_today_percent / pace.daily_limit_percent * 100.0).max(0.0);
-    let used_i = pace.used_percent.round() as i64;
-    let remaining_i = (100.0 - pace.used_percent).round() as i64;
-    let (headline, advice) = match band {
-        WeeklyPaceBand::Normal => (
-            "Daily usage is within today's allowance.",
-            "Unused capacity carries into today.",
-        ),
-        WeeklyPaceBand::Yellow => (
-            "Today's allowance is more than half used.",
-            "Keep usage steady until the weekly limit resets.",
-        ),
-        WeeklyPaceBand::Orange => (
-            "Today's allowance is running low.",
-            "Reduce usage until the weekly limit resets.",
-        ),
-        WeeklyPaceBand::Red => (
-            "Today's allowance is nearly exhausted.",
-            "The weekly limit may end before it resets.",
-        ),
+    let advice = match band {
+        WeeklyPaceBand::Normal => "Unused capacity carries into today.",
+        WeeklyPaceBand::Yellow => "Keep usage steady until the weekly limit resets.",
+        WeeklyPaceBand::Orange => "Reduce usage until the weekly limit resets.",
+        WeeklyPaceBand::Red => "The weekly limit may end before it resets.",
     };
     Some(format!(
-        "{headline}\nDay {}/{} | Weekly used: {used_i}% | Remaining: {remaining_i}%\nDaily budget: {:.1}% | Used today: {:.1}% | Safe left: {:.1}%\nResets in: {}\n{advice}",
+        "Daily usage for Day {}/{} | Daily budget: {:.1}%\nUsed: {:.1}% | Safe left: {:.0}%\nReset in: {}\n{advice}",
         pace.day_index,
         pace.total_days,
         pace.daily_limit_percent,
@@ -6937,7 +6909,7 @@ fn limits_card_paragraph(
         let (_, weekly_window) = rolling_windows_for_limits(limits);
         let weekly_label = if compact { "7d:" } else { "Weekly:" };
         let weekly_plain = weekly_window.map(|window| {
-            format_limit_compact_line(weekly_label, Some(window), compact, formatter)
+            format_limit_compact_line(weekly_label, Some(window), compact, formatter, true)
         });
         let band = weekly_window
             .map(|window| weekly_pace_band(window, now))
@@ -7083,6 +7055,7 @@ fn format_extra_bucket_compact_line(
         Some(window),
         compact,
         formatter,
+        false,
     ))
 }
 
@@ -7364,7 +7337,7 @@ mod tests {
 
     #[test]
     fn api_stat_controls_reserve_the_same_reset_summary_row_as_usage() {
-        let summary = "Resets: 1 available | earliest expires Aug 13, 02:39";
+        let summary = "1 available | earliest expires Aug 13, 02:39";
 
         assert_eq!(
             api_stat_controls_height(Some(summary), 100),
@@ -7698,7 +7671,7 @@ mod tests {
         let short = CardSpec::new("42".to_string(), vec!["One line".to_string()]);
         let tall = CardSpec::new(
             "Weekly limit".to_string(),
-            vec!["Resets: 3 available | earliest expires 21 Jul".to_string()],
+            vec!["LIMIT RESETS: 3 available | earliest expires 21 Jul".to_string()],
         );
         let width = 20;
         let expected = tall.required_height(width);
@@ -7790,13 +7763,15 @@ mod tests {
         };
 
         let summary = reset_summary_for_limits(&limits, formatter).expect("reset summary");
-        assert!(summary.starts_with("Resets: 3 available | earliest expires "));
+        assert!(summary.starts_with("3 available | earliest expires "));
+        assert!(reset_summary_display_text(&summary)
+            .starts_with("LIMIT RESETS: 3 available | earliest expires "));
         assert!(summary.contains(", "));
     }
 
     #[test]
     fn reset_summary_height_accounts_for_its_label() {
-        let summary = "Resets: 3 available | earliest expires 18 Jul";
+        let summary = "3 available | earliest expires 18 Jul";
         assert!(reset_summary_height(Some(summary), 24, None) > wrapped_line_count(summary, 24));
         assert_eq!(usage_controls_height(None, 80, Some(7)), 1);
         assert_eq!(activity_controls_height(None, 80), 1);
@@ -7815,18 +7790,26 @@ mod tests {
     }
 
     #[test]
-    fn reset_summary_uses_white_label_and_bright_accent_value() {
-        let line = reset_summary_line("Resets: 1 available", Color::LightCyan);
+    fn reset_summary_is_exact_and_entirely_white() {
+        let summary = "1 available | earliest expires 21 Sep, 09:04";
+        let line = reset_summary_line(summary);
 
-        assert_eq!(line.spans.len(), 2);
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(
+            line.spans[0].content.as_ref(),
+            "LIMIT RESETS: 1 available | earliest expires 21 Sep, 09:04"
+        );
         assert_eq!(line.spans[0].style.fg, Some(Color::White));
-        assert_eq!(line.spans[1].style.fg, Some(Color::LightCyan));
+        assert_eq!(
+            UnicodeWidthStr::width(line.spans[0].content.as_ref()),
+            UnicodeWidthStr::width(reset_summary_display_text(summary).as_str())
+        );
     }
 
     #[test]
     fn reset_button_is_immediately_after_the_summary_when_it_fits() {
         let area = inset_header_area(Rect::new(4, 6, 100, 4));
-        let summary = "Resets: 1 available | earliest expires 21 Sep, 09:04";
+        let summary = "1 available | earliest expires 21 Sep, 09:04";
         let display_width = u16::try_from(UnicodeWidthStr::width(
             reset_summary_display_text(summary).as_str(),
         ))
@@ -7846,7 +7829,7 @@ mod tests {
     #[test]
     fn reset_button_wraps_below_a_narrow_summary() {
         let area = inset_header_area(Rect::new(4, 6, 24, 8));
-        let summary = "Resets: 1 available | earliest expires 21 Sep, 09:04";
+        let summary = "1 available | earliest expires 21 Sep, 09:04";
 
         let layout = reset_summary_layout(area, summary, Some(7));
 
@@ -7900,12 +7883,12 @@ mod tests {
         assert_eq!(value, "Monthly:  99%");
         assert_eq!(caption1.as_deref(), Some("Credits:  564/60,000 used"));
         assert_eq!(caption2.as_deref(), Some("5h limit: 100%"));
-        assert_eq!(caption3.as_deref(), Some("Weekly:   100%"));
+        assert_eq!(caption3.as_deref(), Some("Weekly:   0% / 100%"));
 
         let (_, _, compact_primary, compact_secondary) =
             format_limits_compact_card_lines(&limits, true, formatter);
         assert_eq!(compact_primary.as_deref(), Some("5h: 100%"));
-        assert_eq!(compact_secondary.as_deref(), Some("7d: 100%"));
+        assert_eq!(compact_secondary.as_deref(), Some("7d: 0% / 100%"));
     }
 
     #[test]
@@ -7936,13 +7919,59 @@ mod tests {
         );
 
         let (value, caption1, _, _) = format_limits_compact_card_lines(&limits, false, formatter);
-        assert_eq!(value, "Weekly:   96%");
+        assert_eq!(value, "Weekly:   4% / 96%");
         assert_eq!(caption1.as_deref(), Some("5h limit: --"));
 
         let (compact_value, compact_caption1, _, _) =
             format_limits_compact_card_lines(&limits, true, formatter);
-        assert_eq!(compact_value, "7d: 96%");
+        assert_eq!(compact_value, "7d: 4% / 96%");
         assert_eq!(compact_caption1.as_deref(), Some("5h limit: --"));
+    }
+
+    #[test]
+    fn weekly_limit_line_shows_complementary_used_and_remaining_percentages() {
+        let system_locale = crate::locale::SystemLocale::default();
+        let formatter = DisplayFormatter::new(crate::locale::DisplayStyle::Classic, &system_locale);
+        let cases = [
+            (Some(35.0), "35% / 65%"),
+            (Some(0.0), "0% / 100%"),
+            (Some(100.0), "100% / 0%"),
+            (Some(-12.0), "0% / 100%"),
+            (Some(150.0), "100% / 0%"),
+            (Some(34.5), "35% / 65%"),
+            (None, "--% / --%"),
+            (Some(f64::NAN), "--% / --%"),
+        ];
+
+        for (used_percent, pair) in cases {
+            let window = crate::codex_rpc::RateLimitWindow {
+                used_percent,
+                window_duration_mins: Some(10080.0),
+                resets_at: None,
+            };
+            assert_eq!(
+                format_limit_compact_line("Weekly:", Some(&window), false, formatter, true),
+                format!("Weekly:   {pair}")
+            );
+            assert_eq!(
+                format_limit_compact_line("7d:", Some(&window), true, formatter, true),
+                format!("7d: {pair}")
+            );
+        }
+
+        let short = crate::codex_rpc::RateLimitWindow {
+            used_percent: Some(35.0),
+            window_duration_mins: Some(300.0),
+            resets_at: None,
+        };
+        assert_eq!(
+            format_limit_compact_line("5h limit:", Some(&short), false, formatter, false),
+            "5h limit: 65%"
+        );
+        assert_eq!(
+            format_limit_compact_line("5h limit:", Some(&short), true, formatter, false),
+            "5h: 65%"
+        );
     }
 
     fn local_unix_secs(date: NaiveDate, hour: u32, minute: u32) -> i64 {
@@ -8064,6 +8093,9 @@ mod tests {
         let carryover_details = weekly_daily_pace(&carryover, now).expect("daily pace");
         assert!((carryover_details.safe_today_percent - 200.0).abs() < 0.01);
         assert_eq!(weekly_pace_band(&carryover, now), WeeklyPaceBand::Normal);
+        let carryover_tooltip = format_weekly_pace_tooltip(&carryover, WeeklyPaceBand::Normal, now)
+            .expect("carryover tooltip");
+        assert!(carryover_tooltip.contains("Safe left: 200%"));
     }
 
     #[test]
@@ -8130,32 +8162,50 @@ mod tests {
         assert_eq!(weekly_pace_band(&normal, now), WeeklyPaceBand::Normal);
         let normal_text =
             format_weekly_pace_tooltip(&normal, WeeklyPaceBand::Normal, now).expect("normal");
-        assert_eq!(normal_text.lines().count(), 5);
-        assert!(normal_text.contains("within today's allowance"));
-        assert!(normal_text.contains("Daily budget"));
-        assert!(normal_text.contains("Resets in"));
+        assert_eq!(normal_text.lines().count(), 4);
+        assert!(normal_text.contains("Unused capacity carries into today."));
 
         let (yellow, now) = weekly_window(8.0, start, start, 1, 0);
         assert_eq!(weekly_pace_band(&yellow, now), WeeklyPaceBand::Yellow);
         let yellow_text =
             format_weekly_pace_tooltip(&yellow, WeeklyPaceBand::Yellow, now).expect("yellow");
-        assert_eq!(yellow_text.lines().count(), 5);
-        assert!(yellow_text.contains("more than half used"));
+        assert_eq!(yellow_text.lines().count(), 4);
+        assert_eq!(
+            yellow_text.lines().last(),
+            Some("Keep usage steady until the weekly limit resets.")
+        );
 
         let (orange, now) = weekly_window(10.0, start, start, 1, 0);
         assert_eq!(weekly_pace_band(&orange, now), WeeklyPaceBand::Orange);
         let orange_text =
             format_weekly_pace_tooltip(&orange, WeeklyPaceBand::Orange, now).expect("orange");
-        assert_eq!(orange_text.lines().count(), 5);
-        assert!(orange_text.contains("allowance is running low"));
-        assert!(orange_text.contains("Reduce usage"));
+        assert_eq!(orange_text.lines().count(), 4);
+        assert_eq!(
+            orange_text.lines().last(),
+            Some("Reduce usage until the weekly limit resets.")
+        );
 
         let (red, now) = weekly_window(17.0, start, start, 1, 0);
         assert_eq!(weekly_pace_band(&red, now), WeeklyPaceBand::Red);
         let red_text = format_weekly_pace_tooltip(&red, WeeklyPaceBand::Red, now).expect("red");
-        assert_eq!(red_text.lines().count(), 5);
-        assert!(red_text.contains("allowance is nearly exhausted"));
+        assert_eq!(red_text.lines().count(), 4);
+        assert_eq!(
+            red_text.lines().last(),
+            Some("The weekly limit may end before it resets.")
+        );
         assert!(red_text.contains("Safe left"));
+    }
+
+    #[test]
+    fn weekly_pace_tooltip_matches_four_line_daily_copy() {
+        let start = NaiveDate::from_ymd_opt(2026, 7, 20).expect("date");
+        let (window, now) = weekly_window(5.0, start, start, 1, 52);
+        let tooltip = format_weekly_pace_tooltip(&window, WeeklyPaceBand::Normal, now)
+            .expect("normal tooltip");
+        assert_eq!(
+            tooltip,
+            "Daily usage for Day 1/7 | Daily budget: 14.3%\nUsed: 35.0% | Safe left: 65%\nReset in: 6d 22h 8m\nUnused capacity carries into today."
+        );
     }
 
     #[test]
@@ -8608,7 +8658,7 @@ mod tests {
 
     #[test]
     fn style_weekly_limit_line_matches_band_colors() {
-        let plain = "Weekly:   83% (resets 12:14, 4 Aug)";
+        let plain = "Weekly:   17% / 83% (resets 12:14, 4 Aug)";
         let normal = style_weekly_limit_line(plain, WeeklyPaceBand::Normal, true);
         assert_eq!(normal.spans.len(), 1);
         assert_eq!(normal.spans[0].content.as_ref(), plain);
@@ -8632,7 +8682,7 @@ mod tests {
         assert_eq!(red.spans[0].style.bg, Some(Color::Red));
         assert_eq!(red.spans[0].style.fg, Some(Color::White));
 
-        let compact_plain = "7d: 50% | 12:14";
+        let compact_plain = "7d: 50% / 50% | 12:14";
         let compact = style_weekly_limit_line(compact_plain, WeeklyPaceBand::Orange, false);
         assert_eq!(compact.spans.len(), 1);
         assert_eq!(compact.spans[0].content.as_ref(), compact_plain);

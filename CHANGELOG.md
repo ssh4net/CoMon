@@ -14,11 +14,18 @@ All notable changes to this project are documented in this file.
 - Aligned the Limits gauge with reset-anchored daily allowance warnings and
   retained matching filled-divider colors.
 - Moved the reset action from the Limits card to the reset-credit summary, with
-  a wrapped narrow-layout position, white label, bright accent value, and the
+  a wrapped narrow-layout position, white summary text, and the
   same click and hover behavior.
 - Added six persisted half-channel RGB accent themes and ordered all color
   swatches through a red-to-green-to-blue-to-red rainbow.
 - Fixed project attribution to use recorded session context only: sandbox permissions, tool working directories, and referenced command paths cannot create project memberships or relink Session history. The v12 cache migration rebuilds derived usage from raw session logs.
+
+## 0.5.8 - 2026-09-27
+
+- Simplified the white reset-credit summary to `LIMIT RESETS: N available ...`.
+- Weekly limits now show used / remaining percentages in full and compact views.
+- Shortened the daily-usage tooltip to four lines, preserving daily allowance,
+  carryover, reset countdown, and status-specific advice.
 
 ## 0.5.7 - 2026-09-24
 
